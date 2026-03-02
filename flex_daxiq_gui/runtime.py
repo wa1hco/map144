@@ -143,6 +143,16 @@ def _reset_wav_timeline(self):
     self.realtime_write_index = 0
     self.energy_write_index = 0
 
+    self.sq_spectrogram_data = np.full((self.max_history, self.fft_size), -130.0)
+    self.sq_spec_staging = np.full((self.max_history, self.fft_size), -130.0)
+    self.sq_spec_staging_filled = False
+    self.sq_realtime_data = np.full((self.max_history, self.fft_size), -130.0)
+    self.sq_realtime_filled = False
+    self.sq_spec_boundary = 0
+    self._sq_realtime_boundary = 0
+    self.sq_spec_write_index = 0
+    self.sq_realtime_write_index = 0
+
     self.time_in_window = 0.0
     self.next_boundary = self.history_secs
 

@@ -19,7 +19,7 @@ def _format_bandwidth_hz(bandwidth_hz):
 
 
 def update_displays(self):
-    """Update all four display panels."""
+    """Update all display panels."""
     if len(self.realtime_data) == 0:
         return
 
@@ -104,6 +104,36 @@ def update_displays(self):
         self.realtime_energy_curve.setData(self.energy_time_axis[valid_mask], realtime_y)
     else:
         self.realtime_energy_curve.setData([], [])
+
+    # Squared-signal periodograms.
+    # Y-axis uses kHz offset from band center; actual spectral content appears at
+    # 2× those offsets because squaring doubled the component frequencies.
+    sq_freq_min = self.sq_freq_axis_khz[0]
+    sq_freq_max = self.sq_freq_axis_khz[-1]
+
+    if self.sq_spec_staging_filled:
+        self.sq_accumulated_img.setImage(
+            self.sq_spectrogram_data,
+            autoLevels=False,
+            levels=[self.sq_min_level, self.sq_max_level],
+        )
+        self.sq_accumulated_img.setRect(
+            QtCore.QRectF(0, sq_freq_min, self.max_time, sq_freq_max - sq_freq_min)
+        )
+        self.sq_accumulated_plot.setXRange(0, self.max_time, padding=0)
+        self.sq_accumulated_plot.setYRange(sq_freq_min, sq_freq_max, padding=0)
+
+    if self.sq_realtime_filled:
+        self.sq_realtime_img.setImage(
+            self.sq_realtime_data,
+            autoLevels=False,
+            levels=[self.sq_min_level, self.sq_max_level],
+        )
+        self.sq_realtime_img.setRect(
+            QtCore.QRectF(0, sq_freq_min, self.realtime_time, sq_freq_max - sq_freq_min)
+        )
+        self.sq_realtime_plot.setXRange(0, self.realtime_time, padding=0)
+        self.sq_realtime_plot.setYRange(sq_freq_min, sq_freq_max, padding=0)
 
     utc_time = datetime.datetime.now(datetime.UTC).strftime("%H:%M:%S")
     self.utc_clock_label.setText(f"UTC: {utc_time}")

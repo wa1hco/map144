@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../wsjtx-2.7.0/build/wsjtx-prefix"
+		}
+	],
+	"settings": {
+		"chat.tools.terminal.autoApprove": {
+			"/home/jeff/ham/mapmsk144/.venv/bin/python": true
+		}
+	}
+}

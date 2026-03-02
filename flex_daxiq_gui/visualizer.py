@@ -8,6 +8,8 @@ from .ui import (
     setup_ui,
     on_min_level_changed,
     on_max_level_changed,
+    on_sq_min_level_changed,
+    on_sq_max_level_changed,
     on_select_source_flex,
     on_select_source_wav,
 )
@@ -22,6 +24,8 @@ class DAXIQVisualizer(QtWidgets.QMainWindow):
     setup_ui = setup_ui
     on_min_level_changed = on_min_level_changed
     on_max_level_changed = on_max_level_changed
+    on_sq_min_level_changed = on_sq_min_level_changed
+    on_sq_max_level_changed = on_sq_max_level_changed
     on_select_source_flex = on_select_source_flex
     on_select_source_wav = on_select_source_wav
     setup_flex_client = setup_flex_client
@@ -83,6 +87,30 @@ class DAXIQVisualizer(QtWidgets.QMainWindow):
 
         self.min_level = -90
         self.max_level = -30
+
+        # Squared signal spectrogram buffers (for MSK144 tone-pair detection).
+        # Squaring the IQ doubles all spectral component frequencies; MSK144 tones
+        # at fc±500 Hz produce a ±1000 Hz symmetric pair in this spectrum.
+        self.sq_spectrogram_data = np.full((self.max_history, self.fft_size), -130.0)
+        self.sq_spec_staging = np.full((self.max_history, self.fft_size), -130.0)
+        self.sq_spec_boundary = int(current_time / self.history_secs)
+        self.sq_spec_staging_filled = False
+        self.sq_spec_write_index = min(max(initial_index, 0), self.max_history - 1)
+
+        self.sq_realtime_data = np.full((self.max_history, self.fft_size), -130.0)
+        self.sq_realtime_filled = False
+        self._sq_realtime_boundary = self.sq_spec_boundary
+        self.sq_realtime_write_index = min(max(initial_index, 0), self.max_history - 1)
+
+        # Relative frequency axis in kHz for the squared-signal plots.
+        # Labels represent FFT bin offsets from center; actual spectral content
+        # appears at 2× these offsets due to squaring.
+        self.sq_freq_axis_khz = np.fft.fftshift(
+            np.fft.fftfreq(self.fft_size, 1.0 / self.sample_rate)
+        ) / 1e3
+
+        self.sq_min_level = -180
+        self.sq_max_level = -100
 
         self.fft_bin_axis_mhz = np.fft.fftshift(
             np.fft.fftfreq(self.fft_size, 1 / self.sample_rate)

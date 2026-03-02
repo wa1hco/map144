@@ -11,5 +11,34 @@
             "program": "${file}",
             "console": "integratedTerminal"
         },
+        {
+            "name": "Python Debugger: Generate MSK144 Test Signal",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/generate_msk144_test_signal.py",
+            "args": [
+                "--input-dir", "${workspaceFolder}/test_data",
+                "--pattern", "input_*.wav",
+                "--target-centers-hz", "1000, 2000, 3000",
+                "--output-rate", "48000",
+                "--plot-output", "${workspaceFolder}/plots",
+                "--show-plots",
+                "--flatten-spectrum"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Python Debugger: Analyze MSK144",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/analyze_msk144.py",
+            "args": [
+                 //"${workspaceFolder}/MSK144/160915_113100.wav"
+                 //"${workspaceFolder}/MSK144/160915_113230.wav"
+                 //"${workspaceFolder}/MSK144/181211_120500.wav"
+                 "${workspaceFolder}/MSK144/181211_120800.wav"
+            ],
+            "console": "integratedTerminal"
+        }               
     ]
 }

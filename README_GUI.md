@@ -53,6 +53,42 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 Accepted log levels: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`.
 
+## Test Signal Generator
+
+Generate the combined MSK144 test IQ stream and diagnostics plot:
+
+```bash
+.venv/bin/python generate_msk144_test_signal.py
+```
+
+All source bursts are aligned at `t=0` in the combined output stream.
+Source center is fixed at `1500 Hz`; each burst is shifted from `1500 Hz` to its configured target center.
+
+This opens the **interactive diagnostics GUI by default** and writes:
+- `msk144_combined_iq_48k.npy`
+- `msk144_combined_iq_48k.wav`
+- `msk144_wav_diagnostics.png`
+
+Diagnostics spectrum flattening (based on median noise floor vs frequency) is **enabled by default**.
+
+To run without opening the live interactive diagnostics window (Qt/Matplotlib), pass:
+
+```bash
+.venv/bin/python generate_msk144_test_signal.py --no-show-plots
+```
+
+To disable frequency flattening for diagnostics (use raw spectrum), pass:
+
+```bash
+.venv/bin/python generate_msk144_test_signal.py --no-flatten-spectrum
+```
+
+Example (headless + raw spectrum):
+
+```bash
+.venv/bin/python generate_msk144_test_signal.py --no-show-plots --no-flatten-spectrum
+```
+
 ## Before Running
 
 1. Make sure FlexRadio is powered on and connected to your network
@@ -80,7 +116,7 @@ The spectrogram is updated in real-time as IQ samples are received and processed
 - `flex_daxiq_gui/displays.py` - Plot/update rendering logic
 - `flex_daxiq_gui/runtime.py` - Flex client thread lifecycle and shutdown
 - `flexclient/` - Modular FlexRadio client package (`core`, `client`, `setup`, `tcp_client`, `vita`, `discovery`, `models`, `common`)
-- `flex_client.py` - Legacy compatibility shim that re-exports `flexclient.core`
+- `flex_client.py` - Legacy CLI launcher and compatibility shim for `flexclient.core`
 - `install_gui_deps.sh` - Dependency installation script
 
 ## Troubleshooting
