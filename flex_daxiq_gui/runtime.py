@@ -6,6 +6,7 @@ import wave
 import importlib
 
 import numpy as np
+from scipy.signal import hilbert
 
 from PyQt5 import QtCore
 
@@ -79,7 +80,11 @@ def _load_wav_complex(path: str, target_rate: int) -> tuple[np.ndarray, int]:
         raise ValueError(f"Unsupported WAV sample width {sample_width}")
 
     if channels == 1:
-        iq = data.astype(np.complex64)
+        # Convert real mono to analytic (single-sideband) IQ.
+        # Setting Q=0 leaves a symmetric spectrum whose squared version produces
+        # mirror-image tone pairs at negative frequencies, causing the detector to
+        # recover a negative fc and mix the signal to the wrong frequency.
+        iq = hilbert(data.astype(np.float64)).astype(np.complex64)
     else:
         frames = data.reshape(-1, channels)
         i = frames[:, 0]
@@ -155,6 +160,14 @@ def _reset_wav_timeline(self):
 
     self.time_in_window = 0.0
     self.next_boundary = self.history_secs
+
+    # Reset LP filter streaming state and ring buffer
+    self._lp_zi_re = np.zeros(len(self._lp_taps) - 1, dtype=np.float64)
+    self._lp_zi_im = np.zeros(len(self._lp_taps) - 1, dtype=np.float64)
+    self._iq_ring[:] = 0
+    self._iq_ring_pos = 0
+    self._iq_abs_sample = 0
+    self._detect_cooldown = 0
 
 
 def _process_wav_source_step(self):
@@ -280,6 +293,11 @@ def _get_tuned_frequency_mhz(self):
 
 def closeEvent(self, event):
     """Clean up on window close."""
+    from .visualizer import _SETTINGS
+    _SETTINGS.setValue('geometry',  self.saveGeometry())
+    _SETTINGS.setValue('min_level', self.min_level)
+    _SETTINGS.setValue('max_level', self.max_level)
+
     print("Shutting down...")
     self.running = False
 

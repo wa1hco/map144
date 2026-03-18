@@ -115,7 +115,7 @@ def update_displays(self):
         self.sq_accumulated_img.setImage(
             self.sq_spectrogram_data,
             autoLevels=False,
-            levels=[self.sq_min_level, self.sq_max_level],
+            levels=[self.min_level, self.max_level],
         )
         self.sq_accumulated_img.setRect(
             QtCore.QRectF(0, sq_freq_min, self.max_time, sq_freq_max - sq_freq_min)
@@ -127,7 +127,7 @@ def update_displays(self):
         self.sq_realtime_img.setImage(
             self.sq_realtime_data,
             autoLevels=False,
-            levels=[self.sq_min_level, self.sq_max_level],
+            levels=[self.min_level, self.max_level],
         )
         self.sq_realtime_img.setRect(
             QtCore.QRectF(0, sq_freq_min, self.realtime_time, sq_freq_max - sq_freq_min)

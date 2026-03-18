@@ -7,7 +7,7 @@ import pyqtgraph as pg
 def setup_ui(self):
     """Create the five-panel display layout."""
     self.setWindowTitle(f'FlexRadio DAXIQ - {self.center_freq_mhz:.3f} MHz')
-    self.setGeometry(100, 100, 1400, 1200)
+    self.setGeometry(100, 100, 1400, 1600)
 
     menu_bar = self.menuBar()
     file_menu = menu_bar.addMenu("&File")
@@ -79,12 +79,9 @@ def setup_ui(self):
     self.realtime_noise_plot.setLabel('left', 'Frequency', units='MHz')
     self.realtime_noise_curve = self.realtime_noise_plot.plot(pen='c', width=2)
 
-    # Squared-signal periodograms for MSK144 tone-pair detection.
-    # Squaring IQ doubles spectral frequencies: MSK144 tones at fc±500 Hz
-    # become a ±1000 Hz symmetric pair at 2fc in these displays.
-    # Y-axis is offset from band center in kHz; content appears at 2× actual offsets.
+    # Squared-signal periodograms: FFT of the squared real (I) 48 kHz input signal.
     self.sq_realtime_plot = pg.PlotWidget(title="Squared Signal – Real-time")
-    self.sq_realtime_plot.setLabel('left', 'Offset', units='kHz')
+    self.sq_realtime_plot.setLabel('left', 'Freq (squared)', units='kHz')
     self.sq_realtime_plot.setLabel('bottom', 'Time', units='s')
     self.sq_realtime_img = pg.ImageItem(axisOrder='col-major')
     self.sq_realtime_plot.addItem(self.sq_realtime_img)
@@ -92,99 +89,78 @@ def setup_ui(self):
     self.sq_realtime_img.setColorMap(colormap)
 
     self.sq_accumulated_plot = pg.PlotWidget(title="Squared Signal – Accumulated (15 sec snapshot)")
-    self.sq_accumulated_plot.setLabel('left', 'Offset', units='kHz')
+    self.sq_accumulated_plot.setLabel('left', 'Freq (squared)', units='kHz')
     self.sq_accumulated_plot.setLabel('bottom', 'Time', units='s')
     self.sq_accumulated_img = pg.ImageItem(axisOrder='col-major')
     self.sq_accumulated_plot.addItem(self.sq_accumulated_img)
     self.sq_accumulated_plot.setAspectLocked(False)
     self.sq_accumulated_img.setColorMap(colormap)
 
-    control_panel = QtWidgets.QWidget()
-    control_layout = QtWidgets.QVBoxLayout(control_panel)
-    control_layout.setContentsMargins(10, 10, 10, 10)
-    control_layout.setSpacing(15)
+    def _make_slider_bar(title, min_label_ref, min_range, min_default,
+                         max_label_ref, max_range, max_default,
+                         min_slot, max_slot, tick_interval):
+        """Return a fixed-height horizontal bar: title | min label | slider | max label | slider."""
+        bar = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(bar)
+        row.setContentsMargins(6, 2, 6, 2)
+        row.setSpacing(8)
 
-    title_label = QtWidgets.QLabel("<b>Color Scale</b>")
-    control_layout.addWidget(title_label)
+        row.addWidget(QtWidgets.QLabel(f"<b>{title}</b>"))
 
-    min_label = QtWidgets.QLabel(f"Min Level: {self.min_level} dB")
-    self.min_level_label = min_label
-    control_layout.addWidget(min_label)
+        min_lbl = QtWidgets.QLabel(f"Min: {min_default} dB")
+        setattr(self, min_label_ref, min_lbl)
+        row.addWidget(min_lbl)
+        min_sl = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        min_sl.setMinimum(min_range[0])
+        min_sl.setMaximum(min_range[1])
+        min_sl.setValue(min_default)
+        min_sl.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        min_sl.setTickInterval(tick_interval)
+        min_sl.valueChanged.connect(min_slot)
+        row.addWidget(min_sl, stretch=1)
 
-    min_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-    min_slider.setMinimum(-150)
-    min_slider.setMaximum(-20)
-    min_slider.setValue(self.min_level)
-    min_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
-    min_slider.setTickInterval(10)
-    min_slider.valueChanged.connect(self.on_min_level_changed)
-    control_layout.addWidget(min_slider)
+        max_lbl = QtWidgets.QLabel(f"Max: {max_default} dB")
+        setattr(self, max_label_ref, max_lbl)
+        row.addWidget(max_lbl)
+        max_sl = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        max_sl.setMinimum(max_range[0])
+        max_sl.setMaximum(max_range[1])
+        max_sl.setValue(max_default)
+        max_sl.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        max_sl.setTickInterval(tick_interval)
+        max_sl.valueChanged.connect(max_slot)
+        row.addWidget(max_sl, stretch=1)
 
-    max_label = QtWidgets.QLabel(f"Max Level: {self.max_level} dB")
-    self.max_level_label = max_label
-    control_layout.addWidget(max_label)
+        bar.setFixedHeight(54)
+        return bar
 
-    max_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-    max_slider.setMinimum(-100)
-    max_slider.setMaximum(0)
-    max_slider.setValue(self.max_level)
-    max_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
-    max_slider.setTickInterval(10)
-    max_slider.valueChanged.connect(self.on_max_level_changed)
-    control_layout.addWidget(max_slider)
+    iq_sliders = _make_slider_bar(
+        "IQ Color Scale",
+        "min_level_label",  (-150, -20),  self.min_level,
+        "max_level_label",  (-100,   0),  self.max_level,
+        self.on_min_level_changed, self.on_max_level_changed, 10,
+    )
+    # ── Grid layout ─────────────────────────────────────────────────────────
+    # Row 0: accumulated IQ spectrogram  | accumulated noise floor
+    # Row 1: real-time IQ spectrogram    | real-time noise floor
+    # Row 2: IQ slider bar               | (spans both cols)
+    # Row 3: accumulated squared         | (col 1 empty)
+    # Row 4: real-time squared           | (col 1 empty)
+    layout.addWidget(self.spectrogram_plot,      0, 0)
+    layout.addWidget(self.accumulated_noise_plot, 0, 1)
+    layout.addWidget(self.realtime_plot,          1, 0)
+    layout.addWidget(self.realtime_noise_plot,    1, 1)
+    layout.addWidget(iq_sliders,                  2, 0, 1, 2)
+    layout.addWidget(self.sq_accumulated_plot,    3, 0)
+    layout.addWidget(self.sq_realtime_plot,       4, 0)
 
-    sq_title_label = QtWidgets.QLabel("<b>Squared Signal Scale</b>")
-    control_layout.addWidget(sq_title_label)
-
-    sq_min_label = QtWidgets.QLabel(f"Min Level: {self.sq_min_level} dB")
-    self.sq_min_level_label = sq_min_label
-    control_layout.addWidget(sq_min_label)
-
-    sq_min_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-    sq_min_slider.setMinimum(-300)
-    sq_min_slider.setMaximum(-20)
-    sq_min_slider.setValue(self.sq_min_level)
-    sq_min_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
-    sq_min_slider.setTickInterval(20)
-    sq_min_slider.valueChanged.connect(self.on_sq_min_level_changed)
-    control_layout.addWidget(sq_min_slider)
-
-    sq_max_label = QtWidgets.QLabel(f"Max Level: {self.sq_max_level} dB")
-    self.sq_max_level_label = sq_max_label
-    control_layout.addWidget(sq_max_label)
-
-    sq_max_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-    sq_max_slider.setMinimum(-250)
-    sq_max_slider.setMaximum(0)
-    sq_max_slider.setValue(self.sq_max_level)
-    sq_max_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
-    sq_max_slider.setTickInterval(20)
-    sq_max_slider.valueChanged.connect(self.on_sq_max_level_changed)
-    control_layout.addWidget(sq_max_slider)
-
-    control_layout.addStretch()
-
-    # Row 0-1: main IQ spectrograms + noise floors (col 0 wide, col 1 narrow)
-    layout.addWidget(self.spectrogram_plot, 0, 0, 1, 1)
-    layout.addWidget(self.accumulated_noise_plot, 0, 1, 1, 1)
-    layout.addWidget(self.realtime_plot, 1, 0, 1, 1)
-    layout.addWidget(self.realtime_noise_plot, 1, 1, 1, 1)
-    # Row 2: squared-signal periodograms spanning both columns equally
-    sq_panel = QtWidgets.QWidget()
-    sq_layout = QtWidgets.QHBoxLayout(sq_panel)
-    sq_layout.setContentsMargins(0, 0, 0, 0)
-    sq_layout.addWidget(self.sq_realtime_plot)
-    sq_layout.addWidget(self.sq_accumulated_plot)
-    layout.addWidget(sq_panel, 2, 0, 1, 2)
-    # Row 3: control panel (right column only)
-    layout.addWidget(control_panel, 3, 1, 1, 1)
-
-    layout.setColumnStretch(0, 3)
+    layout.setColumnStretch(0, 4)
     layout.setColumnStretch(1, 1)
     layout.setRowStretch(0, 3)
     layout.setRowStretch(1, 3)
-    layout.setRowStretch(2, 2)
-    layout.setRowStretch(3, 0)
+    layout.setRowStretch(2, 0)
+    layout.setRowStretch(3, 3)
+    layout.setRowStretch(4, 3)
 
     self.statusBar().showMessage('Initializing...')
     self.tuned_freq_label = QtWidgets.QLabel("Tuned: --")
@@ -201,22 +177,22 @@ def setup_ui(self):
 
 def on_min_level_changed(self, value):
     self.min_level = value
-    self.min_level_label.setText(f"Min Level: {value} dB")
+    self.min_level_label.setText(f"Min: {value} dB")
 
 
 def on_max_level_changed(self, value):
     self.max_level = value
-    self.max_level_label.setText(f"Max Level: {value} dB")
+    self.max_level_label.setText(f"Max: {value} dB")
 
 
 def on_sq_min_level_changed(self, value):
     self.sq_min_level = value
-    self.sq_min_level_label.setText(f"Min Level: {value} dB")
+    self.sq_min_level_label.setText(f"Min: {value} dB")
 
 
 def on_sq_max_level_changed(self, value):
     self.sq_max_level = value
-    self.sq_max_level_label.setText(f"Max Level: {value} dB")
+    self.sq_max_level_label.setText(f"Max: {value} dB")
 
 
 def on_select_source_flex(self):

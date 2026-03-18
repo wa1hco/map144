@@ -13,6 +13,9 @@ This tool:
 from __future__ import annotations
 
 import argparse
+import shutil
+import subprocess
+import tempfile
 import time
 import wave
 from pathlib import Path
@@ -33,6 +36,27 @@ DIAGNOSTIC_NFFT = 512
 DIAGNOSTIC_CHUNK_SAMPLES = 504
 EMBEDDED_POWER_MIN_SPAN_DB = 1.5
 SOURCE_CENTER_HZ = 1500.0
+
+# ── msk144sim ping generation ──────────────────────────────────────────────
+MSK144SIM_DEFAULT_PATH = 'msk144sim'
+MSK144SIM_TR_PERIOD = 15         # seconds; msk144sim TR period argument
+MSK144SIM_AUDIO_CENTER_HZ = 1500.0
+MSK144SIM_SAMPLE_RATE = 12000
+PING_EXTRACT_START_S = 1.0       # first ping lands at t=1 s in msk144sim output
+PING_EXTRACT_DURATION_S = 1.0    # one second of ping audio to extract
+# Parameter encoding ranges (match message format "A[±][ff][ttt][±][dd][www]")
+FREQ_MIN_KHZ = -12
+FREQ_MAX_KHZ = +12
+TIME_MIN_DS  =   5                  # deciseconds (0.5 s)
+TIME_MAX_DS  = 150                # deciseconds (15.0 s)
+SNR_MIN_DB   = -10
+SNR_MAX_DB   =  +3
+WIDTH_MIN_MS =  50
+WIDTH_MAX_MS = 300
+WIDTH_CLAMP_MIN_MS = 10          # avoid division-by-zero inside msk144sim
+MSK144SIM_GENERATE_SNR_DB = 55  # SNR passed to msk144sim.  55 dB is near the
+                                 # int16 clipping limit (≈ 58 dB); going higher
+                                 # would saturate iwave = 30*wave in msk144sim.
 
 
 def read_wav_mono(path: Path) -> tuple[np.ndarray, int]:
@@ -141,6 +165,90 @@ def write_iq_wav(path: Path, iq: np.ndarray, sample_rate: int) -> None:
 
 def parse_float_list(text: str) -> list[float]:
     return [float(item.strip()) for item in text.split(',') if item.strip()]
+
+
+# ── Ping message encoding / decoding ──────────────────────────────────────
+
+def encode_ping_message(freq_khz: int, time_ds: int, snr_db: int, width_ms: int) -> str:
+    """Encode ping parameters into a 13-character MSK144 free-text message.
+
+    Format: A[P/N][ff][ttt][P/N][dd][www]
+      A        – literal prefix character
+      [P/N]    – sign of freq_khz  ('P' = positive/zero, 'N' = negative)
+      [ff]     – abs(freq_khz) as 2 digits, 00–24
+      [ttt]    – time in deciseconds as 3 digits, 005–150
+      [P/N]    – sign of snr_db   ('P' = positive/zero, 'N' = negative)
+      [dd]     – abs(snr_db) as 2 digits, 00–10
+      [www]    – width in milliseconds as 3 digits, 000–999
+    Total: 1+1+2+3+1+2+3 = 13 characters.
+    P/N are used instead of +/- because '+' is not reliably preserved by the
+    MSK144 message encoder (it maps to '0' in some positions).
+    """
+    freq_sign = 'P' if freq_khz >= 0 else 'N'
+    snr_sign  = 'P' if snr_db  >= 0 else 'N'
+    return f"A{freq_sign}{abs(freq_khz):02d}{time_ds:03d}{snr_sign}{abs(snr_db):02d}{width_ms:03d}"
+
+
+def decode_ping_message(msg: str) -> dict:
+    """Decode a 13-character ping message back to its parameters."""
+    freq_khz = (1 if msg[1] == 'P' else -1) * int(msg[2:4])
+    time_ds  = int(msg[4:7])
+    snr_db   = (1 if msg[7] == 'P' else -1) * int(msg[8:10])
+    width_ms = int(msg[10:13])
+    return {'freq_khz': freq_khz, 'time_ds': time_ds, 'snr_db': snr_db, 'width_ms': width_ms}
+
+
+def generate_ping_wav(msg: str, msk144sim_path: str) -> tuple[np.ndarray, int]:
+    """Call msk144sim to generate a ping, extract the first ping at t=1 s.
+
+    Returns (samples, sample_rate) where samples covers PING_EXTRACT_DURATION_S
+    seconds of 12 kHz mono audio starting at t=PING_EXTRACT_START_S.
+    """
+    params = decode_ping_message(msg)
+    width_s = max(params['width_ms'], WIDTH_CLAMP_MIN_MS) / 1000.0
+    snr_db  = params['snr_db']
+
+    work_dir = Path(tempfile.mkdtemp(prefix='msk144sim_'))
+    try:
+        cmd = [
+            msk144sim_path,
+            msg,
+            str(MSK144SIM_TR_PERIOD),
+            str(MSK144SIM_AUDIO_CENTER_HZ),
+            f"{width_s:.3f}",
+            str(MSK144SIM_GENERATE_SNR_DB),   # always high → clean ping, no embedded noise
+            "1",
+        ]
+        subprocess.run(cmd, cwd=str(work_dir), check=True,
+                       capture_output=True, text=True)
+
+        wav_path = work_dir / "000000_000001.wav"
+        samples, sample_rate = read_wav_mono(wav_path)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    start = int(PING_EXTRACT_START_S * sample_rate)
+    end   = start + int(PING_EXTRACT_DURATION_S * sample_rate)
+    ping  = samples[start:end].copy()
+
+    # msk144sim adds constant AWGN across the whole file regardless of the ping
+    # envelope, so the extracted window is mostly pure noise at the start (where
+    # the envelope rises from 0) and in the long decay tail.  Multiply by the
+    # same Gamma envelope msk144sim uses to drive the noise to zero wherever the
+    # signal is near-silent.  Combined with MSK144SIM_GENERATE_SNR_DB=55 this
+    # makes the embedded noise ~60 dB below the peak signal — invisible.
+    width_s_eff = max(params['width_ms'], WIDTH_CLAMP_MIN_MS) / 1000.0
+    n = ping.size
+    t_norm = np.arange(n, dtype=np.float64) / sample_rate / width_s_eff
+    # Exact msk144sim envelope: e·t·exp(−t) for t∈[0,10], else 0
+    env = np.where(
+        (t_norm >= 0.0) & (t_norm <= 10.0),
+        np.e * t_norm * np.exp(-t_norm),
+        0.0,
+    ).astype(np.float32)
+    ping = ping * env
+
+    return ping, sample_rate
 
 
 def _gui_like_colormap() -> LinearSegmentedColormap:
@@ -851,6 +959,51 @@ def plot_wav_diagnostics(
         plt.close(fig)
 
 
+def _bandpass_real_fft(
+    samples: np.ndarray,
+    sample_rate: int,
+    lo_hz: float,
+    hi_hz: float,
+) -> np.ndarray:
+    """FFT-domain bandpass filter for a real signal with cosine tapers at both edges.
+
+    Removes out-of-band noise (e.g. the wideband Gaussian noise embedded in
+    msk144sim output) before converting to analytic/IQ.  The taper width is
+    10 % of the passband bandwidth at each edge.
+    """
+    n = samples.size
+    if n == 0:
+        return samples.astype(np.float32)
+
+    freq = np.fft.rfftfreq(n, 1.0 / sample_rate)
+    X = np.fft.rfft(samples.astype(np.float64))
+    gain = np.zeros(freq.size, dtype=np.float64)
+
+    bw = hi_hz - lo_hz
+    taper = max(10.0, 0.10 * bw)
+
+    # Flat passband
+    flat = (freq >= lo_hz) & (freq <= hi_hz)
+    gain[flat] = 1.0
+
+    # Low-edge cosine rise: (lo_hz - taper) … lo_hz
+    lo_taper_lo = max(0.0, lo_hz - taper)
+    trans_lo = (freq >= lo_taper_lo) & (freq < lo_hz)
+    if np.any(trans_lo):
+        t = (freq[trans_lo] - lo_taper_lo) / (lo_hz - lo_taper_lo)
+        gain[trans_lo] = 0.5 - 0.5 * np.cos(np.pi * t)
+
+    # High-edge cosine fall: hi_hz … (hi_hz + taper)
+    hi_taper_hi = hi_hz + taper
+    trans_hi = (freq > hi_hz) & (freq <= hi_taper_hi)
+    if np.any(trans_hi):
+        t = (freq[trans_hi] - hi_hz) / (hi_taper_hi - hi_hz)
+        gain[trans_hi] = 0.5 + 0.5 * np.cos(np.pi * t)
+
+    x_out = np.fft.irfft(X * gain, n=n)
+    return x_out.astype(np.float32)
+
+
 def _equalize_and_lp_filter(
     samples: np.ndarray,
     correction_db: np.ndarray,
@@ -893,106 +1046,226 @@ def _equalize_and_lp_filter(
     return x_out.astype(np.float32)
 
 
+def _plot_output_spectrogram(
+    combined: np.ndarray,
+    sample_rate: int,
+    output_path: Path,
+    placements: list[tuple[str, float, float]],
+) -> None:
+    """Save a spectrogram of the combined IQ output with signal placement markers."""
+    t_s, freq_hz, spec_db = _compute_spectrogram_db(combined, sample_rate)
+    gui_cmap = _gui_like_colormap()
+    vmin, vmax = -110.0, -70.0
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    f_min = float(freq_hz[0]) / 1000.0
+    f_max = float(freq_hz[-1]) / 1000.0
+    t_min = float(t_s[0])
+    t_max = float(t_s[-1])
+    ax.imshow(
+        spec_db.T, aspect='auto', origin='lower',
+        extent=[t_min, t_max, f_min, f_max],
+        cmap=gui_cmap, vmin=vmin, vmax=vmax,
+    )
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Frequency (kHz)')
+    ax.set_title('Combined IQ Test Signal – Spectrogram')
+
+    # Mark each signal's center frequency and start time
+    for name, center_hz, delay_s in placements:
+        ax.axhline(center_hz / 1000.0, color='red', lw=0.7, ls='--', alpha=0.6)
+        ax.axvline(delay_s, color='yellow', lw=0.7, ls=':', alpha=0.6)
+        ax.text(delay_s + 0.05, center_hz / 1000.0 + 0.2,
+                f'{center_hz/1000:+.1f}kHz', color='red', fontsize=7)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=140)
+    plt.close(fig)
+    print(f"Wrote spectrogram: {output_path}")
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate 48 kHz combined MSK144 complex test signal")
-    parser.add_argument('--input-dir', default='MSK144', help='Folder containing source WAV files')
-    parser.add_argument('--pattern', default='*.wav', help='Glob pattern for source files')
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate a 48 kHz complex IQ test stream: AWGN noise floor with MSK144 "
+            "bursts placed at random frequencies and time offsets.\n\n"
+            "With --count N, pings are generated via msk144sim with randomly chosen\n"
+            "parameters encoded into self-describing 13-char messages."
+        )
+    )
+    parser.add_argument('--count', type=int, default=10,
+                        help='Number of random pings to generate via msk144sim (default: 10; 0 = use --input-dir)')
+    parser.add_argument('--msk144sim', default=MSK144SIM_DEFAULT_PATH,
+                        help=f'Path to msk144sim executable (default: {MSK144SIM_DEFAULT_PATH})')
+    parser.add_argument('--input-dir', default='MSK144',
+                        help='Folder containing 15-sec 12 kHz mono WAV files (default: MSK144)')
+    parser.add_argument('--pattern', default='*.wav',
+                        help='Glob pattern for source WAV files (default: *.wav)')
+    parser.add_argument('--duration', type=float, default=15.0,
+                        help='Output duration in seconds (default: 15.0)')
     parser.add_argument('--output-rate', type=int, default=48000,
-                        help='Output sample rate in Hz')
-    parser.add_argument('--target-centers-hz', default='-9000,-3000,3000,9000',
-                        help='Comma-separated target center frequencies in Hz for each file')
+                        help='Output sample rate in Hz (default: 48000)')
+    parser.add_argument('--freq-range-hz', type=float, default=12000.0,
+                        help='Place each signal at a random centre in ±freq-range-hz (default: 12000); '
+                             'ignored when --count is used (frequency is encoded in message)')
+    parser.add_argument('--max-delay-s', type=float, default=1.0,
+                        help='Maximum random start-time delay in seconds (default: 1.0); '
+                             'ignored when --count is used (time is encoded in message)')
+    parser.add_argument('--atten-db', type=float, default=10.0,
+                        help='Attenuation applied to each signal before mixing, dB (default: 10.0)')
+    parser.add_argument('--awgn-snr-db', type=float, default=15.0,
+                        help='AWGN level relative to combined signal RMS, dB above noise (default: 15.0)')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed for reproducible placement (default: random)')
     parser.add_argument('--output-npy', default='msk144_combined_iq_48k.npy',
-                        help='Output complex .npy file path')
+                        help='Output complex float32 .npy file (default: msk144_combined_iq_48k.npy)')
     parser.add_argument('--output-iq-wav', default='msk144_combined_iq_48k.wav',
-                        help='Optional output stereo IQ WAV path; use empty string to skip')
-    parser.add_argument('--skip-plots', action='store_true',
-                        help='Skip generating diagnostics plots for input WAV files')
-    parser.add_argument('--show-plots', action='store_true', dest='show_plots',
-                        help='Display diagnostics plots interactively (default)')
-    parser.add_argument('--no-show-plots', action='store_false', dest='show_plots',
-                        help='Do not display diagnostics plots interactively')
-    parser.add_argument('--flatten-spectrum', action='store_true', dest='flatten_spectrum',
-                        help='Flatten diagnostics spectrum using median noise floor vs frequency (default)')
-    parser.add_argument('--no-flatten-spectrum', action='store_false', dest='flatten_spectrum',
-                        help='Do not apply frequency flattening to diagnostics spectrum')
-    parser.set_defaults(show_plots=True, flatten_spectrum=True)
+                        help='Output stereo IQ WAV (I=L, Q=R); empty string to skip')
     parser.add_argument('--plot-output', default='msk144_wav_diagnostics.png',
-                        help='Output PNG path for diagnostics plots')
+                        help='Output PNG spectrogram path (default: msk144_wav_diagnostics.png)')
+    parser.add_argument('--source-bp-lo', type=float, default=750.0,
+                        help='Source bandpass lower edge Hz – strip out-of-band noise (default: 750)')
+    parser.add_argument('--source-bp-hi', type=float, default=2250.0,
+                        help='Source bandpass upper edge Hz (default: 2250)')
+    parser.add_argument('--skip-plots', action='store_true',
+                        help='Skip output spectrogram plot')
     args = parser.parse_args()
 
-    input_dir = Path(args.input_dir)
-    files = sorted(input_dir.glob(args.pattern))
-    if not files:
-        raise SystemExit(f"No files found in {input_dir} matching {args.pattern}")
+    rng = np.random.default_rng(args.seed)
+    n_total = int(args.duration * args.output_rate)
+    atten = 10.0 ** (-args.atten_db / 20.0)
 
-    target_centers = list(reversed(parse_float_list(args.target_centers_hz)))
+    print(f"Output: {args.duration:.1f} s  @  {args.output_rate} Hz  ({n_total} samples)")
+    print(f"Signal attenuation: {args.atten_db:.1f} dB ({atten:.4f}×)  "
+          f"AWGN SNR: {args.awgn_snr_db:.1f} dB above noise\n")
 
-    if len(target_centers) != len(files):
-        raise SystemExit(
-            f"Need one target center per file: found {len(files)} files but {len(target_centers)} centers"
-        )
+    sig_buf = np.zeros(n_total, dtype=np.complex64)
+    placements: list[tuple[str, float, float]] = []
 
-    prepared: list[np.ndarray] = []
-    diagnostics_data: list[tuple[str, np.ndarray, int]] = []
-    max_len = 0
+    if args.count > 0:
+        # ── Generate pings via msk144sim ───────────────────────────────────────
+        print(f"Generating {args.count} pings via msk144sim ({args.msk144sim}):")
+        print(f"  Message format: A[±][ff][ttt][±][dd][www]")
+        print(f"  freq {FREQ_MIN_KHZ}..{FREQ_MAX_KHZ} kHz  "
+              f"time {TIME_MIN_DS}..{TIME_MAX_DS} ds  "
+              f"snr {SNR_MIN_DB}..{SNR_MAX_DB} dB  "
+              f"width {WIDTH_MIN_MS}..{WIDTH_MAX_MS} ms\n")
 
-    print("Input files:")
-    for index, path in enumerate(files):
-        samples, src_rate = read_wav_mono(path)
-        diagnostics_data.append((path.name, samples, src_rate))
+        # Phase 1: generate all pings and store (samples, message, params)
+        ping_bank: list[tuple[np.ndarray, int, str, dict]] = []
+        for i in range(args.count):
+            freq_khz = int(rng.integers(FREQ_MIN_KHZ, FREQ_MAX_KHZ + 1))
+            time_ds  = int(rng.integers(TIME_MIN_DS, TIME_MAX_DS + 1))
+            snr_db   = int(rng.integers(SNR_MIN_DB, SNR_MAX_DB + 1))
+            width_ms = int(rng.integers(WIDTH_MIN_MS, WIDTH_MAX_MS + 1))
 
-        # Compute the same flattening correction used by the combined plot,
-        # then apply it together with the 3 kHz LP filter before resampling.
-        _, _, spec_db_src = _compute_spectrogram_db(samples, src_rate)
-        if spec_db_src.size > 0:
-            _, _, correction_db = _flatten_spectrum_by_median_noise_floor(spec_db_src)
-        else:
-            correction_db = np.array([], dtype=np.float64)
-        samples_proc = _equalize_and_lp_filter(
-            samples, correction_db, src_rate, DIAGNOSTIC_NFFT, lp_cutoff_hz=3000.0,
-        )
+            msg = encode_ping_message(freq_khz, time_ds, snr_db, width_ms)
+            print(f"  [{i+1:3d}/{args.count}] {msg}  "
+                  f"freq={freq_khz:+d} kHz  t={time_ds/10:.1f} s  "
+                  f"snr={snr_db:+d} dB  width={width_ms} ms", end='', flush=True)
+            try:
+                samples, src_rate = generate_ping_wav(msg, args.msk144sim)
+                ping_bank.append((samples, src_rate, msg,
+                                  {'freq_khz': freq_khz, 'time_ds': time_ds,
+                                   'snr_db': snr_db, 'width_ms': width_ms}))
+                print(f"  → {samples.size} samples @ {src_rate} Hz")
+            except subprocess.CalledProcessError as exc:
+                print(f"  FAILED (msk144sim returned {exc.returncode}), skipping")
 
-        up = resample_linear(samples_proc, src_rate, args.output_rate)
+        # Phase 2: assemble into output buffer using message-encoded freq and time
+        print(f"\nAssembling {len(ping_bank)} pings into {args.duration:.0f} s × "
+              f"{args.output_rate/1000:.0f} kHz buffer:")
+        for samples, src_rate, msg, params in ping_bank:
+            # Upsample 12 kHz → output rate
+            up = resample_linear(samples, src_rate, args.output_rate)
 
-        shift_hz = target_centers[index] - SOURCE_CENTER_HZ
-        shifted = freq_shift_real_to_complex(up, shift_hz, args.output_rate)
+            # Bandpass to MSK144 signal band before IQ conversion
+            up = _bandpass_real_fft(up, args.output_rate, args.source_bp_lo, args.source_bp_hi)
 
-        prepared.append(shifted)
-        max_len = max(max_len, shifted.size)
+            # Frequency shift: audio at MSK144SIM_AUDIO_CENTER_HZ → params['freq_khz']*1000 Hz
+            target_hz = params['freq_khz'] * 1000.0
+            shift_hz  = target_hz - MSK144SIM_AUDIO_CENTER_HZ
+            shifted   = freq_shift_real_to_complex(up, shift_hz, args.output_rate)
 
-        print(
-            f"  {path.name}: src_rate={src_rate} Hz, samples={samples.size}, "
-            f"upsampled={up.size}, target_center={target_centers[index]:.1f} Hz, "
-            f"shift={shift_hz:+.1f} Hz, start=0.000 s"
-        )
+            # Time placement from encoded time_ds (deciseconds)
+            delay_n = int(params['time_ds'] * 0.1 * args.output_rate)
+            delay_n = min(delay_n, n_total - 1)
 
-    combined = np.zeros(max_len, dtype=np.complex64)
-    for shifted in prepared:
-        combined[:shifted.size] += shifted
+            # Scale amplitude to honour the per-ping SNR encoded in the message.
+            # snr_db=0 → reference level (atten); ±10 dB spans a 20 dB range.
+            snr_scale = 10.0 ** (params['snr_db'] / 20.0)
+            n_copy = min(shifted.size, n_total - delay_n)
+            if n_copy > 0:
+                sig_buf[delay_n:delay_n + n_copy] += (
+                    shifted[:n_copy] * atten * snr_scale
+                ).astype(np.complex64)
 
-    peak = float(np.max(np.abs(combined))) if combined.size else 0.0
-    if peak > 0:
-        combined *= (0.95 / peak)
+            delay_s = delay_n / args.output_rate
+            print(f"  {msg}: centre={target_hz:+.0f} Hz, t={delay_s:.1f} s, "
+                  f"snr_scale={snr_scale:.3f}")
+            placements.append((msg, target_hz, delay_s))
+
+    else:
+        # ── Original mode: read WAV files from --input-dir ────────────────────
+        input_dir = Path(args.input_dir)
+        files = sorted(input_dir.glob(args.pattern))
+        if not files:
+            raise SystemExit(f"No WAV files found in {input_dir} matching {args.pattern}")
+
+        print(f"Source files ({len(files)}):")
+        for path in files:
+            samples, src_rate = read_wav_mono(path)
+
+            up = resample_linear(samples, src_rate, args.output_rate)
+            up = _bandpass_real_fft(up, args.output_rate, args.source_bp_lo, args.source_bp_hi)
+
+            target_center_hz = float(rng.uniform(-args.freq_range_hz, args.freq_range_hz))
+            shift_hz = target_center_hz - SOURCE_CENTER_HZ
+            shifted = freq_shift_real_to_complex(up, shift_hz, args.output_rate)
+
+            delay_n = int(rng.uniform(0.0, args.max_delay_s) * args.output_rate)
+
+            n_copy = min(shifted.size, n_total - delay_n)
+            if n_copy > 0:
+                sig_buf[delay_n:delay_n + n_copy] += (shifted[:n_copy] * atten).astype(np.complex64)
+
+            delay_s = delay_n / args.output_rate
+            print(
+                f"  {path.name}: src={src_rate} Hz, "
+                f"centre={target_center_hz:+.0f} Hz, "
+                f"delay={delay_s:.3f} s"
+            )
+            placements.append((path.name, target_center_hz, delay_s))
+
+    # ── Pass 2: generate AWGN scaled relative to the signal RMS ───────────────
+    # awgn_snr_db is how many dB the signal RMS sits above the AWGN RMS.
+    sig_rms = float(np.sqrt(np.mean(np.abs(sig_buf) ** 2)))
+    awgn_rms = sig_rms / (10.0 ** (args.awgn_snr_db / 20.0))
+    noise_i = rng.standard_normal(n_total).astype(np.float32) * awgn_rms
+    noise_q = rng.standard_normal(n_total).astype(np.float32) * awgn_rms
+    combined = sig_buf + (noise_i + 1j * noise_q).astype(np.complex64)
+
+    print(f"\nSignal RMS: {sig_rms:.6f}  AWGN RMS: {awgn_rms:.6f}  "
+          f"({20*np.log10(sig_rms+1e-30):.1f} dBFS signal, "
+          f"{20*np.log10(awgn_rms+1e-30):.1f} dBFS noise)")
+
+    # Normalise to 0.95 peak (preserves signal/noise ratio)
+    peak = float(np.max(np.abs(combined)))
+    if peak > 0.0:
+        combined *= 0.95 / peak
+    print(f"Peak before normalise: {peak:.6f}  →  scaled to 0.95")
 
     out_npy = Path(args.output_npy)
     np.save(out_npy, combined)
-    print(f"Wrote complex stream: {out_npy} ({combined.size} samples @ {args.output_rate} Hz)")
+    print(f"Wrote: {out_npy}  ({combined.size} samples @ {args.output_rate} Hz)")
 
     if args.output_iq_wav.strip():
         out_wav = Path(args.output_iq_wav)
         write_iq_wav(out_wav, combined, args.output_rate)
-        print(f"Wrote IQ WAV: {out_wav}")
+        print(f"Wrote: {out_wav}")
 
     if not args.skip_plots:
-        plot_wav_diagnostics(
-            diagnostics_data,
-            output_path=Path(args.plot_output),
-            show_plots=args.show_plots,
-            flatten_spectrum=args.flatten_spectrum,
-            combined_output_rate=args.output_rate,
-            combined_target_centers_hz=target_centers,
-            combined_lp_cutoff_hz=3000.0,
-        )
+        _plot_output_spectrogram(combined, args.output_rate, Path(args.plot_output), placements)
 
 
 if __name__ == '__main__':

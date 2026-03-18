@@ -16,6 +16,7 @@ import argparse
 import cProfile
 import io
 import pstats
+import re
 import subprocess
 import tempfile
 import time
@@ -24,21 +25,29 @@ import wave
 from pathlib import Path
 from tkinter import filedialog, ttk
 
+import matplotlib
+matplotlib.use('TkAgg')
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.ticker import MultipleLocator
-from matplotlib.widgets import Button, Slider
+from matplotlib.widgets import Button
 
 # ── msk144spd.f90 algorithm constants ────────────────────────────────────── #
 NSPM_12K      = 864    # samples / MSK144 frame at 12 000 Hz  (72 ms)
 STEP_12K      = 216    # step at 12 000 Hz                    (18 ms = NSPM/4)
 EDGE_FADE_12K = 12     # raised-cosine edge length at 12 kHz (each end)
-DETECT_THRESH = 3.0    # normalized detection metric threshold
+DETECT_THRESH     = 3.0    # normalized detection metric threshold
+DETECT_MERGE_GAP_S = 0.4  # merge successive detections with gaps <= this (seconds)
 
 
-def read_wav_mono(path: Path) -> tuple[np.ndarray, int]:
-    """Read a WAV file and return mono float32 samples in [-1, 1] and sample rate."""
+def read_wav(path: Path) -> tuple[np.ndarray, int]:
+    """Read a WAV file.
+
+    Returns complex64 IQ (L=I, R=Q) for stereo files, or float32 mono
+    for single-channel files.  Samples are normalised to ±1.
+    """
     with wave.open(str(path), 'rb') as wf:
         sample_rate = wf.getframerate()
         channels = wf.getnchannels()
@@ -63,10 +72,35 @@ def read_wav_mono(path: Path) -> tuple[np.ndarray, int]:
     else:
         raise ValueError(f"Unsupported WAV sample width {sample_width} bytes: {path}")
 
-    if channels > 1:
+    if channels == 2:
+        frames = data.reshape(-1, 2)
+        return (frames[:, 0] + 1j * frames[:, 1]).astype(np.complex64), sample_rate
+
+    if channels > 2:
         data = data.reshape(-1, channels).mean(axis=1)
 
     return data.astype(np.float32), sample_rate
+
+
+# Keep the old name as an alias for callers that expect mono
+def read_wav_mono(path: Path) -> tuple[np.ndarray, int]:
+    return read_wav(path)
+
+
+def _lp_filter_iq(samples: np.ndarray, rate: int, cutoff_hz: float) -> np.ndarray:
+    """FFT-domain LP filter for complex IQ: keeps |f| <= cutoff_hz with a 10 % taper."""
+    n = samples.size
+    freq = np.fft.fftfreq(n, 1.0 / rate)
+    X = np.fft.fft(samples.astype(np.complex128))
+    taper_bw = 0.10 * cutoff_hz
+    f_abs = np.abs(freq)
+    gain = np.zeros(n, dtype=np.float64)
+    gain[f_abs <= cutoff_hz] = 1.0
+    trans = (f_abs > cutoff_hz) & (f_abs <= cutoff_hz + taper_bw)
+    if np.any(trans):
+        t = (f_abs[trans] - cutoff_hz) / taper_bw
+        gain[trans] = 0.5 + 0.5 * np.cos(np.pi * t)
+    return np.fft.ifft(X * gain).astype(np.complex64)
 
 
 def _real_to_analytic(samples: np.ndarray) -> np.ndarray:
@@ -91,35 +125,41 @@ def _compute_spectrogram(
     samples: np.ndarray,
     rate: int,
     nfft: int = 512,
-    chunk_samples: int = 504,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (time_s, freq_hz, spec_db) for a real mono signal.
+    """Return (time_s, freq_hz, spec_db) with 50% overlap.
 
-    spec_db has shape (nstep, nfreq) where nfreq = nfft//2 + 1.
+    For complex IQ input the bilateral FFT is used (freq_hz spans -rate/2 … +rate/2).
+    For real mono input rfft is used (0 … rate/2).
+    spec_db shape: (nstep, nfreq).
     """
+    is_complex = np.iscomplexobj(samples)
     nfft = max(256, min(int(nfft), samples.size))
-    chunk_samples = max(1, int(chunk_samples))
+    hop = nfft // 2
 
     window = np.hanning(nfft).astype(np.float64)
     win_power = np.sum(window ** 2)
     frames: list[np.ndarray] = []
     times: list[float] = []
-    elapsed_s = 0.0
 
-    for start in range(0, samples.size, chunk_samples):
-        chunk = samples[start:start + chunk_samples]
-        if chunk.size == 0:
-            continue
-        block = np.zeros(nfft, dtype=np.float64)
-        copy_len = min(chunk.size, nfft)
-        block[:copy_len] = chunk[:copy_len].astype(np.float64)
-        spec = np.fft.rfft(block * window)
+    for start in range(0, samples.size, hop):
+        chunk = samples[start:start + nfft]
+        if is_complex:
+            block = np.zeros(nfft, dtype=np.complex128)
+            block[:chunk.size] = chunk.astype(np.complex128)
+            spec = np.fft.fftshift(np.fft.fft(block * window))
+        else:
+            block = np.zeros(nfft, dtype=np.float64)
+            block[:chunk.size] = chunk.astype(np.float64)
+            spec = np.fft.rfft(block * window)
         psd = (np.abs(spec) ** 2) / (rate * win_power)
         frames.append(10.0 * np.log10(psd + 1e-20))
-        elapsed_s += chunk.size / rate
-        times.append(elapsed_s)
+        times.append((start + nfft / 2) / rate)
 
-    freq_hz = np.fft.rfftfreq(nfft, d=1.0 / rate)
+    if is_complex:
+        freq_hz = np.fft.fftshift(np.fft.fftfreq(nfft, d=1.0 / rate))
+    else:
+        freq_hz = np.fft.rfftfreq(nfft, d=1.0 / rate)
+
     if not frames:
         return np.array([0.0]), freq_hz, np.full((1, freq_hz.size), -180.0, dtype=np.float64)
 
@@ -167,6 +207,86 @@ def _gui_colormap() -> LinearSegmentedColormap:
     return LinearSegmentedColormap.from_list("flex_gui_spectrogram", color_points)
 
 
+def _build_file_picker(
+    parent_win,
+    dialog_dir: list,
+    reload_fn,
+    initial_filename: str = "",
+) -> None:
+    """Create a persistent WAV-file selector Toplevel alongside the figure.
+
+    parent_win     – the TkAgg figure window (fig.canvas.manager.window)
+    dialog_dir     – mutable list[Path] pointing to the current directory
+    reload_fn      – callable(Path) that reloads the figure
+    initial_filename – wav filename to highlight on first open
+    """
+    win = tk.Toplevel(parent_win)
+    win.title("WAV Files")
+    win.geometry("300x440")
+    win.resizable(True, True)
+
+    dir_var = tk.StringVar(value=str(dialog_dir[0]))
+    tk.Label(
+        win, textvariable=dir_var, wraplength=280,
+        justify=tk.LEFT, relief=tk.SUNKEN, anchor='w', padx=4,
+    ).pack(fill=tk.X, padx=6, pady=(6, 2))
+
+    list_frame = tk.Frame(win)
+    list_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=2)
+
+    sb = tk.Scrollbar(list_frame)
+    sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+    lb = tk.Listbox(
+        list_frame, yscrollcommand=sb.set, selectmode=tk.SINGLE,
+        exportselection=False, activestyle='dotbox',
+    )
+    lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    sb.config(command=lb.yview)
+
+    def _populate(highlight: str = "") -> None:
+        lb.delete(0, tk.END)
+        for w in sorted(dialog_dir[0].glob('*.wav')):
+            lb.insert(tk.END, w.name)
+        dir_var.set(str(dialog_dir[0]))
+        if highlight:
+            items = lb.get(0, tk.END)
+            if highlight in items:
+                idx = list(items).index(highlight)
+                lb.selection_set(idx)
+                lb.see(idx)
+
+    def _load(_event=None) -> None:
+        sel = lb.curselection()
+        if not sel:
+            return
+        chosen = dialog_dir[0] / lb.get(sel[0])
+        if chosen.exists():
+            dialog_dir[0] = chosen.parent
+            reload_fn(chosen)
+
+    def _browse() -> None:
+        chosen_dir = filedialog.askdirectory(
+            parent=win, title="Select directory",
+            initialdir=str(dialog_dir[0]),
+        )
+        if chosen_dir:
+            dialog_dir[0] = Path(chosen_dir)
+            _populate()
+
+    # Double-click or Enter to load; single click just highlights
+    lb.bind('<Double-Button-1>', _load)
+    lb.bind('<Return>', _load)
+
+    btn_bar = tk.Frame(win)
+    btn_bar.pack(fill=tk.X, padx=6, pady=(2, 6))
+    ttk.Button(btn_bar, text='Load',        command=_load).pack(side=tk.LEFT, padx=2)
+    ttk.Button(btn_bar, text='Refresh',     command=_populate).pack(side=tk.LEFT, padx=2)
+    ttk.Button(btn_bar, text='Browse Dir…', command=_browse).pack(side=tk.LEFT, padx=2)
+
+    _populate(highlight=initial_filename)
+
+
 def _compute_squared_spectrogram(
     samples: np.ndarray,
     rate: int,
@@ -198,8 +318,20 @@ def _compute_squared_spectrogram(
     i_low  = max(0, min(npos - 1, int(round(2.0 * (fc_hz - 500.0) / df))))
     hw     = max(1, int(round(2.0 * ntol_hz / df)))
 
-    analytic = _real_to_analytic(samples)
-    n        = analytic.size
+    is_complex = np.iscomplexobj(samples)
+    if is_complex:
+        # LP-filter IQ to ±10 kHz before squaring so out-of-band signals don't
+        # alias into the squared spectrum.  After squaring, a ±10 kHz band maps
+        # to ±20 kHz in the squared domain — well within the ±24 kHz display range.
+        analytic = _lp_filter_iq(samples, rate, cutoff_hz=10000.0).astype(np.complex128)
+        freq_hz = np.fft.fftshift(np.fft.fftfreq(nfft, 1.0 / rate))
+        n_spec = nfft          # bilateral: all bins
+    else:
+        analytic = _real_to_analytic(samples)
+        freq_hz = np.arange(npos, dtype=np.float64) * df   # 0 … rate/2
+        n_spec = npos
+
+    n = analytic.size
 
     frames:   list[np.ndarray] = []
     times:    list[float]      = []
@@ -221,23 +353,31 @@ def _compute_squared_spectrogram(
         blk_sq[:edge_n]        *= rcw
         blk_sq[nspm - edge_n:] *= rcw[::-1]
 
-        # Step 3: FFT → power spectrum (positive-frequency half only)
-        tone = np.abs(np.fft.fft(blk_sq, n=nfft)[:npos]) ** 2
+        # Step 3: FFT → power spectrum
+        fft_sq = np.fft.fft(blk_sq, n=nfft)
+        tone_pos = np.abs(fft_sq[:npos]) ** 2          # always use positive half for detection
 
-        frames.append(10.0 * np.log10(tone + 1e-20))
+        if is_complex:
+            spec_frame = 10.0 * np.log10(
+                np.fft.fftshift(np.abs(fft_sq) ** 2) + 1e-20
+            )
+        else:
+            spec_frame = 10.0 * np.log10(tone_pos + 1e-20)
+
+        frames.append(spec_frame)
         times.append((ns + nspm / 2.0) / rate)
 
         # Step 4: detection metric – peak in ±2*ntol_hz window around each tone
         hi_lo = max(0, i_high - hw);  hi_hi = min(npos - 1, i_high + hw)
         lo_lo = max(0, i_low  - hw);  lo_hi = min(npos - 1, i_low  + hw)
-        ah = float(tone[hi_lo:hi_hi + 1].max()) if hi_hi >= hi_lo else 0.0
-        al = float(tone[lo_lo:lo_hi + 1].max()) if lo_hi >= lo_lo else 0.0
+        ah = float(tone_pos[hi_lo:hi_hi + 1].max()) if hi_hi >= hi_lo else 0.0
+        al = float(tone_pos[lo_lo:lo_hi + 1].max()) if lo_hi >= lo_lo else 0.0
         det_raw.append(max(ah, al))
 
         istp += 1
 
     if not frames:
-        return np.array([0.0]), freq_hz, np.zeros((1, npos)), np.zeros(1)
+        return np.array([0.0]), freq_hz, np.zeros((1, n_spec)), np.zeros(1)
 
     spec_db = np.stack(frames)
     time_s  = np.array(times,   dtype=np.float64)
@@ -270,6 +410,9 @@ def run_detections(
         f"\n{wav_path.name}: {rate} Hz, {samples.size} samples "
         f"({samples.size / rate:.3f} s), fc={fc_hz:.0f} Hz, ntol=\u00b1{ntol_hz:.0f} Hz"
     )
+    if np.iscomplexobj(samples):
+        print("  (complex IQ input – jt9 decode requires mono; skipping detection)")
+        return
 
     t2, _, _, det_norm = _compute_squared_spectrogram(samples, rate, fc_hz, ntol_hz)
     block_dur = t2[1] - t2[0] if len(t2) > 1 else 0.0
@@ -286,20 +429,37 @@ def run_detections(
                 start_idx = None
     if start_idx is not None:
         detections.append((start_idx, len(det_norm) - 1))
+
+    # Merge detections whose gap is within DETECT_MERGE_GAP_S
+    if block_dur > 0:
+        gap_frames = int(DETECT_MERGE_GAP_S / block_dur)
+        merged: list[list[int]] = []
+        for d_start, d_end in detections:   # still in time order here
+            if merged and (d_start - merged[-1][1]) <= gap_frames:
+                merged[-1][1] = d_end
+            else:
+                merged.append([d_start, d_end])
+        detections = [tuple(d) for d in merged]  # type: ignore[assignment]
+
     detections.sort(key=lambda s_e: det_norm[s_e[0]:s_e[1]+1].max(), reverse=True)
 
-    pad = np.zeros(int(0.5 * rate), dtype=np.float32)
+
+    pad = np.zeros(int(0.1 * rate), dtype=np.float32)  # Set to 0.0 for manual testing
 
     print(f"\njt9: {' '.join(JT9_BASE_ARGS)} <wav>")
-    print(f"{'start':>7}  {'dur':>6}  {'metric':>6}  decode")
+    pad = np.zeros(int(0.1 * rate), dtype=np.float32)  # 0.1 seconds of padding, per manual test
     if not detections:
         print("  (no detections above threshold)")
+        return
     for d_start, d_end in detections:
         t_start    = t2[d_start]
         t_end      = t2[d_end]
         max_metric = float(det_norm[d_start:d_end+1].max())
         duration   = (d_end - d_start + 1) * block_dur
-        segment    = samples[int(t_start * rate):int(t_end * rate)]
+        pre_post   = int(0.5 * rate)
+        seg_start  = max(0, int(t_start * rate) - pre_post)
+        seg_end    = min(samples.size, int(t_end * rate) + pre_post)
+        segment    = samples[seg_start:seg_end]
         padded     = np.concatenate([pad, segment, pad])
 
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
@@ -320,6 +480,20 @@ def run_detections(
                 if s and not s.startswith('<') and not s.startswith('EOF'):
                     decoded = s
                     break
+            # Save to permanent file if valid decode, but skip if this file
+            # is itself a saved detection (stem already contains _t<digits>)
+            is_detection_file = bool(re.search(r'_t\d+\.\d+', wav_path.stem))
+            if decoded and not is_detection_file:
+                det_dir = wav_path.parent / 'detections'
+                det_dir.mkdir(exist_ok=True)
+                out_name = f"{wav_path.stem}_t{t_start:.2f}.wav"
+                out_path = det_dir / out_name
+                with wave.open(str(out_path), 'wb') as wf_out:
+                    wf_out.setnchannels(1)
+                    wf_out.setsampwidth(2)
+                    wf_out.setframerate(rate)
+                    wf_out.writeframes((padded * 32767).astype(np.int16).tobytes())
+                print(f"Saved detection to: {out_path}")
         finally:
             Path(tmp_path).unlink(missing_ok=True)
         print(f"{t_start:7.3f}  {duration:6.3f}  {max_metric:6.2f}  {decoded or 'no decode'}")
@@ -366,6 +540,14 @@ def plot_analysis(
     t0 = _tick('operational: squared_spectrogram', t0)
 
     floor2 = _estimate_median(s2)
+
+    # Align the squared spectrum's median noise floor with the normal spectrum
+    # so one set of baseline/gain sliders controls both rows (mirrors the fixed
+    # -15 dB offset baked into flex_gui's power_db_sq computation).
+    sq_offset = float(np.median(floor1)) - float(np.median(floor2))
+    s2     = s2     + sq_offset
+    floor2 = floor2 + sq_offset
+
     t0 = _tick('analysis: median_floor_row2', t0)
 
     # Expected squared-tone frequencies (for reference lines)
@@ -374,10 +556,8 @@ def plot_analysis(
 
     # ── Figure layout ──────────────────────────────────────────────────────
     gui_cmap = _gui_colormap()
-    baseline_default = -110.0
-    gain_default     =   40.0
-    vmin0 = baseline_default
-    vmax0 = baseline_default + gain_default
+    vmin0 = -110.0
+    vmax0 =  -70.0
 
     fig, axes = plt.subplots(
         3, 2,
@@ -391,6 +571,8 @@ def plot_analysis(
         return [float(t[0]), float(t[-1]), float(f[0]) / 1000.0, float(f[-1]) / 1000.0]
 
     # ── [0,0]  Normal spectrogram ──────────────────────────────────────────
+    f1_min_khz = float(f1[0])  / 1000.0
+    f1_max_khz = float(f1[-1]) / 1000.0
     ax00, ax01 = axes[0]
     img1 = ax00.imshow(
         s1.T, aspect='auto', origin='lower',
@@ -399,7 +581,7 @@ def plot_analysis(
     ax00.set_title(row1_title)
     ax00.set_xlabel("Time (s)")
     ax00.set_ylabel("Frequency (kHz)")
-    ax00.set_ylim(0.0, 6.0)
+    ax00.set_ylim(f1_min_khz, f1_max_khz)
     ax00.xaxis.set_major_locator(MultipleLocator(1.0))
 
     # ── [0,1]  Median noise floor vs frequency ─────────────────────────────
@@ -408,21 +590,17 @@ def plot_analysis(
     ax01.set_xlabel("Level (dB)")
     ax01.set_ylabel("Frequency (kHz)")
     ax01.set_xlim(vmin0, vmax0)
-    ax01.set_ylim(0.0, 6.0)
+    ax01.set_ylim(f1_min_khz, f1_max_khz)
     ax01.grid(True, alpha=0.25)
 
     # ── [1,0]  Squared spectrogram ─────────────────────────────────────────
+    f2_min_khz = float(f2[0])  / 1000.0
+    f2_max_khz = float(f2[-1]) / 1000.0
     ax10, ax11 = axes[1]
-
-    # Auto-scale the squared spectrogram (its absolute dB level differs from row 1)
-    s2_finite = s2[np.isfinite(s2)]
-    sq_vmin = float(np.percentile(s2_finite,  5)) if s2_finite.size else -180.0
-    sq_vmax = float(np.percentile(s2_finite, 99)) if s2_finite.size else -100.0
-    sq_vmax = max(sq_vmax, sq_vmin + gain_default)
 
     img2 = ax10.imshow(
         s2.T, aspect='auto', origin='lower',
-        extent=_extent(t2, f2), cmap=gui_cmap, vmin=sq_vmin, vmax=sq_vmax,
+        extent=_extent(t2, f2), cmap=gui_cmap, vmin=vmin0, vmax=vmax0,
     )
 
     # Reference lines at expected squared-tone frequencies
@@ -432,10 +610,12 @@ def plot_analysis(
                  label=f'2\u00b7(fc\u2212500)={f_sq_low:.0f} Hz')
 
     ax10.set_title(
-        f"Squared-Signal Spectrogram  (fc={fc_hz:.0f} Hz, ntol=\u00b1{ntol_hz:.0f} Hz)"
+        f"Squared-Signal Spectrogram  (fc={fc_hz:.0f} Hz, ntol=\u00b1{ntol_hz:.0f} Hz,"
+        f" sq_offset={sq_offset:+.0f} dB)"
     )
     ax10.set_xlabel("Time (s)")
     ax10.set_ylabel("Frequency (kHz)")
+    ax10.set_ylim(f2_min_khz, f2_max_khz)
     ax10.xaxis.set_major_locator(MultipleLocator(1.0))
     ax10.legend(fontsize=8, loc='upper right')
 
@@ -444,6 +624,8 @@ def plot_analysis(
     ax11.set_title("Median Noise")
     ax11.set_xlabel("Level (dB)")
     ax11.set_ylabel("Frequency (kHz)")
+    ax11.set_xlim(vmin0, vmax0)
+    ax11.set_ylim(f2_min_khz, f2_max_khz)
     ax11.grid(True, alpha=0.25)
 
     # ── [2,0]  Detection metric vs time (x-axis aligned with [1,0]) ────────
@@ -466,33 +648,59 @@ def plot_analysis(
 
     t0 = _tick('analysis: plot_layout_and_axes', t0)
 
-    # ── Baseline / Gain sliders + Open WAV button ──────────────────────────
+    # ── Color-range controls ───────────────────────────────────────────────
+    # Sliders generate many events during a drag and flood the renderer.
+    # Instead use discrete scroll-wheel events (one redraw per click):
+    #   scroll up/down          → shift min+max together  (brightness)
+    #   Ctrl + scroll up/down   → expand/contract span    (contrast)
+    # Current values are shown as text in the button bar.
     if show_plots:
-        fig.tight_layout(rect=[0, 0.10, 1, 0.97])
-        btn_ax = fig.add_axes([0.01, 0.035, 0.11, 0.030])
-        bl_ax  = fig.add_axes([0.15, 0.04,  0.30, 0.025])
-        gn_ax  = fig.add_axes([0.58, 0.04,  0.30, 0.025])
-
+        fig.tight_layout(rect=[0, 0.07, 1, 0.97])
+        btn_ax = fig.add_axes([0.01, 0.020, 0.11, 0.030])
         open_btn = Button(btn_ax, 'Open WAV\u2026', color='0.15', hovercolor='0.30')
-        bl_sl = Slider(bl_ax, "Baseline (dB)", -240.0, -20.0,
-                       valinit=baseline_default, valstep=1.0)
-        gn_sl = Slider(gn_ax, "Gain (dB)", 10.0, 220.0,
-                       valinit=gain_default, valstep=1.0)
 
-        def _update(_: object) -> None:
-            bl = float(bl_sl.val)
-            gn = float(gn_sl.val)
-            img1.set_clim(bl, bl + gn)
-            ax01.set_xlim(bl, bl + gn)
+        clim = [vmin0, vmax0]          # mutable so closures can update it
+        SCROLL_STEP = 2.0              # dB per scroll click
+
+        lbl = fig.text(0.15, 0.030, '', fontsize=9, va='center',
+                       color='white', family='monospace')
+
+        def _apply_clim() -> None:
+            img1.set_clim(clim[0], clim[1])
+            img2.set_clim(clim[0], clim[1])
+            ax01.set_xlim(clim[0], clim[1])
+            ax11.set_xlim(clim[0], clim[1])
+            lbl.set_text(
+                f'Min {clim[0]:+.0f} dB   Max {clim[1]:+.0f} dB'
+                f'   span {clim[1]-clim[0]:.0f} dB'
+                f'   (scroll=brightness  ctrl+scroll=contrast)'
+            )
             fig.canvas.draw_idle()
 
-        bl_sl.on_changed(_update)
-        gn_sl.on_changed(_update)
+        def _on_scroll(event) -> None:
+            if event.inaxes not in (ax00, ax01, ax10, ax11):
+                return
+            delta = SCROLL_STEP if event.button == 'up' else -SCROLL_STEP
+            if event.key == 'control':
+                # Ctrl+scroll: expand (down) or contract (up) the span
+                clim[0] -= delta
+                clim[1] += delta
+            else:
+                # Plain scroll: shift both limits (brightness)
+                clim[0] += delta
+                clim[1] += delta
+            _apply_clim()
+
+        fig.canvas.mpl_connect('scroll_event', _on_scroll)
+        _apply_clim()   # set initial label text
+
+        def _full_redraw() -> None:
+            _apply_clim()
 
         dialog_dir = [output_path.parent]
 
         def _reload(new_wav: Path) -> None:
-            new_samples, new_rate = read_wav_mono(new_wav)
+            new_samples, new_rate = read_wav(new_wav)
 
             # Row 1
             t1n, f1n, s1n_raw = _compute_spectrogram(new_samples, new_rate)
@@ -505,6 +713,10 @@ def plot_analysis(
                 ax00.set_title("Spectrogram (original)")
             img1.set_data(s1n.T)
             img1.set_extent(_extent(t1n, f1n))
+            f1n_min_khz = float(f1n[0])  / 1000.0
+            f1n_max_khz = float(f1n[-1]) / 1000.0
+            ax00.set_ylim(f1n_min_khz, f1n_max_khz)
+            ax01.set_ylim(f1n_min_khz, f1n_max_khz)
             floor1_line.set_xdata(floor1n)
             floor1_line.set_ydata(f1n / 1000.0)
 
@@ -513,15 +725,21 @@ def plot_analysis(
                 new_samples, new_rate, fc_hz, ntol_hz
             )
             floor2n = _estimate_median(s2n)
-            s2n_fin = s2n[np.isfinite(s2n)]
-            sq_vmin_n = float(np.percentile(s2n_fin,  5)) if s2n_fin.size else -180.0
-            sq_vmax_n = float(np.percentile(s2n_fin, 99)) if s2n_fin.size else -100.0
-            sq_vmax_n = max(sq_vmax_n, sq_vmin_n + gain_default)
+            sq_offset_n = float(np.median(floor1n)) - float(np.median(floor2n))
+            s2n     = s2n     + sq_offset_n
+            floor2n = floor2n + sq_offset_n
+            ax10.set_title(
+                f"Squared-Signal Spectrogram  (fc={fc_hz:.0f} Hz, ntol=\u00b1{ntol_hz:.0f} Hz,"
+                f" sq_offset={sq_offset_n:+.0f} dB)"
+            )
             img2.set_data(s2n.T)
             img2.set_extent(_extent(t2n, f2n))
-            img2.set_clim(sq_vmin_n, sq_vmax_n)
+            f2n_min_khz = float(f2n[0])  / 1000.0
+            f2n_max_khz = float(f2n[-1]) / 1000.0
+            ax10.set_ylim(f2n_min_khz, f2n_max_khz)
             floor2_line.set_xdata(floor2n)
             floor2_line.set_ydata(f2n / 1000.0)
+            ax11.set_ylim(f2n_min_khz, f2n_max_khz)
             ax11.relim()
             ax11.autoscale_view(scalex=True, scaley=False)
 
@@ -542,7 +760,7 @@ def plot_analysis(
 
             new_out = new_wav.parent / (new_wav.stem + '_analysis.png')
             fig.suptitle(f"MSK144 Analysis \u2013 {new_wav.name}", fontsize=13)
-            fig.canvas.draw_idle()
+            _full_redraw()   # rebuilds blit background for the new file
             fig.savefig(new_out, dpi=140)
             print(f"Wrote: {new_out}")
             run_detections(new_wav, new_samples, new_rate, fc_hz, ntol_hz)
@@ -566,6 +784,16 @@ def plot_analysis(
             _reload(new_wav)
 
         open_btn.on_clicked(_on_open_wav)
+
+        try:
+            _build_file_picker(
+                fig.canvas.manager.window,
+                dialog_dir,
+                _reload,
+                initial_filename=name,
+            )
+        except Exception:
+            pass  # non-TkAgg backend: file picker unavailable, Open WAV button still works
     else:
         fig.tight_layout(rect=[0, 0.02, 1, 0.97])
 
@@ -650,7 +878,7 @@ def main() -> None:
         else:
             out_path = wav_path.parent / (wav_path.stem + '_analysis.png')
 
-        samples, rate = read_wav_mono(wav_path)
+        samples, rate = read_wav(wav_path)
         show = args.show and not args.profile
         timings: dict | None = {} if args.profile else None
 

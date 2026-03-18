@@ -2,7 +2,9 @@
 
 import datetime
 import numpy as np
-from PyQt5 import QtWidgets
+from PyQt5 import QtCore, QtWidgets
+
+_SETTINGS = QtCore.QSettings('FlexDAXIQ', 'DAXIQVisualizer')
 
 from .ui import (
     setup_ui,
@@ -16,6 +18,7 @@ from .ui import (
 from .runtime import setup_flex_client, run_flex_client, _get_tuned_frequency_mhz, closeEvent
 from .processing import process_iq_data
 from .displays import update_displays
+from .detection import design_lp_filter
 
 
 class DAXIQVisualizer(QtWidgets.QMainWindow):
@@ -43,7 +46,7 @@ class DAXIQVisualizer(QtWidgets.QMainWindow):
         self.fft_size = fft_size
         self.bind_client_id = bind_client_id or bind_client_handle
         self.history_secs = 15
-        self.blocks_per_sec = self.sample_rate / self.fft_size
+        self.blocks_per_sec = self.sample_rate / (self.fft_size // 2)  # 50% overlap hop
         self.max_history = int(round(self.history_secs * self.blocks_per_sec))
         self.running = True
         self.source_mode = "flex"
@@ -85,8 +88,8 @@ class DAXIQVisualizer(QtWidgets.QMainWindow):
         self.energy_write_index = min(max(initial_index, 0), self.max_history - 1)
         self.max_time = self.history_secs
 
-        self.min_level = -90
-        self.max_level = -30
+        self.min_level    = int(_SETTINGS.value('min_level',    -90))
+        self.max_level    = int(_SETTINGS.value('max_level',    -30))
 
         # Squared signal spectrogram buffers (for MSK144 tone-pair detection).
         # Squaring the IQ doubles all spectral component frequencies; MSK144 tones
@@ -109,8 +112,20 @@ class DAXIQVisualizer(QtWidgets.QMainWindow):
             np.fft.fftfreq(self.fft_size, 1.0 / self.sample_rate)
         ) / 1e3
 
-        self.sq_min_level = -180
-        self.sq_max_level = -100
+        self.sq_min_level = self.min_level
+        self.sq_max_level = self.max_level
+
+        # LP filter state (10 kHz cutoff, streaming FIR)
+        self._lp_taps = design_lp_filter(self.sample_rate)
+        self._lp_zi_re = np.zeros(len(self._lp_taps) - 1, dtype=np.float64)
+        self._lp_zi_im = np.zeros(len(self._lp_taps) - 1, dtype=np.float64)
+
+        # Circular IQ ring buffer (5 seconds of LP-filtered samples)
+        _ring_n = int(5 * self.sample_rate)
+        self._iq_ring = np.zeros(_ring_n, dtype=np.complex64)
+        self._iq_ring_pos = 0
+        self._iq_abs_sample = 0
+        self._detect_cooldown = 0
 
         self.fft_bin_axis_mhz = np.fft.fftshift(
             np.fft.fftfreq(self.fft_size, 1 / self.sample_rate)
@@ -121,6 +136,9 @@ class DAXIQVisualizer(QtWidgets.QMainWindow):
         print(f"Center requested: {self.center_freq_mhz:.6f} MHz", flush=True)
 
         self.setup_ui()
+        geometry = _SETTINGS.value('geometry')
+        if geometry:
+            self.restoreGeometry(geometry)
         self.setup_flex_client()
 
     def _map_energy_to_freq_band(self, energy_vals, freq_min, freq_max):
