@@ -1,14 +1,108 @@
 #!/usr/bin/env python3
 """Analyze a single MSK144 WAV file.
 
-Two-row diagnostic display:
-  Row 1 – Normal spectrogram (original or flattened) + median noise-floor panel.
-  Row 2 – Squared-signal spectrogram (msk144spd.f90 algorithm) + detection-metric panel.
+Standalone diagnostic and decode tool for MSK144 audio files.  Produces a
+four-panel matplotlib figure, runs the WSJT-X ``jt9`` decoder on every
+detected burst, and can save results interactively.  Accepts stereo IQ (L=I,
+R=Q) or mono real audio; handles 8-bit, 16-bit, 32-bit int, and float32 WAV.
 
-The squared-signal row implements the exact sliding-window algorithm from
-msk144spd.f90: NSPM=864 samples per frame at 12 kHz (scaled to actual rate),
-step=NSPM/4, 12-sample raised-cosine edge window, complex analytic squaring,
-then FFT to locate the expected tones at 2*(fc±500) Hz.
+Display layout (3 rows × 2 columns)
+------------------------------------
+[0, 0]  Normal spectrogram — Hanning-windowed, 50 % overlap FFT, expressed as
+        power-spectral density in dB/Hz.  For complex IQ input the bilateral
+        FFT is used (−Fs/2 … +Fs/2); for mono real input rfft is used
+        (0 … Fs/2).  Optional flattening (``--flatten-spectrum``, default on)
+        equalises the noise floor across frequency by adding the median-floor
+        correction per bin, making weak signals visible against a tilted
+        passband.
+
+[0, 1]  Median noise-floor curve for row 0 — per-frequency 50th-percentile
+        power across all time frames.
+
+[1, 0]  Squared-signal spectrogram — implements the exact sliding-window
+        algorithm from WSJT-X ``msk144spd.f90``:
+          * Frame length NSPM = 864 samples at 12 kHz (72 ms), scaled to
+            the actual input sample rate.
+          * Step = NSPM / 4 (18 ms, 75 % overlap).
+          * 12-sample raised-cosine edge window applied to each frame after
+            squaring: ``rcw[i] = (1 − cos(i·π/edge_n)) / 2``.
+          * For complex IQ input, the IQ is LP-filtered to ±10 kHz before
+            squaring so out-of-band signals do not alias into the squared
+            domain.  For mono input, the signal is converted to its analytic
+            form first (via FFT, zeroing negative-frequency bins) to eliminate
+            the mirror-image tone pair that would appear at negative fc when
+            squaring a real signal.
+          * FFT of each squared, windowed frame gives the squared spectrum.
+          * Reference lines mark the expected squared-tone centres at
+            2·(fc±500) Hz.
+          * A display offset (``sq_offset``) aligns the squared-spectrum noise
+            median with the normal-spectrum noise median so both rows share the
+            same colour scale.
+
+[1, 1]  Median noise-floor curve for the squared spectrum.
+
+[2, 0]  Detection metric strip — the per-frame tone-pair strength normalised by
+        its 25th percentile (matching the ``xmed`` normalisation in
+        ``msk144spd.f90``).  Red dashed threshold line at ``DETECT_THRESH = 3.0``.
+        Red fill marks frames above threshold.  X-axis is shared with [1, 0].
+
+[2, 1]  Hidden (no content needed alongside the metric strip).
+
+Detection and decode pipeline (``run_detections``)
+---------------------------------------------------
+1. **Threshold crossing** — contiguous runs of frames where
+   ``det_norm >= DETECT_THRESH`` are collected as candidate bursts.
+2. **Gap merging** — bursts separated by ≤ ``DETECT_MERGE_GAP_S = 0.4 s``
+   are merged into a single detection.
+3. **Ranking** — bursts sorted strongest-first by peak metric; all are
+   attempted regardless of rank.
+4. **Segment extraction** — ±0.5 s around each burst is extracted from the
+   source array, zero-padded by 0.1 s each end.
+5. **Decode** — the segment is written to a temporary 16-bit mono WAV at the
+   source sample rate and passed to ``jt9 --msk144 -p 15 -L 1400 -H 1600
+   -f 1500 -F 200 -d 3``.
+6. **Save** — on a successful decode the padded segment WAV is saved to
+   ``<source_dir>/detections/<stem>_t<time>.wav``; detection files
+   (filenames containing ``_t<digits>``) are not re-saved to avoid recursion.
+
+Interactive controls (``--show-plots`` mode)
+--------------------------------------------
+Scroll wheel (over any spectrogram or noise panel)
+    Plain scroll — shifts both colour limits together (brightness).
+    Ctrl + scroll — expands or contracts the span (contrast).
+    Step size: 2 dB per click.  Current limits shown in a status line below
+    the figure.
+
+"Open WAV…" button
+    Opens a file dialog; reloads the figure with the new file in-place
+    (updates image data, axes, noise curves, detection metric, and saves a
+    new PNG) without opening a second window.
+
+Persistent file-picker Toplevel (TkAgg backend)
+    A separate Tk window listing all ``*.wav`` files in the current directory
+    appears alongside the figure.  Double-click or Enter loads a file; the
+    Browse Dir… button switches directory.
+
+Command-line arguments
+----------------------
+wav                     Input WAV file path; opens a file dialog if omitted.
+--fc-hz FLOAT           Expected carrier frequency in Hz (default: 1500).
+--ntol-hz FLOAT         ±Search tolerance around each squared tone (default: 50).
+--flatten-spectrum      Flatten row-1 spectrogram by median noise floor (default on).
+--no-flatten-spectrum   Show raw (unflattened) spectrogram in row 1.
+--show-plots            Open interactive window (default on).
+--no-show-plots         Save PNG only; no window.
+--plot-output PATH      Output PNG path (default: ``<stem>_analysis.png``).
+--profile               Run ``cProfile`` + section timing table; implies
+                        ``--no-show-plots``.
+
+Algorithm constants
+-------------------
+NSPM_12K      : 864    samples/frame at 12 kHz (72 ms, matches msk144spd.f90)
+STEP_12K      : 216    step at 12 kHz (18 ms = NSPM/4)
+EDGE_FADE_12K : 12     raised-cosine edge length at 12 kHz
+DETECT_THRESH     : 3.0   normalised detection threshold
+DETECT_MERGE_GAP_S: 0.4 s gap within which successive detections are merged
 """
 from __future__ import annotations
 
@@ -32,7 +126,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.ticker import MultipleLocator
-from matplotlib.widgets import Button
+from matplotlib.widgets import Button, Slider
 
 # ── msk144spd.f90 algorithm constants ────────────────────────────────────── #
 NSPM_12K      = 864    # samples / MSK144 frame at 12 000 Hz  (72 ms)
@@ -204,7 +298,7 @@ def _gui_colormap() -> LinearSegmentedColormap:
         (pos, (r / 255.0, g / 255.0, b / 255.0))
         for pos, (r, g, b) in zip(positions, colors)
     ]
-    return LinearSegmentedColormap.from_list("flex_gui_spectrogram", color_points)
+    return LinearSegmentedColormap.from_list("radio_iq_spectrogram", color_points)
 
 
 def _build_file_picker(
@@ -383,9 +477,13 @@ def _compute_squared_spectrogram(
     time_s  = np.array(times,   dtype=np.float64)
     det_arr = np.array(det_raw, dtype=np.float64)
 
-    # Normalize by 25th percentile (mirrors msk144spd "xmed" normalization)
+    # Normalize by 25th percentile (mirrors msk144spd "xmed" normalization).
+    # Floor at 0.1 % of the mean prevents blowup when the detection bins contain
+    # near-zero power (e.g. complex IQ input where signals are not at fc_hz).
     pct25    = float(np.percentile(det_arr, 25)) if det_arr.size > 1 else float(det_arr[0])
-    det_norm = det_arr / max(pct25, 1e-20)
+    mean_val = float(np.mean(det_arr)) if det_arr.size > 0 else 1.0
+    ref      = max(pct25, mean_val * 0.001, 1e-20)
+    det_norm = det_arr / ref
 
     return time_s, freq_hz, spec_db, det_norm
 
@@ -656,43 +754,49 @@ def plot_analysis(
     # Current values are shown as text in the button bar.
     if show_plots:
         fig.tight_layout(rect=[0, 0.07, 1, 0.97])
-        btn_ax = fig.add_axes([0.01, 0.020, 0.11, 0.030])
+        btn_ax = fig.add_axes([0.01, 0.015, 0.10, 0.030])
         open_btn = Button(btn_ax, 'Open WAV\u2026', color='0.15', hovercolor='0.30')
 
         clim = [vmin0, vmax0]          # mutable so closures can update it
         SCROLL_STEP = 2.0              # dB per scroll click
 
-        lbl = fig.text(0.15, 0.030, '', fontsize=9, va='center',
-                       color='white', family='monospace')
+        baseline_ax = fig.add_axes([0.18, 0.015, 0.28, 0.025])
+        gain_ax     = fig.add_axes([0.60, 0.015, 0.28, 0.025])
+        baseline_slider = Slider(baseline_ax, 'Min (dB)', -200.0, 0.0,
+                                 valinit=vmin0, valstep=1.0)
+        gain_slider     = Slider(gain_ax,     'Span (dB)',  5.0, 120.0,
+                                 valinit=vmax0 - vmin0, valstep=1.0)
 
         def _apply_clim() -> None:
             img1.set_clim(clim[0], clim[1])
             img2.set_clim(clim[0], clim[1])
             ax01.set_xlim(clim[0], clim[1])
             ax11.set_xlim(clim[0], clim[1])
-            lbl.set_text(
-                f'Min {clim[0]:+.0f} dB   Max {clim[1]:+.0f} dB'
-                f'   span {clim[1]-clim[0]:.0f} dB'
-                f'   (scroll=brightness  ctrl+scroll=contrast)'
-            )
             fig.canvas.draw_idle()
+
+        def _on_slider(_val) -> None:
+            clim[0] = float(baseline_slider.val)
+            clim[1] = clim[0] + float(gain_slider.val)
+            _apply_clim()
+
+        baseline_slider.on_changed(_on_slider)
+        gain_slider.on_changed(_on_slider)
 
         def _on_scroll(event) -> None:
             if event.inaxes not in (ax00, ax01, ax10, ax11):
                 return
             delta = SCROLL_STEP if event.button == 'up' else -SCROLL_STEP
             if event.key == 'control':
-                # Ctrl+scroll: expand (down) or contract (up) the span
-                clim[0] -= delta
-                clim[1] += delta
+                # Ctrl+scroll: expand/contract span via gain slider
+                gain_slider.set_val(max(5.0, gain_slider.val + 2 * delta))
             else:
-                # Plain scroll: shift both limits (brightness)
-                clim[0] += delta
-                clim[1] += delta
-            _apply_clim()
+                # Plain scroll: shift baseline slider (brightness)
+                baseline_slider.set_val(
+                    float(np.clip(baseline_slider.val + delta, -200.0, 0.0))
+                )
 
         fig.canvas.mpl_connect('scroll_event', _on_scroll)
-        _apply_clim()   # set initial label text
+        _apply_clim()   # set initial clim
 
         def _full_redraw() -> None:
             _apply_clim()

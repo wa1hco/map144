@@ -1,4 +1,83 @@
-"""High-level Flex DAXIQ client orchestration."""
+# Copyright (C) 2026  Jeff Millar, WA1HCO <wa1hco@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""High-level FlexDAXIQ client: discovery, connection, stream, and sample delivery.
+
+This module contains ``FlexDAXIQ``, the single class a caller needs to start
+receiving IQ samples from a FlexRadio.  It orchestrates the lower-level
+components in ``discovery``, ``tcp_client``, ``setup``, and ``vita`` and
+exposes a simple start / get_samples / stop API.
+
+Class: FlexDAXIQ
+----------------
+Constructor parameters
+    radio_ip         : str | None   — Radio IP; auto-discovered via UDP broadcast
+                                      if omitted.
+    center_freq_mhz  : float        — Requested centre frequency in MHz.
+                                      Only applied to a slice if one is assigned
+                                      to the DAX IQ channel; panadapter frequency
+                                      is controlled by SmartSDR.
+    sample_rate      : int          — DAXIQ sample rate (24000 / 48000 / 96000 /
+                                      192000 Hz).  SmartSDR must be configured to
+                                      match; this client does not force the rate.
+    dax_channel      : int          — DAX IQ channel number (1–8 depending on licence).
+    listen_port      : int          — Local UDP port for VITA-49 stream; overridden
+                                      at ``start()`` time by an auto-selected
+                                      ephemeral port via ``_pick_udp_listen_port()``.
+    bind_client_id   : str | None   — GUI client UUID for ``client bind
+                                      client_id=<uuid>``.  Required when SmartSDR
+                                      enforces client binding so that the DAXIQ
+                                      stream is associated with an active GUI
+                                      context and UDP packets actually flow.
+    bind_client_handle : str | None — Deprecated alias for ``bind_client_id``.
+
+start() sequence
+    1. Discover or use provided radio IP; create ``FlexRadio`` object.
+    2. Connect ``FlexTCPClient`` (TCP port 4992).
+    3. Subscribe for client status (``sub client all`` / ``sub client``) and
+       wait 0.5 s for the radio to emit ``client`` status lines.
+    4. Collect GUI client UUIDs from status lines and discovery advertisements.
+    5. Determine ``bind_client_id``: explicit argument → status-observed IDs →
+       discovery-advertised IDs → none (log warning).
+    6. Send ``client bind client_id=<uuid>`` if a UUID is available; run bound-
+       context diagnostics (``slice list``) to verify the binding context.
+    7. Pick an ephemeral UDP listen port via ``_pick_udp_listen_port()``.
+    8. Instantiate ``DAXIQSetup`` and call ``setup(center_freq_mhz)`` to:
+         - Subscribe to panadapter status and discover existing pan/slice context.
+         - Assign the DAX IQ channel to a panadapter (``dax iq set``).
+         - Create the DAXIQ stream (``stream create daxiq=``).
+         - Optionally tune a slice to ``center_freq_mhz``.
+    9. Instantiate ``VITAReceiver`` and start the UDP receive thread.
+
+sample_queue
+    A ``queue.Queue(maxsize=500)`` populated by ``VITAReceiver``.  Each entry
+    is a ``VitaPacket`` with fields:
+      - ``samples``        — complex64 NumPy array, I + jQ
+      - ``timestamp_int``  — integer seconds (GPS or Unix epoch)
+      - ``timestamp_frac`` — fractional timestamp (picoseconds)
+      - ``stream_id``      — 32-bit VITA-49 stream identifier
+      - ``sequence``       — 4-bit packet sequence number
+
+get_samples(timeout)
+    Convenience wrapper around ``sample_queue.get(timeout=timeout)``.
+    Returns ``None`` on timeout; raises nothing.
+
+stop()
+    Stops the VITA receiver thread, sends ``stream remove`` to the radio,
+    and closes the TCP connection.  Safe to call even if ``start()`` was
+    never completed successfully.
+"""
 
 import queue
 import time

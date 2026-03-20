@@ -1,0 +1,101 @@
+{
+  "generated_at": "2026-03-19T19:53:01.062918+00:00",
+  "output_wav": "msk144_combined_iq_48k.wav",
+  "output_npy": "msk144_combined_iq_48k.npy",
+  "output_rate": 48000,
+  "duration_s": 15.0,
+  "awgn_snr_db": 15.0,
+  "atten_db": 10.0,
+  "placements": [
+    {
+      "msg": "AN09062P03128",
+      "center_hz": -9000.0,
+      "delay_s": 6.2,
+      "freq_khz": -9,
+      "time_ds": 62,
+      "snr_db": 3,
+      "width_ms": 128
+    },
+    {
+      "msg": "AP05036P02106",
+      "center_hz": 5000.0,
+      "delay_s": 3.6,
+      "freq_khz": 5,
+      "time_ds": 36,
+      "snr_db": 2,
+      "width_ms": 106
+    },
+    {
+      "msg": "AP10034N05111",
+      "center_hz": 10000.0,
+      "delay_s": 3.4,
+      "freq_khz": 10,
+      "time_ds": 34,
+      "snr_db": -5,
+      "width_ms": 111
+    },
+    {
+      "msg": "AP01024N03178",
+      "center_hz": 1000.0,
+      "delay_s": 2.4,
+      "freq_khz": 1,
+      "time_ds": 24,
+      "snr_db": -3,
+      "width_ms": 178
+    },
+    {
+      "msg": "AP08109P00153",
+      "center_hz": 8000.0,
+      "delay_s": 10.9,
+      "freq_khz": 8,
+      "time_ds": 109,
+      "snr_db": 0,
+      "width_ms": 153
+    },
+    {
+      "msg": "AP05047N08272",
+      "center_hz": 5000.0,
+      "delay_s": 4.7,
+      "freq_khz": 5,
+      "time_ds": 47,
+      "snr_db": -8,
+      "width_ms": 272
+    },
+    {
+      "msg": "AN05074N01269",
+      "center_hz": -5000.0,
+      "delay_s": 7.4,
+      "freq_khz": -5,
+      "time_ds": 74,
+      "snr_db": -1,
+      "width_ms": 269
+    },
+    {
+      "msg": "AN06109P00132",
+      "center_hz": -6000.0,
+      "delay_s": 10.9,
+      "freq_khz": -6,
+      "time_ds": 109,
+      "snr_db": 0,
+      "width_ms": 132
+    },
+    {
+      "msg": "AP00035N07250",
+      "center_hz": 0.0,
+      "delay_s": 3.5,
+      "freq_khz": 0,
+      "time_ds": 35,
+      "snr_db": -7,
+      "width_ms": 250
+    },
+    {
+      "msg": "AN07103N05085",
+      "center_hz": -7000.0,
+      "delay_s": 10.3,
+      "freq_khz": -7,
+      "time_ds": 103,
+      "snr_db": -5,
+      "width_ms": 85
+    }
+  ]
+}

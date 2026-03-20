@@ -1,4 +1,66 @@
-"""FlexRadio UDP discovery helpers."""
+# Copyright (C) 2026  Jeff Millar, WA1HCO <wa1hco@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""FlexRadio UDP discovery: listen for VITA-49 broadcast advertisements.
+
+FlexRadio SmartSDR hardware periodically broadcasts discovery packets on UDP
+port 4992 (the same port used for TCP command/control).  Each packet is a
+VITA-49 formatted datagram carrying a ``key=value`` ASCII payload that
+describes the radio's identity and currently connected GUI clients.
+
+Protocol details
+----------------
+VITA-49 header (Word 0, big-endian)
+    Bits 31-28  Packet type (IF Data = 0x1)
+    Bit  27     Class ID present flag
+    Bits 23-22  TSI — integer timestamp type
+    Bits 21-20  TSF — fractional timestamp type
+    Bits 19-16  4-bit sequence number
+    Bits 15-0   Packet size in 32-bit words
+
+Class ID (Words 2-3, 8 bytes, present when bit 27 set)
+    Upper 32 bits: pad(8) + OUI(24)
+    Lower 32 bits: information class code(16) + packet class code(16)
+    FlexRadio discovery packets: OUI = 0x001c2d, PacketClass = 0xffff
+
+Payload (following Class ID)
+    UTF-8 string of space-separated ``key=value`` pairs, null-terminated.
+    Typical keys: ``ip``, ``model``, ``serial``, ``version``, ``nickname``,
+    ``callsign``, ``status``, ``inuse_host``, ``available_clients``,
+    ``gui_client_ips``, ``gui_client_handles``, ``gui_client_ids``,
+    ``gui_client_programs``, ``gui_client_stations``.
+
+Functions
+---------
+discover(timeout)
+    Binds to UDP port 4992 with ``SO_REUSEADDR`` / ``SO_REUSEPORT`` (so
+    SmartSDR can run concurrently on the same machine), receives packets
+    for up to ``timeout`` seconds, and returns a list of ``FlexRadio``
+    objects.  Stops after the first valid FlexRadio advertisement to minimise
+    startup latency in single-radio deployments.
+
+_parse_discovery(msg, ip)
+    Parses the UTF-8 ``key=value`` payload string into a ``FlexRadio``
+    dataclass.  Uses the packet source IP as a fallback if the ``ip`` key is
+    absent from the payload.  Extracts GUI client handle and UUID lists for
+    subsequent ``client bind`` negotiation.
+
+_format_discovery_summary(msg, fallback_ip)
+    Formats a multi-line human-readable summary of the discovery payload for
+    logging, including model, nickname, callsign, status, firmware version,
+    and a per-entry breakdown of all connected GUI clients.
+"""
 
 import socket
 import struct

@@ -1,4 +1,95 @@
-"""DAXIQ setup logic and pan/slice status handling."""
+# Copyright (C) 2026  Jeff Millar, WA1HCO <wa1hco@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""DAXIQSetup: SmartSDR API sequence to configure and start a DAXIQ IQ stream.
+
+This module contains ``DAXIQSetup``, which handles the multi-step SmartSDR
+command sequence required to get VITA-49 IQ UDP packets flowing to the client.
+It also installs a persistent status callback on ``FlexTCPClient`` to track
+panadapter centre frequency, bandwidth, and slice frequency in real time so
+the GUI can display the correct frequency labels.
+
+SmartSDR API sequence (``DAXIQSetup.setup``)
+---------------------------------------------
+1. **Pan status subscription** — send ``sub pan all`` or ``sub pan`` to ask the
+   radio to emit ``display pan <id> ...`` status lines for existing panadapters.
+   Wait 250 ms for the burst of status lines to arrive.
+
+2. **Panadapter discovery** — the persistent status callback
+   (``_status_monitor``) populates ``known_pans`` from incoming
+   ``display pan <id> center=... bandwidth=...`` lines.  If a
+   ``preferred_pan_id`` was supplied (from ``client bind`` context) it takes
+   priority; otherwise the lowest-ID non-zero panadapter is selected.
+
+3. **DAX IQ channel assignment** — send ``dax iq set <channel> pan=0x<id>``
+   to associate the DAX IQ channel with the chosen panadapter.  In bound
+   non-GUI contexts this is often required before the radio will route UDP
+   packets; in GUI-owned contexts SmartSDR may reject the command, which is
+   logged as a warning and not treated as fatal.
+
+4. **Stream creation** — send ``stream create daxiq=<channel> ip=<local_ip>
+   port=<udp_port>`` and parse the returned 32-bit hex stream ID.  This ID
+   is used by ``VITAReceiver`` to filter incoming VITA-49 packets.
+
+5. **Pan subscription** — subscribe to the chosen panadapter's ongoing status
+   updates (``sub pan 0x<id>``) so frequency and bandwidth changes made in
+   SmartSDR are reflected in the GUI without restarting.
+
+6. **Frequency setting** — if ``center_freq_mhz`` is provided and the stream
+   is in slice mode (``slice_id != 0``), send ``slice set <id>
+   RF_frequency=<hz>``.  If the stream is panadapter-only, the frequency is
+   controlled by SmartSDR and this client does not override it.
+
+Persistent status callback (``_status_monitor``)
+-------------------------------------------------
+Installed via ``FlexTCPClient._status_cb`` (chained after any existing
+callback) at ``__init__`` time.  Parses three families of unsolicited status
+lines:
+
+``|stream <id> dax_iq ...``
+    Records the slice ID and panadapter ID assigned to our stream.
+
+``|slice <num> RF_frequency=<hz> ...``
+    Updates ``slice_frequency_mhz`` when our slice is retuned.
+
+``|display pan <id> center=... bandwidth=... ...``
+    Updates ``known_pans`` with the latest centre frequency (converting the
+    SmartSDR ambiguous Hz/MHz representation via ``_parse_freq_to_mhz``) and
+    bandwidth (via ``_parse_bandwidth_to_hz``).  Suppresses redundant log
+    output using a content signature and a 750 ms cooldown timer.
+
+Teardown
+--------
+``teardown()`` sends ``stream remove 0x<stream_id>`` to the radio.  Errors
+are caught and logged; the TCP connection is closed by the caller
+(``FlexDAXIQ.stop()``).
+
+Helper functions
+----------------
+_extract_key(response, key)
+    Scans a whitespace-separated ``key=value`` string and returns the value
+    for the first matching key, or ``None`` if absent.
+
+_parse_freq_to_mhz(freq_value)
+    Handles SmartSDR's ambiguous frequency representation: values ≥ 1,000,000
+    are divided by 1e6 to convert Hz → MHz; smaller values are assumed already
+    in MHz.
+
+_parse_bandwidth_to_hz(bw_value)
+    Converts SmartSDR panadapter bandwidth: values < 1000 are treated as
+    fractional MHz (e.g. ``0.063298`` → 63298 Hz); values ≥ 1000 are Hz.
+"""
 
 import time
 from typing import Optional

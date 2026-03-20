@@ -1,4 +1,84 @@
-"""SmartSDR TCP command/control client."""
+# Copyright (C) 2026  Jeff Millar, WA1HCO <wa1hco@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""FlexTCPClient: SmartSDR TCP command/control connection and protocol parser.
+
+This module implements the long-lived TCP connection to SmartSDR (port 4992)
+and the line-oriented message protocol used to send commands and receive both
+direct responses and unsolicited status messages.
+
+SmartSDR TCP message protocol
+------------------------------
+All messages are UTF-8 text, newline-terminated (``\\n``).
+
+Command (client → radio)
+    ``C<seq>|<command>\\n``
+    ``seq`` is a monotonically increasing integer; the radio echoes it back
+    in the response so commands and responses can be matched asynchronously.
+
+Response (radio → client)
+    ``R<seq>|<status_hex>|<payload>\\n``
+    ``status_hex`` is a 32-bit hex code; 0x00000000 = success.  Non-zero
+    codes are looked up in ``SMARTSDR_STATUS_MESSAGES`` and logged.
+    ``payload`` is the data returned by the command, or an error description.
+
+Unsolicited status (radio → client)
+    Lines beginning with ``S`` (status) or ``V`` (version).  Format:
+    ``S<handle>|<category> <id> <key>=<value> ...\\n``
+    These lines are routed to the registered ``_status_cb`` callback for
+    consumption by ``DAXIQSetup._status_monitor`` and for GUI client tracking.
+
+Class: FlexTCPClient
+--------------------
+Threading model
+    A single daemon thread (``_recv_loop``) runs ``recv(4096)`` in a loop,
+    assembles a line buffer, and dispatches complete lines to ``_handle_line``.
+    ``send_command`` is called from the caller's thread; it acquires a lock,
+    stores a ``threading.Event`` keyed on the sequence number, sends the
+    command, and waits on the event.  ``_handle_line`` signals the event when
+    the matching response arrives.  The lock protects ``_responses`` and
+    ``_pending_cmds`` across threads.
+
+send_command(cmd, timeout)
+    Thread-safe blocking call.  Raises ``RuntimeError`` on:
+      * Non-zero SmartSDR status code (radio rejected the command).
+      * Timeout (no response within ``timeout`` seconds, default 5 s).
+    Returns the response payload string on success.
+
+GUI client tracking
+    ``_capture_client_status`` / ``_capture_client_payload`` parse ``client
+    <handle> gui=1 client_id=<uuid> ...`` entries from both unsolicited status
+    lines and ``client list`` command responses.  Only entries with ``gui=1``
+    or ``program`` starting with ``"SmartSDR"`` and a non-empty ``client_id``
+    are retained.  The accumulated table is used by ``FlexDAXIQ.start()`` to
+    select a UUID for ``client bind`` without requiring the user to supply one
+    explicitly.
+
+Key methods
+-----------
+connect()                  Open TCP socket; start ``_recv_loop`` daemon thread.
+disconnect()               Stop recv loop; close socket.
+send_command(cmd, timeout) Send sequenced command; block for response.
+get_local_ip()             Return local IP of the TCP socket (used as the
+                           ``ip=`` argument to ``stream create daxiq``).
+set_status_callback(cb)    Register callable ``(line: str) -> None`` for
+                           unsolicited status lines.
+get_gui_clients()          Return list of GUI client metadata dicts.
+get_gui_client_ids()       Return list of GUI client UUID strings.
+refresh_client_list()      Send ``client list``; parse and ingest all entries;
+                           return ``(line_count, new_gui_count)``.
+"""
 
 import socket
 import threading

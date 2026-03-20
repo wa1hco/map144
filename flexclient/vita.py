@@ -1,4 +1,89 @@
-"""VITA-49 UDP receiver for Flex DAXIQ streams."""
+# Copyright (C) 2026  Jeff Millar, WA1HCO <wa1hco@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""VITAReceiver: VITA-49 UDP packet receiver and IQ sample unpacker.
+
+This module receives UDP datagrams from the FlexRadio DAXIQ stream, decodes
+the VITA-49 binary header, and delivers ``VitaPacket`` objects to a queue for
+the processing pipeline.
+
+VITA-49 packet structure (FlexRadio DAXIQ)
+-------------------------------------------
+All header words are big-endian (network byte order).
+
+Word 0 — Header
+    Bits 31-28  Packet type    (0x1 = IF Data with stream ID)
+    Bit  27     Class ID present
+    Bit  26     Trailer present
+    Bits 25-24  Reserved
+    Bits 23-22  TSI            (integer timestamp type: 0=none, 1=UTC, 2=GPS)
+    Bits 21-20  TSF            (fractional timestamp: 0=none, 1=sample count,
+                                2=real-time picoseconds, 3=free-running)
+    Bits 19-16  Sequence number (4-bit, wraps at 16)
+    Bits 15-0   Packet size in 32-bit words (includes header, excludes trailer)
+
+Word 1 — Stream ID
+    32-bit stream identifier assigned by SmartSDR at ``stream create`` time.
+    Used to filter packets to the expected stream when ``filter_sid`` is set.
+
+Words 2-3 — Class ID (8 bytes, present when bit 27 of Word 0 is set)
+    Upper 32 bits: pad(8) + OUI(24)   — FlexRadio OUI = 0x001c2d
+    Lower 32 bits: information class(16) + packet class(16)
+
+Integer timestamp (4 bytes, present when TSI != 0)
+    Seconds in the epoch specified by TSI (typically GPS or Unix).
+
+Fractional timestamp (8 bytes, present when TSF != 0)
+    TSF=1: sample count since last integer second.
+    TSF=2: picoseconds since last integer second.
+
+Payload — interleaved I/Q as IEEE-754 32-bit floats, **little-endian**
+    FlexRadio DAXIQ uses little-endian float32 for the payload despite the
+    big-endian VITA-49 header.  Values use a 16-bit-style ADC scale where
+    ±32768 represents full scale (not ±1.0).  The consumer is responsible for
+    dividing by 32768 to convert to the ±1.0 internal convention.
+    ``raw[0::2]`` = I channel, ``raw[1::2]`` = Q channel → combined as
+    complex64 ``I + j*Q``.
+
+Trailer (4 bytes, present when bit 26 of Word 0 is set)
+    Excluded from the payload slice before IQ unpacking.
+
+Class: VITAReceiver
+-------------------
+``start()``
+    Binds a UDP socket with a 4 MB receive buffer to ``listen_port``, sets a
+    1 s ``SO_TIMEOUT`` so the receive loop can check ``_running`` periodically,
+    and launches a daemon thread running ``_recv_loop``.
+
+``_recv_loop()``
+    Calls ``recvfrom(65536)`` in a tight loop, passes each datagram to
+    ``_unpack``, filters by ``filter_sid``, and puts valid packets onto
+    ``out_q`` via ``put_nowait``.  Drops the packet and increments
+    ``drop_count`` when the queue is full; logs a warning.
+
+``_unpack(data)``
+    Decodes the VITA-49 header byte by byte using ``struct.unpack_from``,
+    advances an offset pointer through the optional fields, and slices the
+    payload.  Returns ``None`` for malformed packets (too short, no IQ pairs).
+
+Sequence gap detection
+    A per-stream dict ``_last_seq`` tracks the most recent 4-bit sequence
+    number.  On each packet the expected sequence is ``(last + 1) & 0xF``;
+    a mismatch logs a warning and accumulates the gap in ``missed_count``.
+    ``missed_count`` and ``packet_count`` are readable by the GUI display
+    layer for the VITA-49 packet-loss status-bar field.
+"""
 
 import socket
 import threading
@@ -155,8 +240,8 @@ class VITAReceiver:
         # Unpack as little-endian IEEE-754 32-bit floats (DAXIQ format: payload_endian=little)
         raw = np.frombuffer(payload[:n_words * 4], dtype="<f4")
         
-        # FlexRadio DAXIQ sends float values that need no scaling
-        # They are already in the correct range for direct FFT processing
+        # FlexRadio DAXIQ float32 payload uses ±32768 ADC scale.
+        # Normalisation to ±1.0 is applied by the consumer (FLEX_DAXIQ_FULL_SCALE in runtime.py).
         
         # Interleaved I, Q pairs -> complex64
         n_samples = n_words // 2

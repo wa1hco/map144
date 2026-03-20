@@ -1,6 +1,48 @@
-"""Compatibility shim for legacy imports.
+# Copyright (C) 2026  Jeff Millar, WA1HCO <wa1hco@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""Compatibility shim and standalone DAXIQ test receiver.
 
-All FlexRadio client implementation now lives in ``flexclient.core``.
+This file serves two purposes:
+
+1. **Backwards-compatibility import shim** — ``from flexclient.core import *``
+   pulls every public symbol from the ``flexclient`` package into this
+   module's namespace.  Any code that previously imported from the old
+   top-level ``flex_client`` module continues to work without changes.
+
+2. **Standalone command-line test receiver** — when run as a script
+   (``python flex_client.py``), ``main()`` connects to a FlexRadio, receives
+   DAXIQ samples for a configurable number of seconds, and reports packet
+   count, sample count, and drop count.  Useful for verifying network
+   connectivity and VITA-49 stream health before running the full GUI.
+
+Command-line arguments (standalone mode)
+-----------------------------------------
+--ip IP            Radio IP address; auto-discovered via UDP broadcast if
+                   omitted.
+--freq FLOAT       Centre frequency in MHz (default: 50.260).
+--rate INT         Sample rate in Hz (default: 96000).
+--bind-client-id UUID   GUI client UUID for ``client bind`` (see ``flexclient``
+                   documentation); omit for auto-discovery.
+--bind-client UUID Deprecated alias of ``--bind-client-id``.
+--secs INT         Duration in seconds (default: 5).
+
+Output
+------
+Every 50 packets a log line is printed showing cumulative packet count,
+sample count, the most recent VITA-49 timestamp (integer + fractional seconds),
+and the stream ID.  At exit, total packets, samples, and drop count are logged.
 """
 
 import argparse
