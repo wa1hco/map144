@@ -89,6 +89,11 @@ def _configure_logging(level_name: str):
 
 def main():
     """Launch the Radio IQ visualizer GUI."""
+    import shutil
+    if shutil.which('jt9') is None:
+        print("error: jt9 not found on PATH", file=sys.stderr)
+        sys.exit(1)
+
     app = QtWidgets.QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
 

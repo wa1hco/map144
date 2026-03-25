@@ -82,7 +82,6 @@ extract_and_decode(iq_ring, ring_state_fn, detect_sample,
 
 Constants
 ---------
-JT9_PATH           : absolute path to the jt9 binary (WSJT-X build tree)
 JT9_BASE_ARGS      : fixed jt9 arguments (mode, period, freq window, depth)
 _DECODE_RATE       : 12000 Hz — target WAV sample rate expected by jt9
 _DECIMATE_FACTOR   : 4       — ratio 48 kHz / 12 kHz
@@ -101,11 +100,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
-from scipy.signal import decimate, firwin, lfilter
+from scipy.signal import decimate
 
-JT9_PATH = '/home/jeff/ham/wsjtx-2.7.0/build/wsjtx-prefix/src/wsjtx-build/jt9'
 JT9_BASE_ARGS = [
-    JT9_PATH, "--msk144",
+    'jt9', "--msk144",
     "-p", "15", "-L", "1400", "-H", "1600",
     "-f", "1500", "-F", "200", "-d", "3",
 ]
@@ -116,28 +114,6 @@ _TARGET_FC_HZ = 1500.0      # jt9 expects the signal at this frequency
 _JT9_SEMAPHORE = threading.Semaphore(4)   # max concurrent jt9 processes
 
 
-def design_lp_filter(sample_rate: int, cutoff_hz: float = 10000.0, numtaps: int = 101) -> np.ndarray:
-    """Design a symmetric FIR low-pass filter.  Returns tap array (float64)."""
-    nyq = sample_rate / 2.0
-    taps = firwin(numtaps, cutoff_hz / nyq)
-    return taps.astype(np.float64)
-
-
-def apply_lp_filter(
-    block: np.ndarray,
-    taps: np.ndarray,
-    zi_re: np.ndarray,
-    zi_im: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Apply FIR LP filter to I and Q independently, preserving streaming state.
-
-    Returns (filtered_iq, new_zi_re, new_zi_im).
-    """
-    i_filt, new_zi_re = lfilter(taps, 1.0, np.real(block).astype(np.float64), zi=zi_re)
-    q_filt, new_zi_im = lfilter(taps, 1.0, np.imag(block).astype(np.float64), zi=zi_im)
-    filtered = (i_filt + 1j * q_filt).astype(np.complex64)
-    return filtered, new_zi_re, new_zi_im
-
 
 def scan_for_pairs(
     power_db: np.ndarray,
@@ -145,11 +121,17 @@ def scan_for_pairs(
     spacing_hz: float = 2000.0,
     tol_hz: float = 200.0,
     thresh_db: float = 10.0,
+    center_hz: float | None = None,
+    center_tol_hz: float = 500.0,
 ) -> list[tuple[float, float]]:
     """Scan a power spectrum for pairs of peaks spaced spacing_hz apart.
 
-    power_db  – full fftshift'd squared spectrum in dB  (shape: fft_size,)
-    freq_hz   – corresponding frequency axis in Hz  (same shape)
+    power_db      – full fftshift'd spectrum in dB  (shape: fft_size,)
+    freq_hz       – corresponding frequency axis in Hz  (same shape)
+    center_hz     – if set, keep only pairs whose midpoint is within
+                    center_tol_hz of this frequency.  Pass 0.0 with
+                    center_tol_hz=500 to require the pair to straddle DC,
+                    which naturally rejects adjacent-channel ghost detections.
 
     Returns list of (f_lo_hz, f_hi_hz) for each detected pair, ordered by
     peak power (strongest pair first).
@@ -199,6 +181,12 @@ def scan_for_pairs(
             pairs.append((f_lo, float(freq_hz[best_i_hi])))
             seen.add(i_lo)
             seen.add(best_i_hi)
+
+    if center_hz is not None:
+        pairs = [
+            (fl, fh) for fl, fh in pairs
+            if abs((fl + fh) / 2.0 - center_hz) <= center_tol_hz
+        ]
 
     return pairs
 

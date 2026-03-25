@@ -162,43 +162,19 @@ def update_displays(self):
     self.realtime_noise_plot.setXRange(self.min_level, self.max_level, padding=0)
     self.realtime_noise_plot.setYRange(freq_min, freq_max, padding=0)
 
-    # Squared-signal periodograms.
-    # Y-axis uses kHz offset from band center; actual spectral content appears at
-    # 2× those offsets because squaring doubled the component frequencies.
-    sq_freq_min = self.sq_freq_axis_khz[0]
-    sq_freq_max = self.sq_freq_axis_khz[-1]
-
-    if self.sq_spec_staging_filled:
-        self.sq_accumulated_img.setImage(
-            self.sq_spectrogram_data,
-            autoLevels=False,
-            levels=[self.sq_min_level, self.sq_max_level],
-        )
-        self.sq_accumulated_img.setRect(
-            QtCore.QRectF(0, sq_freq_min, self.max_time, sq_freq_max - sq_freq_min)
-        )
-        self.sq_accumulated_plot.setXRange(0, self.max_time, padding=0)
-        self.sq_accumulated_plot.setYRange(sq_freq_min, sq_freq_max, padding=0)
-
-    if self.sq_realtime_filled:
-        self.sq_realtime_img.setImage(
-            self.sq_realtime_data,
-            autoLevels=False,
-            levels=[self.sq_min_level, self.sq_max_level],
-        )
-        self.sq_realtime_img.setRect(
-            QtCore.QRectF(0, sq_freq_min, self.realtime_time, sq_freq_max - sq_freq_min)
-        )
-        self.sq_realtime_plot.setXRange(0, self.realtime_time, padding=0)
-        self.sq_realtime_plot.setYRange(sq_freq_min, sq_freq_max, padding=0)
-
-    # Keep sq freq-slice X range in sync with the squared color scale sliders
-    self.sq_freq_slice_plot.setXRange(self.sq_min_level, self.sq_max_level, padding=0)
-    self.sq_freq_slice_plot.setYRange(sq_freq_min, sq_freq_max, padding=0)
-
-    # Pin time-slice X ranges to the realtime window (0 → history_secs)
-    self.sq_time_slice_plot.setXRange(0, self.realtime_time, padding=0)
+    # Pin IQ time-slice X range to the realtime window
     self.iq_time_slice_plot.setXRange(0, self.realtime_time, padding=0)
+
+    # ── Channel detection ridgeline ───────────────────────────────────────────
+    # Show data from t=0 growing rightward; curves reset each 15-s boundary.
+    w_idx  = min(self._ch_snr_write_idx, self._ch_snr_history.shape[0])
+    t_axis = self._ch_time_axis[:w_idx]
+    offset = self._ch_display_offset
+
+    for ch_k, curve in enumerate(self._ch_curves):
+        snr_k = self._ch_snr_history[:w_idx, ch_k].astype(np.float32)
+        pos   = self._ch_display_pos[ch_k]
+        curve.setData(t_axis, snr_k + pos * offset)
 
     utc_time = datetime.datetime.now(datetime.UTC).strftime("%H:%M:%S")
     self.utc_clock_label.setText(f"UTC: {utc_time}")

@@ -24,16 +24,17 @@ from .ui import (
     setup_ui,
     on_min_level_changed,
     on_max_level_changed,
-    on_sq_min_level_changed,
-    on_sq_max_level_changed,
     on_select_source_radio,
     on_select_source_wav,
-    on_sq_realtime_mouse_moved,
 )
 from .runtime import setup_radio_client, _connect_radio_client, run_radio_source, _get_tuned_frequency_mhz, closeEvent
-from .processing import process_iq_data
+from .processing import process_iq_data, N_SNR_HIST
 from .displays import update_displays
-from .detection import design_lp_filter
+from .channelizer import (
+    design_channelizer_filter,
+    make_channelizer_state,
+    N_CHANNELS,
+)
 
 
 class RadioIQVisualizer(QtWidgets.QMainWindow):
@@ -42,11 +43,8 @@ class RadioIQVisualizer(QtWidgets.QMainWindow):
     setup_ui = setup_ui
     on_min_level_changed = on_min_level_changed
     on_max_level_changed = on_max_level_changed
-    on_sq_min_level_changed = on_sq_min_level_changed
-    on_sq_max_level_changed = on_sq_max_level_changed
     on_select_source_radio = on_select_source_radio
     on_select_source_wav = on_select_source_wav
-    on_sq_realtime_mouse_moved = on_sq_realtime_mouse_moved
     setup_radio_client = setup_radio_client
     _connect_radio_client = _connect_radio_client
     run_radio_source = run_radio_source
@@ -79,7 +77,6 @@ class RadioIQVisualizer(QtWidgets.QMainWindow):
         self._wav_run_start_time = None # UTC datetime when current WAV run started
 
         self.sample_buffer = np.array([], dtype=np.complex64)
-        self.raw_buffer    = np.array([], dtype=np.complex64)
 
         current_time = datetime.datetime.now().timestamp()
         self.time_in_window = current_time % self.history_secs
@@ -104,44 +101,27 @@ class RadioIQVisualizer(QtWidgets.QMainWindow):
 
         self.max_time = self.history_secs
 
-        self.min_level    = int(_SETTINGS.value('min_level',    -90))
-        self.max_level    = int(_SETTINGS.value('max_level',    -30))
+        self.min_level = int(_SETTINGS.value('min_level', -90))
+        self.max_level = int(_SETTINGS.value('max_level', -30))
 
-        # Squared signal spectrogram buffers (for MSK144 tone-pair detection).
-        # Squaring the IQ doubles all spectral component frequencies; MSK144 tones
-        # at fc±500 Hz produce a ±1000 Hz symmetric pair in this spectrum.
-        self.sq_spectrogram_data = np.full((self.max_history, self.fft_size), -130.0)
-        self.sq_spec_staging = np.full((self.max_history, self.fft_size), -130.0)
-        self.sq_spec_boundary = int(current_time / self.history_secs)
-        self.sq_spec_staging_filled = False
-        self.sq_spec_write_index = min(max(initial_index, 0), self.max_history - 1)
+        # Channeliser state
+        self._ch_taps  = design_channelizer_filter(self.sample_rate)
+        self._ch_state = make_channelizer_state(N_CHANNELS, self._ch_taps)
+        self._ch_buffer      = np.zeros((N_CHANNELS, 0), dtype=np.complex64)
+        self._metric_history = []   # list of (N_CH,) linear raw-peak arrays, capped at _METRIC_HIST_DEPTH
 
-        self.sq_realtime_data = np.full((self.max_history, self.fft_size), -130.0)
-        self.sq_realtime_filled = False
-        self._sq_realtime_boundary = self.sq_spec_boundary
-        self.sq_realtime_write_index = min(max(initial_index, 0), self.max_history - 1)
+        # Per-channel peak-SNR history for the ridgeline detection display.
+        # Shape: (N_SNR_HIST, N_CHANNELS); written time-indexed by processing.py.
+        self._ch_snr_history   = np.zeros((N_SNR_HIST, N_CHANNELS), dtype=np.float32)
+        self._ch_snr_write_idx = 0
+        self._ch_snr_boundary  = int(current_time / self.history_secs)
 
-        # Relative frequency axis in kHz for the squared-signal plots.
-        # Labels represent FFT bin offsets from center; actual spectral content
-        # appears at 2× these offsets due to squaring.
-        self.sq_freq_axis_khz = np.fft.fftshift(
-            np.fft.fftfreq(self.fft_size, 1.0 / self.sample_rate)
-        ) / 1e3
-
-        self.sq_min_level = self.min_level
-        self.sq_max_level = self.max_level
-
-        # LP filter state (10 kHz cutoff, streaming FIR)
-        self._lp_taps = design_lp_filter(self.sample_rate)
-        self._lp_zi_re = np.zeros(len(self._lp_taps) - 1, dtype=np.float64)
-        self._lp_zi_im = np.zeros(len(self._lp_taps) - 1, dtype=np.float64)
-
-        # Circular IQ ring buffer (5 seconds of LP-filtered samples)
+        # Circular IQ ring buffer (5 seconds of raw samples for extract_and_decode)
         _ring_n = int(5 * self.sample_rate)
-        self._iq_ring = np.zeros(_ring_n, dtype=np.complex64)
-        self._iq_ring_pos = 0
+        self._iq_ring       = np.zeros(_ring_n, dtype=np.complex64)
+        self._iq_ring_pos   = 0
         self._iq_abs_sample = 0
-        self._detect_cooldowns = {}   # {freq_bin_hz: hops_remaining}
+        self._detect_cooldowns = {}   # {channel_index: hops_remaining}
 
         self.fft_bin_axis_mhz = np.fft.fftshift(
             np.fft.fftfreq(self.fft_size, 1 / self.sample_rate)

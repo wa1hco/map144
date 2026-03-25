@@ -105,6 +105,7 @@ import argparse
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import wave
@@ -129,7 +130,6 @@ EMBEDDED_POWER_MIN_SPAN_DB = 1.5
 SOURCE_CENTER_HZ = 1500.0
 
 # ── msk144sim ping generation ──────────────────────────────────────────────
-MSK144SIM_DEFAULT_PATH = 'msk144sim'
 MSK144SIM_TR_PERIOD = 15         # seconds; msk144sim TR period argument
 MSK144SIM_AUDIO_CENTER_HZ = 1500.0
 MSK144SIM_SAMPLE_RATE = 12000
@@ -137,13 +137,13 @@ PING_EXTRACT_START_S = 1.0       # first ping lands at t=1 s in msk144sim output
 PING_EXTRACT_DURATION_S = 1.0    # one second of ping audio to extract
 
 # Parameter encoding ranges (match message format "A[±][ff][ttt][±][dd][www]")
-FREQ_MIN_KHZ =  -8
-FREQ_MAX_KHZ =  +8
+FREQ_MIN_KHZ =  -15
+FREQ_MAX_KHZ =  +15
 TIME_MIN_DS  =   5               # deciseconds (0.5 s)
-TIME_MAX_DS  = 150               # deciseconds (15.0 s)
-SNR_MIN_DB   =   0
-SNR_MAX_DB   = +20
-WIDTH_MIN_MS =  50
+TIME_MAX_DS  = 145               # deciseconds (15.0 s)
+SNR_MIN_DB   = +0
+SNR_MAX_DB   = +10
+WIDTH_MIN_MS =  100
 WIDTH_MAX_MS = 300
 WIDTH_CLAMP_MIN_MS = 10          # avoid division-by-zero inside msk144sim
 MSK144_SNR_BW_HZ = 2500.0        # WSJT-X reference bandwidth for MSK144 SNR
@@ -341,7 +341,7 @@ def generate_synthetic_ping(width_ms: int, sample_rate: int = 12000) -> tuple[np
     return samples, sample_rate
 
 
-def generate_ping_wav(msg: str, msk144sim_path: str) -> tuple[np.ndarray, int]:
+def generate_ping_wav(msg: str) -> tuple[np.ndarray, int]:
     """Call msk144sim to generate a ping, extract the first ping at t=1 s.
 
     Returns (samples, sample_rate) where samples covers PING_EXTRACT_DURATION_S
@@ -354,7 +354,7 @@ def generate_ping_wav(msg: str, msk144sim_path: str) -> tuple[np.ndarray, int]:
     work_dir = Path(tempfile.mkdtemp(prefix='msk144sim_'))
     try:
         cmd = [
-            msk144sim_path,
+            'msk144sim',
             msg,
             str(MSK144SIM_TR_PERIOD),
             str(MSK144SIM_AUDIO_CENTER_HZ),
@@ -1238,8 +1238,6 @@ def main() -> None:
     )
     parser.add_argument('--count', type=int, default=10,
                         help='Number of random pings to generate via msk144sim (default: 10; 0 = use --input-dir)')
-    parser.add_argument('--msk144sim', default=MSK144SIM_DEFAULT_PATH,
-                        help=f'Path to msk144sim executable (default: {MSK144SIM_DEFAULT_PATH})')
     parser.add_argument('--input-dir', default='MSK144',
                         help='Folder containing 15-sec 12 kHz mono WAV files (default: MSK144)')
     parser.add_argument('--pattern', default='*.wav',
@@ -1307,7 +1305,10 @@ def main() -> None:
 
     if args.count > 0:
         # ── Generate pings via msk144sim ───────────────────────────────────────
-        print(f"Generating {args.count} pings via msk144sim ({args.msk144sim}):")
+        if shutil.which('msk144sim') is None:
+            print("error: msk144sim not found on PATH", file=sys.stderr)
+            sys.exit(1)
+        print(f"Generating {args.count} pings via msk144sim:")
         print(f"  Message format: A[±][ff][ttt][±][dd][www]")
         print(f"  freq {FREQ_MIN_KHZ}..{FREQ_MAX_KHZ} kHz  "
               f"time {TIME_MIN_DS}..{TIME_MAX_DS} ds  "
@@ -1333,7 +1334,7 @@ def main() -> None:
                     samples, src_rate = generate_synthetic_ping(
                         width_ms, sample_rate=MSK144SIM_SAMPLE_RATE)
                 else:
-                    samples, src_rate = generate_ping_wav(msg, args.msk144sim)
+                    samples, src_rate = generate_ping_wav(msg)
                 ping_bank.append((samples, src_rate, msg,
                                   {'freq_khz': freq_khz, 'time_ds': time_ds,
                                    'snr_db': snr_db, 'width_ms': width_ms}))

@@ -135,6 +135,13 @@ EDGE_FADE_12K = 12     # raised-cosine edge length at 12 kHz (each end)
 DETECT_THRESH     = 3.0    # normalized detection metric threshold
 DETECT_MERGE_GAP_S = 0.4  # merge successive detections with gaps <= this (seconds)
 
+# ── Per-channel detection constants (mirror processing.py) ──────────────── #
+_PDET_FFT_SIZE   = 512
+_PDET_HOP        = _PDET_FFT_SIZE // 2
+_PDET_SQ_TONE    = 1000.0   # Hz — squared-domain tone offset from DC
+_PDET_SQ_NTOL    = 200.0    # Hz — half-width of each tone search window
+_PDET_THRESH_DB  = 3.0      # dB above 25th-percentile noise baseline (WSJT-X style)
+
 
 def read_wav(path: Path) -> tuple[np.ndarray, int]:
     """Read a WAV file.
@@ -488,9 +495,8 @@ def _compute_squared_spectrogram(
     return time_s, freq_hz, spec_db, det_norm
 
 
-JT9_PATH = '/home/jeff/ham/wsjtx-2.7.0/build/wsjtx-prefix/src/wsjtx-build/jt9'
 JT9_BASE_ARGS = [
-    JT9_PATH, "--msk144",
+    'jt9', "--msk144",
     "-p", "15", "-L", "1400", "-H", "1600",
     "-f", "1500", "-F", "200", "-d", "3",
 ]
@@ -598,6 +604,416 @@ def run_detections(
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
+#   Per-channel detection diagnostic                                          #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+def _compute_per_channel_metrics(
+    samples: np.ndarray,
+    rate: int,
+) -> dict | None:
+    """Run the channelizer + per-channel detection pipeline on complex IQ input.
+
+    Mirrors the algorithm in radio_iq_gui/processing.py.  Returns None for
+    mono (real) input or if the channelizer module is unavailable.
+
+    Returns a dict with keys:
+        time_s          (n_frames,)
+        channel_hz      (N_CHANNELS,)
+        pair_metric     (n_frames, N_CHANNELS) — dB above 25th-percentile baseline
+        lo_peak         (n_frames, N_CHANNELS) — lo-window peak power (dB)
+        hi_peak         (n_frames, N_CHANNELS) — hi-window peak power (dB)
+        pct25_lin       (N_CHANNELS,)           — per-channel 25th-percentile linear baseline
+        sq_freq         (_PDET_FFT_SIZE,)      — centered frequency axis (Hz)
+        lo_mask / hi_mask (_PDET_FFT_SIZE,) bool
+        peak_frame_pdb  (N_CHANNELS, _PDET_FFT_SIZE) — pdb_all at peak frame
+        peak_frame_idx  int
+    """
+    if not np.iscomplexobj(samples):
+        return None
+    try:
+        from radio_iq_gui.channelizer import (
+            apply_channelizer,
+            design_channelizer_filter,
+            make_channelizer_state,
+            N_CHANNELS,
+            CHANNEL_SPACING_HZ,
+            DECIMATE_FACTOR,
+        )
+    except ImportError:
+        print("  per-channel analysis: radio_iq_gui.channelizer not available")
+        return None
+
+    lp_taps = design_channelizer_filter(rate)
+    state   = make_channelizer_state(N_CHANNELS, lp_taps)
+    ch_out  = apply_channelizer(
+        samples.astype(np.complex64), state, lp_taps=lp_taps, sample_rate=rate,
+    )  # (N_CHANNELS, n_ch_samples)
+
+    ch_rate  = rate // DECIMATE_FACTOR
+    fft_sz   = _PDET_FFT_SIZE
+    hop      = _PDET_HOP
+    window   = np.hanning(fft_sz)
+
+    sq_freq = np.fft.fftshift(np.fft.fftfreq(fft_sz, 1.0 / ch_rate))
+    lo_mask = (sq_freq >= -_PDET_SQ_TONE - _PDET_SQ_NTOL) & \
+              (sq_freq <= -_PDET_SQ_TONE + _PDET_SQ_NTOL)
+    hi_mask = (sq_freq >=  _PDET_SQ_TONE - _PDET_SQ_NTOL) & \
+              (sq_freq <=  _PDET_SQ_TONE + _PDET_SQ_NTOL)
+
+    n_ch_samples = ch_out.shape[1]
+    n_frames     = max(0, (n_ch_samples - fft_sz) // hop + 1)
+    if n_frames == 0:
+        return None
+
+    lo_list   = []
+    hi_list   = []
+    raw_list  = []   # linear (lo_lin + hi_lin) / 2 per frame — for percentile
+    pdb_list  = []
+    t_list    = []
+
+    for i in range(n_frames):
+        start    = i * hop
+        ch_block = ch_out[:, start : start + fft_sz]                # (N_CH, fft_sz)
+        sq       = ch_block ** 2
+        X_sq     = np.fft.fft(sq * window[np.newaxis, :], axis=1)
+
+        # dB spectrum for display in the right panels
+        power_db = 10.0 * np.log10(np.abs(X_sq) / fft_sz + 1e-12)  # (N_CH, fft_sz)
+        pdb_all  = np.fft.fftshift(power_db, axes=1)                # (N_CH, fft_sz)
+
+        # Linear-domain peaks for WSJT-X-style 25th-percentile normalization
+        power_lin = np.abs(X_sq) / fft_sz                           # (N_CH, fft_sz)
+        plin_all  = np.fft.fftshift(power_lin, axes=1)              # (N_CH, fft_sz)
+        lo_lin    = np.max(plin_all[:, lo_mask], axis=1)            # (N_CH,) linear
+        hi_lin    = np.max(plin_all[:, hi_mask], axis=1)            # (N_CH,) linear
+        raw_lin   = (lo_lin + hi_lin) / 2.0                         # (N_CH,) linear
+
+        # dB peaks for display in ax_ch
+        lo_peak   = np.max(pdb_all[:, lo_mask], axis=1)             # (N_CH,) dB
+        hi_peak   = np.max(pdb_all[:, hi_mask], axis=1)             # (N_CH,) dB
+
+        lo_list .append(lo_peak)
+        hi_list .append(hi_peak)
+        raw_list.append(raw_lin)
+        pdb_list.append(pdb_all)
+        t_list  .append((start + fft_sz / 2.0) / ch_rate)
+
+    # WSJT-X xmed normalization: 25th percentile over all frames per channel.
+    # Using the full file ensures quiet frames dominate even if pings are long.
+    raw_arr    = np.stack(raw_list)                                  # (n_frames, N_CH)
+    pct25_lin  = np.percentile(raw_arr, 25, axis=0)                 # (N_CH,) linear
+    pair_metric = 10.0 * np.log10(
+        raw_arr / np.maximum(pct25_lin, 1e-30)
+    )                                                                # (n_frames, N_CH) dB
+
+    peak_fi    = int(np.argmax(pair_metric.max(axis=1)))
+    pdb_frames = np.stack(pdb_list)                                  # (n_frames, N_CH, fft_sz)
+
+    return dict(
+        time_s          = np.array(t_list),
+        channel_hz      = np.arange(N_CHANNELS) * float(CHANNEL_SPACING_HZ),
+        pair_metric     = pair_metric,
+        lo_peak         = np.stack(lo_list),    # (n_frames, N_CH) dB — display only
+        hi_peak         = np.stack(hi_list),    # (n_frames, N_CH) dB — display only
+        pct25_lin       = pct25_lin,            # (N_CH,) linear 25th-percentile baseline
+        sq_freq         = sq_freq,
+        lo_mask         = lo_mask,
+        hi_mask         = hi_mask,
+        peak_frame_pdb  = pdb_frames[peak_fi],  # (N_CH, fft_sz) kept for compat
+        peak_frame_idx  = peak_fi,
+        pdb_all_frames  = pdb_frames,           # (n_frames, N_CH, fft_sz)
+    )
+
+
+def _load_manifest_pings(wav_path: Path) -> list:
+    """Return the 'placements' list from <wav_stem>.json, or [] if absent."""
+    import json as _json
+    json_path = wav_path.with_suffix('.json')
+    if not json_path.exists():
+        return []
+    try:
+        data = _json.load(open(json_path))
+        return sorted(data.get('placements', []), key=lambda p: p['delay_s'])
+    except Exception as exc:
+        print(f"  manifest load failed: {exc}")
+        return []
+
+
+def plot_channel_detection(
+    name:        str,
+    result:      dict,
+    show_plots:  bool,
+    output_path: Path,
+    wav_path:    Path | None = None,
+) -> None:
+    """Interactive per-channel detection figure.
+
+    Layout (75 % / 25 % width split):
+      Left  — top ~3/7: pair_metric heatmap with vertical + horizontal cursors
+              bot ~4/7: selected-channel lo/hi/noise time series (x shared)
+      Right — 7 stacked squared-spectrum panels for selected ch ± 3
+
+    If a companion JSON manifest exists alongside *wav_path*, left/right arrow
+    keys cycle through signal placements and update all panels.
+    """
+    time_s         = result['time_s']
+    channel_hz     = result['channel_hz']
+    pair_metric    = result['pair_metric']       # (n_frames, N_CH) dB above 25th-pct
+    lo_peak        = result['lo_peak']           # (n_frames, N_CH) dB — display
+    hi_peak        = result['hi_peak']           # (n_frames, N_CH) dB — display
+    pct25_lin      = result['pct25_lin']         # (N_CH,) linear 25th-percentile baseline
+    pct25_dB       = 10.0 * np.log10(np.maximum(pct25_lin, 1e-30))  # (N_CH,) dB
+    sq_freq        = result['sq_freq']
+    lo_mask        = result['lo_mask']
+    hi_mask        = result['hi_mask']
+    pdb_all_frames = result['pdb_all_frames']    # (n_frames, N_CH, fft_sz)
+    peak_fi        = result['peak_frame_idx']
+    N_CH           = pair_metric.shape[1]
+    ch_spacing     = float(channel_hz[1] - channel_hz[0]) if len(channel_hz) > 1 else 1000.0
+    half_ch        = N_CH // 2
+
+    # ── fftshift display arrays ───────────────────────────────────────────
+    # Channel k is centred at k*1 kHz (0..47 kHz).  In complex IQ, channels
+    # 24-47 are the negative-frequency half (-24..-1 kHz).  fftshift reorders
+    # so display slot 0 = -24 kHz, slot 24 = 0 kHz, slot 47 = +23 kHz —
+    # matching the -24/+24 kHz scale used by the spectrogram displays.
+    #
+    # Conversion: original channel k  →  display slot (k - half_ch) % N_CH
+    #             display slot d       →  original channel (d + half_ch) % N_CH
+    display_hz = (np.arange(N_CH) - half_ch) * ch_spacing   # -24000..23000 Hz
+    pm_disp    = np.fft.fftshift(pair_metric, axes=1)        # (n_frames, N_CH)
+    lo_disp    = np.fft.fftshift(lo_peak,    axes=1)
+    hi_disp    = np.fft.fftshift(hi_peak,    axes=1)
+    pct25_dB_d = np.fft.fftshift(pct25_dB)                  # (N_CH,)
+
+    # ── Manifest pings ────────────────────────────────────────────────────
+    pings   = _load_manifest_pings(wav_path) if wav_path is not None else []
+    n_pings = len(pings)
+
+    def _ch_for_ping(p):
+        """Map ping center_hz to display slot index."""
+        k = int(round(p['center_hz'] / ch_spacing)) % N_CH
+        return int((k - half_ch) % N_CH)
+
+    def _frame_for_ping(p):
+        """Find the frame where pm_disp peaks for this ping's display slot and time window."""
+        ch_d    = _ch_for_ping(p)
+        t_start = p['delay_s']
+        t_end   = p['delay_s'] + p.get('width_ms', 0) / 1000.0
+        mask    = (time_s >= t_start) & (time_s <= t_end)
+        if np.any(mask):
+            idxs = np.where(mask)[0]
+            return int(idxs[np.argmax(pm_disp[idxs, ch_d])])
+        # Fallback: nearest frame to ping centre
+        return int(np.argmin(np.abs(time_s - (t_start + (t_end - t_start) / 2.0))))
+
+    # Initial state: use ping nearest to peak frame, else peak frame itself.
+    # state['ch'] is always a DISPLAY slot index.
+    if n_pings > 0:
+        init_pi = int(np.argmin([abs(_frame_for_ping(p) - peak_fi) for p in pings]))
+        init_fi = _frame_for_ping(pings[init_pi])
+        init_ch = _ch_for_ping(pings[init_pi])
+    else:
+        init_pi = 0
+        init_fi = peak_fi
+        init_ch = int(np.argmax(pm_disp[peak_fi]))
+
+    state = {'ping_idx': init_pi, 'frame_idx': init_fi, 'ch': init_ch}
+
+    # ── Figure layout ─────────────────────────────────────────────────────
+    # Outer 1×2 grid splits 75 % / 25 % horizontally.
+    # Left sub-grid: heatmap (shorter) over channel-power (taller), with
+    # enough hspace so the power x-axis labels don't crowd the heatmap.
+    # Right sub-grid: 7 tightly-spaced spectrum panels.
+    # NO colorbar on the heatmap — it would narrow ax_hm and break x-alignment.
+    fig      = plt.figure(figsize=(16, 10))
+    outer_gs = fig.add_gridspec(
+        1, 2, width_ratios=[3, 1], wspace=0.28,
+        left=0.07, right=0.97, top=0.88, bottom=0.07,
+    )
+    left_gs  = outer_gs[0, 0].subgridspec(2, 1, height_ratios=[2, 2.5], hspace=0.22)
+    right_gs = outer_gs[0, 1].subgridspec(7, 1, hspace=0.05)
+
+    ax_hm = fig.add_subplot(left_gs[0])
+    ax_ch = fig.add_subplot(left_gs[1], sharex=ax_hm)
+    sq_axes: list = []
+    for i in range(7):
+        kw = {} if i == 0 else {'sharex': sq_axes[0], 'sharey': sq_axes[0]}
+        sq_axes.append(fig.add_subplot(right_gs[i], **kw))
+    for a in sq_axes[:-1]:
+        plt.setp(a.get_xticklabels(), visible=False)
+
+    # ── Heatmap (static image, dynamic cursors) ───────────────────────────
+    vmax_pm  = max(_PDET_THRESH_DB * 3, float(pm_disp.max()) * 1.05)
+    # Extent must place pixel *centres* at (time_s[i], display_hz[k]/1000),
+    # so push edges out by half a pixel in each direction.
+    dt   = float(time_s[1] - time_s[0]) / 2.0 if len(time_s) > 1 else 0.0
+    half = ch_spacing / 2000.0   # half channel spacing in kHz
+    hm_ext   = [
+        float(time_s[0])   - dt,  float(time_s[-1])   + dt,
+        float(display_hz[0])  / 1000.0 - half,
+        float(display_hz[-1]) / 1000.0 + half,
+    ]
+    im = ax_hm.imshow(
+        pm_disp.T, aspect='auto', origin='lower',
+        extent=hm_ext, cmap='inferno', vmin=0.0, vmax=vmax_pm,
+    )
+    ax_hm.set_ylabel("Frequency (kHz)", fontsize=8)
+    ax_hm.set_xlabel("Time (s)", fontsize=8)
+    ax_hm.set_title("Pair Metric Heatmap", fontsize=9)
+
+    vline_hm = ax_hm.axvline(float(time_s[init_fi]),               color='cyan', lw=1.2, ls='-')
+    hline_hm = ax_hm.axhline(float(display_hz[init_ch]) / 1000.0,  color='cyan', lw=0.7, ls=':')
+
+    # ── Channel power plot (dynamic lines) ───────────────────────────────
+    lo_ln,  = ax_ch.plot(time_s, lo_disp[:, init_ch], color='tab:blue',  lw=1.0, label='lo peak')
+    hi_ln,  = ax_ch.plot(time_s, hi_disp[:, init_ch], color='tab:red',   lw=1.0, label='hi peak')
+    nf_ln,  = ax_ch.plot(time_s, np.full(len(time_s), pct25_dB_d[init_ch]),
+                         color='tab:gray', lw=1.0, ls='--', label='25th-pct baseline')
+    thr_ln, = ax_ch.plot(time_s, np.full(len(time_s), pct25_dB_d[init_ch] + _PDET_THRESH_DB),
+                         color='orange', lw=0.8, ls='--', label=f'baseline+{_PDET_THRESH_DB} dB')
+    vline_ch = ax_ch.axvline(float(time_s[init_fi]), color='cyan', lw=1.2, ls='-')
+    ax_ch.set_xlabel("Time (s)", fontsize=8)
+    ax_ch.set_ylabel("Power (dB)", fontsize=8)
+    ax_ch.legend(fontsize=7, loc='upper right')
+    ax_ch.grid(True, alpha=0.25)
+
+    # ── Right panels: 7 stacked squared-spectrum subplots ─────────────────
+    lo_f = sq_freq[lo_mask]
+    hi_f = sq_freq[hi_mask]
+    sq_lines: list = []
+    sq_nf_lines: list = []
+    sq_thr_lines: list = []
+    sq_labels: list = []
+
+    def _spectrum_at(fi, ch_d):
+        """Return squared-spectrum for display slot ch_d at frame fi."""
+        k = int((ch_d + half_ch) % N_CH)   # display slot → original channel
+        return pdb_all_frames[fi, k].copy()
+
+    for idx, offset in enumerate(range(-3, 4)):
+        ax   = sq_axes[idx]
+        ch   = (init_ch + offset) % N_CH   # wrap display slot
+        y    = _spectrum_at(init_fi, ch)
+        nf_v = float(pct25_dB_d[ch])
+
+        ax.axvspan(lo_f.min() / 1000.0, lo_f.max() / 1000.0, alpha=0.12, color='blue')
+        ax.axvspan(hi_f.min() / 1000.0, hi_f.max() / 1000.0, alpha=0.12, color='red')
+
+        ln,  = ax.plot(sq_freq / 1000.0, y, color='tab:green', lw=0.9)
+        nfl  = ax.axhline(nf_v,                      color='gray',   lw=0.8, ls='--')
+        thrl = ax.axhline(nf_v + _PDET_THRESH_DB,    color='orange', lw=0.8, ls=':')
+
+        sq_lines    .append(ln)
+        sq_nf_lines .append(nfl)
+        sq_thr_lines.append(thrl)
+
+        ax.set_xlim(float(sq_freq[0]) / 1000.0, float(sq_freq[-1]) / 1000.0)
+        ax.tick_params(labelsize=6)
+        ax.grid(True, alpha=0.20)
+
+        lbl_str = f'{display_hz[ch]/1000:.0f} kHz'
+        if offset == 0:
+            lbl_str += ' ←'
+        txt = ax.text(0.03, 0.93, lbl_str, transform=ax.transAxes,
+                      fontsize=6, va='top', ha='left',
+                      color='white' if offset == 0 else 'lightgray')
+        sq_labels.append(txt)
+
+    sq_axes[-1].set_xlabel("Frequency (kHz)", fontsize=7)
+    sq_axes[3].set_ylabel("Power (dB)", fontsize=7)     # middle panel gets the y label
+    sq_axes[0].set_title("Sq. spectrum\n(± 3 ch)", fontsize=7)
+
+    # ── Suptitle / ping info ──────────────────────────────────────────────
+    def _ping_str(idx):
+        if n_pings == 0:
+            return f"(no manifest)  frame={peak_fi}  ch={init_ch}"
+        p = pings[idx]
+        return (
+            f"Ping {idx+1}/{n_pings}:  '{p['msg']}'   "
+            f"fc={p['center_hz']/1000:.1f} kHz   "
+            f"t={p['delay_s']:.2f} s   "
+            f"SNR={p['snr_db']} dB   "
+            f"width={p.get('width_ms','?')} ms"
+            + (f"   [← →  to navigate]" if n_pings > 1 else "")
+        )
+
+    sup = fig.suptitle(
+        f"Per-Channel Detection  –  {name}\n{_ping_str(state['ping_idx'])}",
+        fontsize=9, y=0.975,
+    )
+
+    # ── Update all dynamic elements for current state ────────────────────
+    def _update():
+        fi = state['frame_idx']
+        ch = state['ch']
+
+        # Heatmap cursors
+        vline_hm.set_xdata([float(time_s[fi])] * 2)
+        hline_hm.set_ydata([float(display_hz[ch]) / 1000.0] * 2)
+        vline_ch.set_xdata([float(time_s[fi])] * 2)
+
+        # Channel power lines
+        lo_ln .set_ydata(lo_disp[:, ch])
+        hi_ln .set_ydata(hi_disp[:, ch])
+        nf_ln .set_ydata(np.full(len(time_s), pct25_dB_d[ch]))
+        thr_ln.set_ydata(np.full(len(time_s), pct25_dB_d[ch] + _PDET_THRESH_DB))
+        ax_ch.set_title(
+            f"{display_hz[ch]/1000:.0f} kHz  lo/hi peaks vs 25th-pct baseline",
+            fontsize=8,
+        )
+        ax_ch.relim()
+        ax_ch.autoscale_view(scalex=False, scaley=True)
+
+        # Right panels — spectrum lines + noise/threshold markers
+        y_vals = []
+        for idx, offset in enumerate(range(-3, 4)):
+            ach  = (ch + offset) % N_CH   # wrap display slot
+            y    = _spectrum_at(fi, ach)
+            nf_v = float(pct25_dB_d[ach])
+            sq_lines    [idx].set_ydata(y)
+            sq_nf_lines [idx].set_ydata([nf_v,                   nf_v])
+            sq_thr_lines[idx].set_ydata([nf_v + _PDET_THRESH_DB, nf_v + _PDET_THRESH_DB])
+            lbl = f'{display_hz[ach]/1000:.0f} kHz'
+            if offset == 0:
+                lbl += ' ←'
+            sq_labels[idx].set_text(lbl)
+            valid = y[np.isfinite(y)]
+            if valid.size:
+                y_vals.extend([float(valid.min()), float(valid.max())])
+
+        # Common y-range for all 7 right panels
+        if y_vals:
+            sq_axes[0].set_ylim(min(y_vals) - 2, max(y_vals) + 5)
+
+        # Title
+        sup.set_text(
+            f"Per-Channel Detection  –  {name}\n{_ping_str(state['ping_idx'])}"
+        )
+        fig.canvas.draw_idle()
+
+    # ── Arrow-key ping navigation ─────────────────────────────────────────
+    def _on_key(event):
+        if event.key not in ('right', 'left') or n_pings == 0:
+            return
+        new_pi = (state['ping_idx'] + (1 if event.key == 'right' else -1)) % n_pings
+        state['ping_idx']  = new_pi
+        state['frame_idx'] = _frame_for_ping(pings[new_pi])
+        state['ch']        = _ch_for_ping(pings[new_pi])
+        _update()
+
+    if show_plots:
+        fig.canvas.mpl_connect('key_press_event', _on_key)
+
+    _update()   # apply initial state
+
+    fig.savefig(output_path, dpi=140, bbox_inches='tight')
+    print(f"Wrote: {output_path}")
+    if not show_plots:
+        plt.close(fig)
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
 #   Main plot                                                                 #
 # ═══════════════════════════════════════════════════════════════════════════ #
 
@@ -669,8 +1085,8 @@ def plot_analysis(
         return [float(t[0]), float(t[-1]), float(f[0]) / 1000.0, float(f[-1]) / 1000.0]
 
     # ── [0,0]  Normal spectrogram ──────────────────────────────────────────
-    f1_min_khz = float(f1[0])  / 1000.0
-    f1_max_khz = float(f1[-1]) / 1000.0
+    f1_min_khz = 0.0
+    f1_max_khz = 3.0
     ax00, ax01 = axes[0]
     img1 = ax00.imshow(
         s1.T, aspect='auto', origin='lower',
@@ -701,11 +1117,6 @@ def plot_analysis(
         extent=_extent(t2, f2), cmap=gui_cmap, vmin=vmin0, vmax=vmax0,
     )
 
-    # Reference lines at expected squared-tone frequencies
-    ax10.axhline(f_sq_high / 1000.0, color='yellow', lw=0.9, ls='--',
-                 label=f'2\u00b7(fc+500)={f_sq_high:.0f} Hz')
-    ax10.axhline(f_sq_low  / 1000.0, color='cyan',   lw=0.9, ls='--',
-                 label=f'2\u00b7(fc\u2212500)={f_sq_low:.0f} Hz')
 
     ax10.set_title(
         f"Squared-Signal Spectrogram  (fc={fc_hz:.0f} Hz, ntol=\u00b1{ntol_hz:.0f} Hz,"
@@ -715,7 +1126,6 @@ def plot_analysis(
     ax10.set_ylabel("Frequency (kHz)")
     ax10.set_ylim(f2_min_khz, f2_max_khz)
     ax10.xaxis.set_major_locator(MultipleLocator(1.0))
-    ax10.legend(fontsize=8, loc='upper right')
 
     # ── [1,1]  Squared-spectrum median noise floor vs frequency ────────────
     floor2_line, = ax11.plot(floor2, f2 / 1000.0, lw=1.2, color='tab:orange')
@@ -817,10 +1227,8 @@ def plot_analysis(
                 ax00.set_title("Spectrogram (original)")
             img1.set_data(s1n.T)
             img1.set_extent(_extent(t1n, f1n))
-            f1n_min_khz = float(f1n[0])  / 1000.0
-            f1n_max_khz = float(f1n[-1]) / 1000.0
-            ax00.set_ylim(f1n_min_khz, f1n_max_khz)
-            ax01.set_ylim(f1n_min_khz, f1n_max_khz)
+            ax00.set_ylim(0.0, 3.0)
+            ax01.set_ylim(0.0, 3.0)
             floor1_line.set_xdata(floor1n)
             floor1_line.set_ydata(f1n / 1000.0)
 
@@ -987,6 +1395,15 @@ def main() -> None:
         timings: dict | None = {} if args.profile else None
 
         run_detections(wav_path, samples, rate, args.fc_hz, args.ntol_hz)
+
+        # Per-channel detection diagnostic (complex IQ only).
+        # Create the figure before plot_analysis so both windows appear together
+        # when plt.show() is called.
+        ch_result = _compute_per_channel_metrics(samples, rate)
+        if ch_result is not None:
+            ch_out_path = wav_path.parent / (wav_path.stem + '_ch_detection.png')
+            plot_channel_detection(wav_path.name, ch_result, show, ch_out_path,
+                                   wav_path=wav_path)
 
         call_kwargs = dict(
             name=wav_path.name,

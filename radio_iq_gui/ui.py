@@ -210,57 +210,59 @@ def setup_ui(self):
     self._iq_cursor_hline = pg.InfiniteLine(angle=0, pen=pg.mkPen('g', width=1, style=QtCore.Qt.DashLine))
     self.realtime_plot.addItem(self._iq_cursor_hline)
 
-    # Squared-signal periodograms: FFT of the squared real (I) 48 kHz input signal.
-    self.sq_realtime_plot = pg.PlotWidget(title="Squared Signal – Real-time")
-    self.sq_realtime_plot.setLabel('left', 'Freq (squared)', units='kHz')
-    self.sq_realtime_plot.setLabel('bottom', 'Time', units='s')
-    self.sq_realtime_img = pg.ImageItem(axisOrder='col-major')
-    self.sq_realtime_plot.addItem(self.sq_realtime_img)
-    self.sq_realtime_plot.setAspectLocked(False)
-    self.sq_realtime_img.setColorMap(colormap)
+    # ── Channel detection ridgeline plot ─────────────────────────────────────
+    # 48 stacked curves, one per 1-kHz sub-band.  Each curve shows peak SNR
+    # (dB above noise floor) from the channelised squared detector.  Curves
+    # are offset by CH_DISPLAY_OFFSET dB so that in pure noise they do not
+    # overlap; a real signal produces a spike that crosses adjacent baselines.
+    from .processing import DETECT_THRESH_DB, N_SNR_HIST
+    from .channelizer import N_CHANNELS
 
-    # Crosshairs on sq_realtime_plot
-    self._sq_cursor_vline = pg.InfiniteLine(angle=90,  pen=pg.mkPen('g', width=1))
-    self._sq_cursor_hline = pg.InfiniteLine(angle=0,   pen=pg.mkPen('g', width=1))
-    self.sq_realtime_plot.addItem(self._sq_cursor_vline)
-    self.sq_realtime_plot.addItem(self._sq_cursor_hline)
+    _ch_time_axis      = np.linspace(0.0, 15.0, N_SNR_HIST)
+    self._ch_time_axis = _ch_time_axis
 
-    # Frequency-slice plot: power (dB) vs frequency (kHz), X=power, Y=freq
-    self.sq_freq_slice_plot = pg.PlotWidget(title="Freq Slice")
-    self.sq_freq_slice_plot.setLabel('bottom', 'Power', units='dB')
-    self.sq_freq_slice_plot.setLabel('left', 'Freq (squared)', units='kHz')
-    self.sq_freq_slice_plot.showGrid(x=True, y=True, alpha=0.3)
-    self.sq_freq_slice_plot.setFixedWidth(_SIDE_WIDTH)
-    self.sq_freq_slice_plot.getAxis('left').setWidth(_SIDE_Y_AXIS_W)
-    _light_background(self.sq_freq_slice_plot)
-    self._sq_freq_slice_curve = pg.PlotCurveItem(pen=pg.mkPen('g', width=1))
-    self.sq_freq_slice_plot.addItem(self._sq_freq_slice_curve)
+    CH_DISPLAY_OFFSET  = 5.0   # dB between channel baselines
+    self._ch_display_offset = CH_DISPLAY_OFFSET
 
-    # Time-slice plot: power (dB) vs time (s)
-    self.sq_time_slice_plot = pg.PlotWidget(title="Time Slice")
-    self.sq_time_slice_plot.setLabel('left', 'Power', units='dB')
-    self.sq_time_slice_plot.setLabel('bottom', 'Time', units='s')
-    self.sq_time_slice_plot.setFixedHeight(120)
-    self.sq_time_slice_plot.showGrid(x=True, y=True, alpha=0.3)
-    _light_background(self.sq_time_slice_plot)
-    self._sq_time_slice_curve = pg.PlotCurveItem(pen=pg.mkPen('g', width=1))
-    self.sq_time_slice_plot.addItem(self._sq_time_slice_curve)
+    # Channel indices follow DFT order (0..23 = positive, 24..47 = negative).
+    # fftshift reorders them so display row 0 = most negative freq (-24 kHz),
+    # row 24 = DC (0 Hz), row 47 = +23 kHz — i.e. highest freq at top.
+    # _ch_display_pos[k] is the vertical slot (0 = bottom) for channel k.
+    _fftshift_order      = np.fft.fftshift(np.arange(N_CHANNELS)).astype(int)
+    _ch_display_pos      = np.argsort(_fftshift_order)   # shape (N_CHANNELS,)
+    self._ch_display_pos = _ch_display_pos
 
-    # Cursor coordinate label — fixed width so it never widens column 1
-    self.sq_cursor_label = QtWidgets.QLabel("")
-    self.sq_cursor_label.setStyleSheet("QLabel { color: green; padding: 2px 6px; }")
-    self.sq_cursor_label.setFixedWidth(_SIDE_WIDTH)
+    # Y-axis tick labels: show frequency in kHz at each channel's slot
+    _freq_khz = lambda k: k if k < N_CHANNELS // 2 else k - N_CHANNELS
+    _ticks = [
+        (_ch_display_pos[ch_k] * CH_DISPLAY_OFFSET, f"{_freq_khz(ch_k):+d}")
+        for ch_k in range(0, N_CHANNELS, 4)   # label every 4th channel
+    ]
+    _ticks.append((_ch_display_pos[0] * CH_DISPLAY_OFFSET, "0"))  # always label DC
 
-    # Connect mouse tracking
-    self.sq_realtime_plot.scene().sigMouseMoved.connect(self.on_sq_realtime_mouse_moved)
+    self.ch_detect_plot = pg.PlotWidget(
+        title=f"Channel Detection SNR  (threshold {DETECT_THRESH_DB:.0f} dB, "
+              f"offset {CH_DISPLAY_OFFSET:.0f} dB/ch)"
+    )
+    self.ch_detect_plot.setLabel('left',   'SNR + channel offset', units='dB')
+    self.ch_detect_plot.setLabel('bottom', 'Time', units='s')
+    self.ch_detect_plot.showGrid(x=True, y=True, alpha=0.2)
+    self.ch_detect_plot.setBackground('k')
 
-    self.sq_accumulated_plot = pg.PlotWidget(title="Squared Signal – Accumulated (15 sec snapshot)")
-    self.sq_accumulated_plot.setLabel('left', 'Freq (squared)', units='kHz')
-    self.sq_accumulated_plot.setLabel('bottom', 'Time', units='s')
-    self.sq_accumulated_img = pg.ImageItem(axisOrder='col-major')
-    self.sq_accumulated_plot.addItem(self.sq_accumulated_img)
-    self.sq_accumulated_plot.setAspectLocked(False)
-    self.sq_accumulated_img.setColorMap(colormap)
+    # Pre-build 48 PlotCurveItems, all green
+    _green_pen = pg.mkPen((0, 200, 0), width=1)
+    self._ch_curves = []
+    for ch_k in range(N_CHANNELS):
+        curve = pg.PlotCurveItem(pen=_green_pen)
+        self.ch_detect_plot.addItem(curve)
+        self._ch_curves.append(curve)
+
+    self.ch_detect_plot.getAxis('left').setTicks([_ticks])
+
+    # Y range: bottom slot (0) to top slot (N_CHANNELS-1) plus headroom
+    _y_max = (N_CHANNELS - 1) * CH_DISPLAY_OFFSET + 20
+    self.ch_detect_plot.setYRange(0, _y_max, padding=0)
+    self.ch_detect_plot.setXRange(0, 15.0, padding=0)
 
     def _make_slider_bar(title, min_label_ref, min_range, min_default,
                          max_label_ref, max_range, max_default,
@@ -306,44 +308,28 @@ def setup_ui(self):
         "max_level_label",  (-100,   0),  self.max_level,
         self.on_min_level_changed, self.on_max_level_changed, 10,
     )
-    sq_sliders = _make_slider_bar(
-        "Squared Color Scale",
-        "sq_min_level_label",  (-150, -20),  self.sq_min_level,
-        "sq_max_level_label",  (-100,   0),  self.sq_max_level,
-        self.on_sq_min_level_changed, self.on_sq_max_level_changed, 10,
-    )
+
     # ── Grid layout ─────────────────────────────────────────────────────────
     # Row 0: accumulated IQ spectrogram  | accumulated noise floor
     # Row 1: real-time IQ spectrogram    | IQ freq slice (cursor-driven)
     # Row 2: IQ time slice               | (col 1 empty)
     # Row 3: IQ slider bar               | (spans both cols)
-    # Row 4: accumulated squared         | (col 1 empty)
-    # Row 5: squared slider bar          | (spans both cols)
-    # Row 6: real-time squared           | sq_freq_slice_plot
-    # Row 7: sq_time_slice_plot          | cursor label
+    # Row 4: channel detection ridgeline | (spans both cols)
     layout.addWidget(self.spectrogram_plot,       0, 0)
     layout.addWidget(self.accumulated_noise_plot,  0, 1)
     layout.addWidget(self.realtime_plot,           1, 0)
     layout.addWidget(self.realtime_noise_plot,     1, 1)
     layout.addWidget(self.iq_time_slice_plot,      2, 0)
     layout.addWidget(iq_sliders,                   3, 0, 1, 2)
-    layout.addWidget(self.sq_accumulated_plot,     4, 0)
-    layout.addWidget(sq_sliders,                   5, 0, 1, 2)
-    layout.addWidget(self.sq_realtime_plot,        6, 0)
-    layout.addWidget(self.sq_freq_slice_plot,      6, 1)
-    layout.addWidget(self.sq_time_slice_plot,      7, 0)
-    layout.addWidget(self.sq_cursor_label,         7, 1)
+    layout.addWidget(self.ch_detect_plot,          4, 0, 1, 2)
 
     layout.setColumnStretch(0, 1)
     layout.setColumnStretch(1, 0)   # col-1 width is fixed by setFixedWidth above
-    layout.setRowStretch(0, 3)
-    layout.setRowStretch(1, 3)
+    layout.setRowStretch(0, 1)
+    layout.setRowStretch(1, 1)
     layout.setRowStretch(2, 1)
     layout.setRowStretch(3, 0)
-    layout.setRowStretch(4, 3)
-    layout.setRowStretch(5, 0)
-    layout.setRowStretch(6, 3)
-    layout.setRowStretch(7, 1)
+    layout.setRowStretch(4, 4)
 
     self.statusBar().showMessage('Initializing...')
     self.tuned_freq_label = QtWidgets.QLabel("Tuned: --")
@@ -367,15 +353,6 @@ def on_max_level_changed(self, value):
     self.max_level = value
     self.max_level_label.setText(f"Max: {value} dB")
 
-
-def on_sq_min_level_changed(self, value):
-    self.sq_min_level = value
-    self.sq_min_level_label.setText(f"Min: {value} dB")
-
-
-def on_sq_max_level_changed(self, value):
-    self.sq_max_level = value
-    self.sq_max_level_label.setText(f"Max: {value} dB")
 
 
 def on_select_source_radio(self):
@@ -406,49 +383,3 @@ def on_select_source_wav(self):
     self.statusBar().showMessage(f"Source selected: WAV File ({file_path})")
 
 
-def on_sq_realtime_mouse_moved(self, pos):
-    if not self.sq_realtime_plot.sceneBoundingRect().contains(pos):
-        return
-    mouse_point = self.sq_realtime_plot.getViewBox().mapSceneToView(pos)
-    t_s   = float(mouse_point.x())
-    f_khz = float(mouse_point.y())
-
-    self._sq_cursor_vline.setPos(t_s)
-    self._sq_cursor_hline.setPos(f_khz)
-
-    sq_data   = self.sq_realtime_data      # shape (max_history, fft_size)
-    sq_freq   = self.sq_freq_axis_khz      # kHz relative to centre
-    bps       = self.blocks_per_sec
-
-    # Smooth helper: box average
-    def _smooth(arr, n=21):
-        if n < 2 or arr.size < n:
-            return arr
-        return np.convolve(arr, np.ones(n) / n, mode='same')
-
-    # Common time/freq indices
-    t_idx  = max(0, min(int(round(t_s * bps)), sq_data.shape[0] - 1))
-    f_idx  = max(0, min(int(np.argmin(np.abs(sq_freq - f_khz))), sq_data.shape[1] - 1))
-    time_axis = np.arange(sq_data.shape[0]) / bps
-
-    # ── Squared slices ────────────────────────────────────────────────────
-    self._sq_time_slice_curve.setData(time_axis, _smooth(sq_data[:, f_idx]))
-    self._sq_freq_slice_curve.setData(_smooth(sq_data[t_idx, :]), sq_freq)
-
-    # ── IQ slices — squared freq → IQ freq (squaring doubles frequency) ──
-    # f_khz is in the squared domain (offset from centre); original signal
-    # is at half that offset.  Convert to absolute MHz for the IQ freq axis.
-    f_iq_mhz = self.display_center_freq_mhz + f_khz / 2.0 / 1000.0
-    self._iq_cursor_hline.setPos(f_iq_mhz)
-
-    iq_data  = self.realtime_data          # shape (max_history, fft_size)
-    iq_freq  = self.freq_axis              # MHz absolute
-
-    fi_iq = max(0, min(int(np.argmin(np.abs(iq_freq - f_iq_mhz))), iq_data.shape[1] - 1))
-    self._iq_time_slice_curve.setData(time_axis, _smooth(iq_data[:, fi_iq], n=7))
-    self._iq_freq_slice_curve.setData(_smooth(iq_data[t_idx, :], n=21), iq_freq)
-
-    self.sq_cursor_label.setText(
-        f"sq: t={t_s:.2f}s f={f_khz:.1f}kHz {float(sq_data[t_idx, f_idx]):.1f}dB\n"
-        f"iq: {f_iq_mhz*1000:.1f}kHz {float(iq_data[t_idx, fi_iq]):.1f}dB"
-    )
