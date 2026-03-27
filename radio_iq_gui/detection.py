@@ -65,7 +65,7 @@ extract_and_decode(iq_ring, ring_state_fn, detect_sample,
     End-to-end decode pipeline, intended to run in a daemon thread:
 
       1. **Extract** — waits for up to ``max_post`` of new IQ data to arrive
-         in the ring buffer after ``detect_sample``, then reads 300 ms before
+         in the ring buffer after ``detect_sample``, then reads 500 ms before
          detection plus everything up to where the signal envelope drops below
          5 % of its peak (plus a 50 ms margin), zero-padded 100 ms each end.
       2. **Mix** — complex-multiplies by ``exp(-j2π·Δf·t)`` to shift the
@@ -90,6 +90,7 @@ _TARGET_FC_HZ      : 1500 Hz — jt9 audio centre frequency after mixing
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -244,6 +245,10 @@ def extract_and_decode(
     fc_hz: float,
     output_dir: str,
     t_in_window: float = 0.0,
+    decode_queue=None,
+    marker_id: int = -1,
+    ring_gen: int = 0,
+    ring_gen_fn=None,
 ) -> None:
     """Extract IQ around detect_sample, mix fc to 1500 Hz, decimate to 12 kHz, run jt9.
 
@@ -252,7 +257,7 @@ def extract_and_decode(
     t_in_window  – seconds within the 15-s display window (0–15), used for logging.
     Intended to run in a background daemon thread.
     """
-    pre_n  = int(0.300 * sample_rate)   # 300 ms before detection
+    pre_n  = int(0.500 * sample_rate)   # 500 ms before detection
     post_n = int(1.200 * sample_rate)   # 1200 ms after detection — MSK144 envelope e·t·exp(-t)
                                         # decays to ~10% at 4× width; for max 300 ms ping that
                                         # tail extends ~900 ms past peak, so 1200 ms captures it
@@ -268,13 +273,16 @@ def extract_and_decode(
             break
         time.sleep(0.020)
 
+    # If the ring buffer was reset (source switch) this launch is stale — exit silently.
+    if ring_gen_fn is not None and ring_gen_fn() != ring_gen:
+        return
+
     ring_pos, abs_sample = ring_state_fn()
 
     iq_seg = _read_ring(iq_ring, ring_pos, abs_sample,
                         detect_sample - pre_n, pre_n + post_n)
 
     if iq_seg.size == 0:
-        print("[MSK144] ring buffer empty, skipping decode", flush=True)
         return
 
     # Zero-pad
@@ -287,7 +295,7 @@ def extract_and_decode(
     iq_mixed = (iq_padded * np.exp(-2j * np.pi * shift_hz * t / sample_rate)).astype(np.complex64)
 
     # Decimate I channel: 48 kHz → 12 kHz
-    i_dec = decimate(np.real(iq_mixed).astype(np.float64), _DECIMATE_FACTOR, zero_phase=True)
+    i_dec = decimate(np.real(iq_mixed).astype(np.float64), _DECIMATE_FACTOR, zero_phase=False)
     audio = i_dec.astype(np.float32)
 
     peak = float(np.max(np.abs(audio)))
@@ -299,7 +307,9 @@ def extract_and_decode(
 
     out_dir  = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    launch_ts = datetime.now(timezone.utc).isoformat()
+    _now      = datetime.now(timezone.utc)
+    launch_ts = _now.isoformat()
+    _ts_file  = _now.strftime('%Y%m%d_%H%M%SZ')
 
     def _log_launch(outcome: str, message: str = "", jt9_snr=None, jt9_line: str = ""):
         entry = {
@@ -335,23 +345,29 @@ def extract_and_decode(
                     break
 
             if decoded:
-                # jt9 MSK144 output: "HHMMSS  SNR  dt  freq  mode  MESSAGE"
+                # jt9 MSK144 output: "HHMMSS  SNR  dt  freq  mode  MESSAGE..."
                 tokens   = decoded.split()
-                bare_msg = tokens[-1] if tokens else decoded
+                full_msg = " ".join(tokens[5:]) if len(tokens) >= 6 else decoded
+                bare_msg = full_msg   # kept for decode_queue / log compatibility
                 jt9_snr  = int(tokens[1]) if len(tokens) >= 2 else None
 
-                # Name the WAV after the decoded message so it is easy to
-                # correlate with the comparison report.  Add a sequence number
-                # if a file for this message already exists (re-trigger case).
-                seq = 1
-                while True:
-                    seq_sfx = f"_{seq:02d}" if seq > 1 else ""
-                    save_name = f"{bare_msg}{seq_sfx}.wav"
-                    if not (out_dir / save_name).exists():
-                        break
-                    seq += 1
+                # Filename: YYYYMMDD_HHMMSSZ_{freq_kHz}kHz_{message}.wav
+                # Spaces → underscore; any non-alphanumeric char → underscore.
+                msg_safe  = re.sub(r'[^A-Za-z0-9]+', '_', full_msg).strip('_')
+                fc_int    = int(round(fc_khz))
+                save_name = f"{_ts_file}_{fc_int}kHz_{msg_safe}.wav"
                 shutil.move(tmp_path, str(out_dir / save_name))
                 print(f"[MSK144 DECODE]  t={t_sec:.2f}s  fc={fc_khz:.2f} kHz  {decoded}", flush=True)
+
+                if decode_queue is not None:
+                    decode_queue.put({
+                        'marker_id': marker_id,
+                        'decoded':   True,
+                        'message':   bare_msg,
+                        't_sec':     t_sec,
+                        'fc_khz':    fc_khz,
+                        'jt9_snr':   jt9_snr,
+                    })
 
                 # Append to decode log for post-run comparison with manifest
                 decode_entry = {

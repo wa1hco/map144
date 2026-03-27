@@ -22,11 +22,11 @@ here; this module is purely concerned with rendering and status text.
 
 Panel layout (matches the grid built in ``ui.py``)
 ---------------------------------------------------
-Row 0  Accumulated IQ spectrogram  |  Accumulated noise-floor curve
-Row 1  Real-time IQ spectrogram    |  Real-time noise-floor curve
-Row 2  (IQ slider bar — not drawn here)
-Row 3  Squared-signal accumulated spectrogram
-Row 4  Squared-signal real-time spectrogram
+Row 0  Accumulated IQ spectrogram  |  Decode panel (spans rows 0–1)
+Row 1  Real-time IQ spectrogram    |  (covered by decode panel rowspan)
+Row 2  IQ colour-scale slider bar
+Row 3  Channel detection SNR heatmap
+Row 4  Detection colour-scale slider bar
 
 Rendering details
 -----------------
@@ -106,12 +106,17 @@ def update_displays(self):
     freq_min = self.freq_axis[0]
     freq_max = self.freq_axis[-1]
 
+    self._noise_floor_ctr = getattr(self, '_noise_floor_ctr', 0) + 1
+
     if self.spec_staging_filled:
         spec_array = self.spectrogram_data
 
-        valid_acc_rows = np.any(spec_array > -129.5, axis=1)
-        if np.any(valid_acc_rows):
-            self.accumulated_noise_floor = np.percentile(spec_array[valid_acc_rows], 10, axis=0)
+        if self._noise_floor_ctr % 10 == 1:   # recompute ~once per second
+            valid_acc_rows = np.any(spec_array > -129.5, axis=1)
+            if np.any(valid_acc_rows):
+                _a = spec_array[valid_acc_rows]
+                _k = max(0, int(len(_a) * 0.10))
+                self.accumulated_noise_floor = np.partition(_a, _k, axis=0)[_k]
 
         self.spectrogram_img.setImage(
             spec_array,
@@ -131,10 +136,8 @@ def update_displays(self):
         self.spectrogram_plot.setXRange(0, self.max_time, padding=0)
         self.spectrogram_plot.setYRange(freq_min, freq_max, padding=0)
 
-    if self.realtime_filled:
-        valid_rt_rows = np.any(self.realtime_data > -129.5, axis=1)
-        if np.any(valid_rt_rows):
-            self.realtime_noise_floor = np.percentile(self.realtime_data[valid_rt_rows], 10, axis=0)
+    if self.realtime_filled and getattr(self, '_realtime_dirty', False):
+        self._realtime_dirty = False
 
         self.realtime_img.setImage(
             self.realtime_data,
@@ -154,27 +157,85 @@ def update_displays(self):
         self.realtime_plot.setXRange(0, self.realtime_time, padding=0)
         self.realtime_plot.setYRange(freq_min, freq_max, padding=0)
 
-    self.accumulated_noise_curve.setData(self.accumulated_noise_floor, self.freq_axis)
-    self.accumulated_noise_plot.setXRange(self.min_level, self.max_level, padding=0)
-    self.accumulated_noise_plot.setYRange(freq_min, freq_max, padding=0)
+    # ── jt9 decode results — always drain the queue so decode_panel stays current
+    all_markers = list(getattr(self, '_jt9_markers', []))
+    _marker_by_id = {m['id']: m for m in all_markers if isinstance(m, dict)}
 
-    # realtime_noise_plot is now cursor-driven (IQ freq slice); Y range kept in sync
-    self.realtime_noise_plot.setXRange(self.min_level, self.max_level, padding=0)
-    self.realtime_noise_plot.setYRange(freq_min, freq_max, padding=0)
+    dq = getattr(self, '_decode_queue', None)
+    if dq is not None:
+        while not dq.empty():
+            try:
+                result = dq.get_nowait()
+            except Exception:
+                break
+            mid = result.get('marker_id', -1)
+            if mid in _marker_by_id:
+                _marker_by_id[mid]['decoded'] = True
+                _marker_by_id[mid]['message'] = result.get('message')
+            # Prepend to decode panel (most recent at top)
+            msg     = result.get('message', '?')
+            fc_khz  = result.get('fc_khz', 0.0)
+            snr     = result.get('jt9_snr')
+            rf_mhz  = center_freq_mhz + fc_khz / 1000.0
+            snr_str = f"{snr:+d} dB" if snr is not None else "  ?"
+            self.decode_panel.insertItem(0, f"{rf_mhz:.3f}  {snr_str:>7}  {msg}")
 
-    # Pin IQ time-slice X range to the realtime window
-    self.iq_time_slice_plot.setXRange(0, self.realtime_time, padding=0)
+    # ── Detection heatmap + markers — skip when panel is hidden ──────────────
+    _detect_win = getattr(self, '_detect_win', None)
+    if _detect_win is None or _detect_win.isVisible():
+        # fftshift channels so image row 0 = -24 kHz, row 47 = +23 kHz.
+        hm_data = np.fft.fftshift(self._ch_snr_history, axes=1)   # (N_SNR_HIST, N_CH)
+        self.ch_detect_img.setImage(
+            hm_data,
+            autoLevels=False,
+            levels=[self.detect_min_level, self.detect_max_level],
+        )
+        self.ch_detect_img.setRect(QtCore.QRectF(
+            0.0,
+            self._detect_freq_min_khz,
+            float(self.history_secs),
+            self._detect_freq_span_khz,
+        ))
+        self.ch_detect_plot.setXRange(0, float(self.history_secs), padding=0)
 
-    # ── Channel detection ridgeline ───────────────────────────────────────────
-    # Show data from t=0 growing rightward; curves reset each 15-s boundary.
-    w_idx  = min(self._ch_snr_write_idx, self._ch_snr_history.shape[0])
-    t_axis = self._ch_time_axis[:w_idx]
-    offset = self._ch_display_offset
+        # ── jt9 launch markers ────────────────────────────────────────────────
+        # Red = launched / not yet decoded.  Green = successfully decoded.
+        markers = [m for m in all_markers
+                   if isinstance(m, dict) and m.get('boundary') == self._ch_snr_boundary]
 
-    for ch_k, curve in enumerate(self._ch_curves):
-        snr_k = self._ch_snr_history[:w_idx, ch_k].astype(np.float32)
-        pos   = self._ch_display_pos[ch_k]
-        curve.setData(t_axis, snr_k + pos * offset)
+        # Only rebuild circle paths when marker state changes
+        n_decoded   = sum(1 for m in markers if m.get('decoded'))
+        marker_fp   = (self._ch_snr_boundary, len(markers), n_decoded)
+        prev_fp     = getattr(self, '_marker_fp', None)
+        if marker_fp != prev_fp:
+            self._marker_fp = marker_fp
+
+            r_y   = 2.5   # kHz radius (5 kHz diameter)
+            px_x, px_y = self.ch_detect_plot.getViewBox().viewPixelSize()
+            r_x   = r_y * (px_x / px_y) if px_y > 0 else r_y * 0.1
+            theta = np.linspace(0, 2 * np.pi, 33)
+
+            def _circle_path(mlist):
+                xs, ys = [], []
+                for m in mlist:
+                    xs.append(m.get('t', 0.0)        + r_x * np.cos(theta))
+                    ys.append(m.get('freq_khz', 0.0) + r_y * np.sin(theta))
+                    xs.append([np.nan])
+                    ys.append([np.nan])
+                return np.concatenate(xs), np.concatenate(ys)
+
+            undecoded = [m for m in markers if not m['decoded']]
+            decoded   = [m for m in markers if     m['decoded']]
+
+            if undecoded:
+                self.ch_detect_curve_red.setData(*_circle_path(undecoded), connect='finite')
+            else:
+                self.ch_detect_curve_red.setData(x=[], y=[])
+
+            if decoded:
+                self.ch_detect_curve_green.setData(*_circle_path(decoded), connect='finite')
+            else:
+                self.ch_detect_curve_green.setData(x=[], y=[])
 
     utc_time = datetime.datetime.now(datetime.UTC).strftime("%H:%M:%S")
     self.utc_clock_label.setText(f"UTC: {utc_time}")
@@ -202,15 +263,23 @@ def update_displays(self):
         if hasattr(self, 'radio_client') and hasattr(self.radio_client, '_vita') and self.radio_client._vita:
             missed = self.radio_client._vita.missed_count
             total = self.radio_client._vita.packet_count
+            drops = self.radio_client._vita.drop_count
             if total > 0:
                 loss_pct = (missed / total) * 100 if total > 0 else 0
-                packet_info = f' | Packets: {total} (loss: {loss_pct:.2f}%)'
+                drop_str = f'  drops: {drops}' if drops > 0 else ''
+                packet_info = f' | Packets: {total} (loss: {loss_pct:.2f}%{drop_str})'
 
+        _nb_total = getattr(self, '_nb_total_count', 0)
+        _nb_blank = getattr(self, '_nb_blanked_count', 0)
+        if _nb_total > 0 and _nb_blank > 0:
+            nb_str = f' | NB: {100.0 * _nb_blank / _nb_total:.2f}%'
+        else:
+            nb_str = ''
         self.statusBar().showMessage(
             f'Rate: {self.sample_rate/1000:.0f} kHz | '
             f'FFT: {self.fft_size} bins | '
             f'Power: {data_min:.1f} to {data_max:.1f} dB (avg {data_mean:.1f})'
-            f'{packet_info}'
+            f'{packet_info}{nb_str}'
         )
     else:
         self.statusBar().showMessage(
@@ -218,3 +287,137 @@ def update_displays(self):
             f'FFT: {self.fft_size} bins | '
             f'Waiting for data...'
         )
+
+    # ── Radio Interface panel — skip when hidden ──────────────────────────────
+    _ri_win = getattr(self, '_radio_iface_win', None)
+    if _ri_win is not None and not _ri_win.isVisible():
+        return
+
+    # ── IQ magnitude time-domain plot (5 Hz — every 2nd 100 ms tick) ─────────
+    if hasattr(self, 'td_curve') and self._noise_floor_ctr % 2 == 0:
+        buf = self._td_mag_buf
+        pos = self._td_mag_pos
+        n   = len(buf)
+        # Unroll circular buffer so oldest sample is on the left
+        if pos == 0:
+            full = buf
+        else:
+            full = np.empty(n, dtype=np.float32)
+            full[:n - pos] = buf[pos:]
+            full[n - pos:] = buf[:pos]
+        # Slice to the requested span
+        span_ms = float(getattr(self, 'td_span_ms', 200.0))
+        span_n  = min(int(span_ms * self.sample_rate / 1000.0), n)
+        display = full[-span_n:]
+        x_axis  = np.linspace(0.0, span_ms, span_n, endpoint=False)
+        self.td_plot.setXRange(0.0, span_ms, padding=0)
+        self.td_curve.setData(x_axis, display)
+        # Move threshold line to nb_factor × running RMS envelope
+        if self._nb_env is not None:
+            nb_k = float(getattr(self, 'nb_factor', 6))
+            self.td_thresh_line.setValue(nb_k * float(self._nb_env))
+
+    # ── Radio Interface panel: live stat labels ───────────────────────────────
+    rc  = getattr(self, 'radio_client', None)
+    tcp = rc._tcp          if rc  else None
+    dax = rc._dax_setup    if rc  else None
+    vita = rc._vita        if rc  else None
+
+    # Radio identity & connection status
+    if hasattr(self, '_ri_radio_status_val'):
+        if self.source_mode == 'wav':
+            status, color = "WAV File", "#1a6b1a"
+        elif rc is None:
+            status, color = "Idle", "#555555"
+        elif tcp is None:
+            status, color = "Discovering...", "#c76000"
+        elif not getattr(tcp, '_running', False):
+            status, color = "TCP disconnected", "#b71c1c"
+        elif vita is None:
+            status, color = "Configuring DAXIQ...", "#c76000"
+        elif getattr(vita, '_running', False):
+            status, color = "Running", "#1a6b1a"
+        else:
+            status, color = "VITA stopped", "#b71c1c"
+        self._ri_radio_status_val.setText(status)
+        self._ri_radio_status_val.setStyleSheet(
+            f"QLabel {{ color: {color}; font-family: monospace; }}"
+        )
+
+    if tcp is not None:
+        radio = getattr(tcp, 'radio', None)
+        if radio is not None:
+            if hasattr(self, '_ri_model_val'):
+                self._ri_model_val.setText(radio.model or "—")
+            if hasattr(self, '_ri_serial_val'):
+                self._ri_serial_val.setText(radio.serial or "—")
+            if hasattr(self, '_ri_firmware_val'):
+                self._ri_firmware_val.setText(radio.version or "—")
+            if hasattr(self, '_ri_radio_ip_val'):
+                self._ri_radio_ip_val.setText(f"{radio.ip}:{radio.port}")
+
+    # DAXIQ stream fields
+    if dax is not None:
+        if hasattr(self, '_ri_dax_ch_val'):
+            self._ri_dax_ch_val.setText(str(dax.dax_channel))
+        if hasattr(self, '_ri_stream_id_val'):
+            sid = dax.stream_id
+            self._ri_stream_id_val.setText(f"0x{sid:08x}" if sid else "—")
+        if hasattr(self, '_ri_udp_port_val'):
+            self._ri_udp_port_val.setText(str(dax.listen_port))
+        if hasattr(self, '_ri_mode_val'):
+            sid = dax.slice_id
+            if sid is None:
+                mode = "—"
+            elif sid == 0:
+                mode = "Panadapter"
+            else:
+                label = chr(ord('A') + sid) if 0 <= sid < 26 else str(sid)
+                mode = f"Slice {label}"
+            self._ri_mode_val.setText(mode)
+
+    # IF parameters
+    if hasattr(self, '_ri_freq_val'):
+        if dax is not None:
+            freq = dax.slice_frequency_mhz or dax.pan_frequency_mhz
+            self._ri_freq_val.setText(f"{freq:.6f} MHz" if freq else "—")
+        elif tuned_freq_mhz is not None:
+            self._ri_freq_val.setText(f"{tuned_freq_mhz:.6f} MHz")
+        else:
+            self._ri_freq_val.setText(f"{self.center_freq_mhz:.6f} MHz (req)")
+
+    if hasattr(self, '_ri_bw_val'):
+        if dax is not None and dax.pan_bandwidth_hz:
+            bw_khz = dax.pan_bandwidth_hz / 1e3
+            self._ri_bw_val.setText(f"{bw_khz:.0f} kHz")
+        else:
+            self._ri_bw_val.setText("—")
+
+    if hasattr(self, '_ri_rate_val'):
+        self._ri_rate_val.setText(f"{self.sample_rate / 1000:.0f} kHz")
+
+    # Stream health
+    if hasattr(self, '_ri_packets_val'):
+        if vita is not None:
+            total    = vita.packet_count
+            missed   = vita.missed_count
+            drops    = vita.drop_count
+            loss_pct = (missed / total * 100) if total > 0 else 0.0
+            self._ri_packets_val.setText(f"{total:,}")
+            if hasattr(self, '_ri_loss_val'):
+                self._ri_loss_val.setText(f"{loss_pct:.3f}%")
+            if hasattr(self, '_ri_drops_val'):
+                self._ri_drops_val.setText(f"{drops:,}")
+        else:
+            self._ri_packets_val.setText("—")
+            if hasattr(self, '_ri_loss_val'):
+                self._ri_loss_val.setText("—")
+            if hasattr(self, '_ri_drops_val'):
+                self._ri_drops_val.setText("—")
+
+    # Noise blanker event counter
+    if hasattr(self, '_ri_nb_count_val'):
+        _nb_t = getattr(self, '_nb_total_count', 0)
+        _nb_b = getattr(self, '_nb_blanked_count', 0)
+        _nb_pct = (100.0 * _nb_b / _nb_t) if _nb_t > 0 else 0.0
+        self._ri_nb_count_val.setText(f"{_nb_pct:.2f}%")
