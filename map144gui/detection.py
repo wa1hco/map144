@@ -307,9 +307,12 @@ def extract_and_decode(
         audio = audio / peak * 0.9
 
     t_sec  = t_in_window
-    # rf_khz is the absolute RF frequency in kHz — used for all user-facing output.
-    # fc_hz is the signed offset from center (DSP use only, e.g. the mixer shift).
-    rf_khz = center_freq_mhz * 1000.0 + fc_hz / 1000.0
+    # radio_khz is the USB dial-equivalent frequency in kHz (actual RF minus the
+    # 1500 Hz audio offset), matching the contest-logging convention used by
+    # N1MM, GridTracker, and other contest tools.  A station on USB 50.270 MHz
+    # with MSK144 audio at 1500 Hz will report radio_khz = 50270.
+    # fc_hz (the DSP mixer offset) is kept separate for the mixing step.
+    radio_khz = center_freq_mhz * 1000.0 + (fc_hz - _TARGET_FC_HZ) / 1000.0
 
     out_dir   = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -320,7 +323,7 @@ def extract_and_decode(
         entry = {
             "timestamp": launch_ts,
             "t_sec":     round(t_sec, 3),
-            "rf_khz":    int(round(rf_khz)),
+            "radio_khz":    int(round(radio_khz)),
             "outcome":   outcome,   # "decoded" | "no_decode" | "timeout" | "error"
             "message":   message,
             "jt9_snr_db": jt9_snr,
@@ -359,10 +362,10 @@ def extract_and_decode(
                 # Filename: YYYYMMDD_HHMMSSZ_{freq_kHz}kHz_{message}.wav
                 # Spaces → underscore; any non-alphanumeric char → underscore.
                 msg_safe  = re.sub(r'[^A-Za-z0-9]+', '_', full_msg).strip('_')
-                rf_int    = int(round(rf_khz))
+                rf_int    = int(round(radio_khz))
                 save_name = f"{_ts_file}_{rf_int}kHz_{msg_safe}.wav"
                 shutil.move(tmp_path, str(out_dir / save_name))
-                print(f"[MSK144 DECODE]  t={t_sec:.2f}s  rf={rf_khz:.3f} kHz  {decoded}", flush=True)
+                print(f"[MSK144 DECODE]  t={t_sec:.2f}s  radio={radio_khz:.3f} kHz  {decoded}", flush=True)
 
                 if decode_queue is not None:
                     decode_queue.put({
@@ -370,7 +373,7 @@ def extract_and_decode(
                         'decoded':   True,
                         'message':   bare_msg,
                         't_sec':     t_sec,
-                        'rf_khz':    rf_khz,
+                        'radio_khz':    radio_khz,
                         'jt9_snr':   jt9_snr,
                     })
 
@@ -378,7 +381,7 @@ def extract_and_decode(
                 decode_entry = {
                     "timestamp":  launch_ts,
                     "t_sec":      round(t_sec, 3),
-                    "rf_khz":     int(round(rf_khz)),
+                    "radio_khz":     int(round(radio_khz)),
                     "message":    bare_msg,
                     "jt9_snr_db": jt9_snr,
                     "jt9_line":   decoded,
@@ -393,7 +396,7 @@ def extract_and_decode(
             Path(tmp_path).unlink(missing_ok=True)
 
     except subprocess.TimeoutExpired:
-        print(f"[MSK144]  jt9 timeout (>20s) at t={t_sec:.2f}s  rf={rf_khz:.3f} kHz", flush=True)
+        print(f"[MSK144]  jt9 timeout (>20s) at t={t_sec:.2f}s  rf={radio_khz:.3f} kHz", flush=True)
         _log_launch("timeout")
     except Exception as exc:
         print(f"[MSK144]  extract_and_decode error: {exc}", flush=True)

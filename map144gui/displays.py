@@ -174,9 +174,9 @@ def update_displays(self):
                 _marker_by_id[mid]['message'] = result.get('message')
             # Prepend to decode panel (most recent at top)
             msg     = result.get('message', '?')
-            rf_khz  = result.get('rf_khz', 0.0)
+            radio_khz  = result.get('radio_khz', 0.0)
             snr     = result.get('jt9_snr')
-            rf_mhz  = rf_khz / 1000.0
+            rf_mhz  = radio_khz / 1000.0
             snr_str = f"{snr:+d} dB" if snr is not None else "  ?"
             self.decode_panel.insertItem(0, f"{rf_mhz:.3f}  {snr_str:>7}  {msg}")
 
