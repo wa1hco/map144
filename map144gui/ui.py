@@ -78,7 +78,7 @@ def setup_ui(self):
     from .channelizer import N_CHANNELS
     from .visualizer import _SETTINGS
 
-    self.setWindowTitle(f'MapMSK144 - {self.center_freq_mhz:.3f} MHz')
+    self.setWindowTitle(f'map144 - {self.center_freq_mhz:.3f} MHz')
     self.setGeometry(50, 50, 420, 800)
 
     # ── Menu bar ──────────────────────────────────────────────────────────────

@@ -14,7 +14,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """Display update/render logic for spectrogram, noise-floor, and energy overlays.
 
-This module implements ``update_displays``, mixed into ``RadioIQVisualizer`` as
+This module implements ``update_displays``, mixed into ``MAP144Visualizer`` as
 a method and called by a Qt 100 ms refresh timer.  It reads the shared NumPy
 buffers written by ``processing.py`` and pushes updated data to the five
 pyqtgraph plot widgets created by ``ui.py``.  No signal processing is done
@@ -249,10 +249,10 @@ def update_displays(self):
                 self.tuned_freq_label.setText(f"Pan Center: {tuned_freq_mhz:.3f} MHz")
         else:
             self.tuned_freq_label.setText(f"Tuned ({tuned_source}): {tuned_freq_mhz:.3f} MHz")
-        self.setWindowTitle(f'Radio IQ - {tuned_freq_mhz:.3f} MHz')
+        self.setWindowTitle(f'map144 - {tuned_freq_mhz:.3f} MHz')
     else:
         self.tuned_freq_label.setText(f"Tuned: {self.center_freq_mhz:.3f} MHz (requested)")
-        self.setWindowTitle(f'Radio IQ - {self.center_freq_mhz:.3f} MHz')
+        self.setWindowTitle(f'map144 - {self.center_freq_mhz:.3f} MHz')
 
     if self.spec_staging_filled and len(self.spectrogram_data) > 0:
         data_min = np.min(self.spectrogram_data)

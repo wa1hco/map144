@@ -15,7 +15,7 @@
 """Headless DSP engine — no Qt imports.
 
 Can be used standalone (headless mode) or as a base class for
-RadioIQVisualizer(Engine, QMainWindow).
+MAP144Visualizer(Engine, QMainWindow).
 """
 
 import datetime
@@ -34,7 +34,7 @@ from .processing import (
 class Engine:
     """DSP engine: holds all numpy state and the IQ processing pipeline.
 
-    No PyQt5 imports.  In GUI mode RadioIQVisualizer inherits from this class.
+    No PyQt5 imports.  In GUI mode MAP144Visualizer inherits from this class.
     In headless mode instantiate directly and call run_headless().
     """
 
@@ -144,7 +144,7 @@ class Engine:
         self.display_center_freq_mhz = self.center_freq_mhz
 
     def setup_radio_client(self):
-        """No-op in headless mode — overridden by RadioIQVisualizer for Qt thread."""
+        """No-op in headless mode — overridden by MAP144Visualizer for Qt thread."""
         self.radio_client = None
 
     def run_headless(self):

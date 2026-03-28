@@ -12,45 +12,49 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""map144gui — modular radio IQ visualiser and MSK144 decoder.
+"""map144gui — MSK144 meteor scatter decoder package.
+
+map144 detects and decodes MSK144 meteor-scatter bursts from a FlexRadio
+6000 series transceiver.  IQ samples are streamed via DAX IQ, channelized
+into 1 kHz sub-bands, and each sub-band is monitored for the paired-tone
+signature of an MSK144 ping.  Detections are passed to the jt9 decoder from
+WSJT-X; results are logged to launches.jsonl and saved as WAV files.
 
 Package structure
 -----------------
-visualizer.py   ``RadioIQVisualizer`` — PyQt5 QMainWindow subclass that owns
-                all shared state (buffers, axes, configuration).  The
-                processing, display, UI, and runtime functions are mixed in as
-                methods so that each concern lives in its own file without
-                requiring multiple classes or cross-module callbacks.
+engine.py       ``Engine`` — Qt-free base class containing all DSP state and
+                the headless run loop.  Can be instantiated directly for
+                unattended operation without a display.
 
-processing.py   ``process_iq_data`` — per-chunk DSP pipeline: LP filtering,
-                ring-buffer write, overlap-FFT (normal and squared spectra),
-                MSK144 tone-pair detection trigger, and spectrogram/energy
-                buffer management.
+visualizer.py   ``MAP144Visualizer`` — PyQt5 QMainWindow that inherits Engine
+                and adds the diagnostic GUI panels.
 
-detection.py    Stateless signal-processing helpers: FIR filter design,
-                streaming filter application, squared-spectrum peak-pair
-                scanner, carrier-frequency recovery, ring-buffer readout, and
-                the full extract → mix → decimate → jt9 decode pipeline.
+processing.py   ``process_iq_data`` — per-chunk DSP pipeline: channelizer,
+                SNR normalization, MSK144 tone-pair detection trigger, and
+                spectrogram buffer management.
 
-runtime.py      Source lifecycle and background thread: radio client
-                startup/shutdown, WAV file loading and replay, sample ingress
-                normalisation, tuned-frequency query, and window close handler.
+detection.py    ``extract_and_decode`` — ring-buffer readout, carrier
+                recovery, decimation, jt9 invocation, result parsing, WAV
+                and JSONL logging.
 
-displays.py     Qt rendering: pushes NumPy buffer data into pyqtgraph
-                ImageItems and PlotCurveItems, updates noise-floor curves,
-                energy overlays, status bar, UTC clock, and tuned-frequency
-                label on every 100 ms timer tick.
+runtime.py      Source lifecycle: FlexRadio DAX IQ client startup/shutdown,
+                WAV file replay, sample ingress, and tuned-frequency query.
 
-ui.py           Widget construction: builds the five-panel grid layout,
-                pyqtgraph plot widgets, colour map, slider bars, menu bar, and
-                status bar; wires all interactive controls to their handlers.
+displays.py     Qt rendering: live spectrogram, detection heatmap, SNR
+                history, decode log, and status labels updated on a 100 ms
+                timer tick.
+
+ui.py           Widget construction: panel layout, pyqtgraph plots, colour
+                map, sliders, menu bar, and control wiring.
+
+channelizer.py  Polyphase channelizer filter design and state management.
 
 Public API
 ----------
-Only ``RadioIQVisualizer`` is exported; everything else is an implementation
+Only ``MAP144Visualizer`` is exported; everything else is an implementation
 detail internal to the package.
 """
 
-from .visualizer import RadioIQVisualizer
+from .visualizer import MAP144Visualizer
 
-__all__ = ["RadioIQVisualizer"]
+__all__ = ["MAP144Visualizer"]

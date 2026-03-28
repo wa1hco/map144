@@ -56,7 +56,7 @@ fc_from_sq_pair(f_sq_lo, f_sq_hi)
 
 _read_ring(iq_ring, ring_pos, abs_sample, read_start_abs, n_samples)
     Copy a contiguous segment from the circular ring buffer maintained in
-    ``RadioIQVisualizer``.  Handles wrap-around and the case where
+    ``MAP144Visualizer``.  Handles wrap-around and the case where
     ``read_start_abs`` predates the oldest retained sample (clips the start,
     returns whatever is still in buffer).  Returns complex64 array.
 

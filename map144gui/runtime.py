@@ -16,7 +16,7 @@
 
 This module owns the boundary between raw IQ sources (FlexRadio DAXIQ or WAV
 file) and the DSP pipeline in ``processing.py``.  Its functions are mixed into
-``RadioIQVisualizer`` and cover three concerns: source lifecycle management,
+``MAP144Visualizer`` and cover three concerns: source lifecycle management,
 sample ingress normalisation, and clean shutdown.
 
 Signal-level conventions

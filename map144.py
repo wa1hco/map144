@@ -13,12 +13,23 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Radio IQ GUI launcher.
+"""map144 — MSK144 meteor scatter decoder for FlexRadio 6000 series.
 
-This is the top-level entry point for the radio IQ visualiser.  It is a thin
-bootstrap script whose only jobs are argument parsing, logging configuration,
-Qt application lifecycle management, and OS-signal handling.  All substantive
-functionality lives in the ``map144gui`` package.
+map144 monitors a 6-metre (or 2-metre) calling frequency, detects MSK144
+meteor-scatter ping bursts in real time, and decodes them using the jt9
+engine from WSJT-X.  Decoded contacts are logged to ``launches.jsonl`` and
+the audio surrounding each detection is saved as a timestamped WAV file for
+offline review.
+
+IQ samples are streamed from a FlexRadio 6000 series transceiver over the
+DAX IQ interface at 48 kHz.  A 48-channel polyphase channelizer resolves
+the band into 1 kHz sub-channels; each sub-channel is monitored
+independently for the paired-tone signature of an MSK144 burst.
+
+A diagnostic GUI (PyQt5) provides a live spectrogram, detection heatmap,
+SNR history, and decode log.  Running with ``--headless`` skips the GUI and
+runs the decoder engine only, suitable for unattended overnight operation or
+integration with logging tools such as PSKreporter or N1MM.
 
 Usage
 -----
@@ -30,9 +41,8 @@ Usage
 Command-line arguments
 ----------------------
 --rate RATE
-    IQ sample rate in Hz passed to ``RadioIQVisualizer`` and forwarded to the
-    radio client.  Must match the rate configured on the radio source.
-    Default: 48000.
+    IQ sample rate in Hz forwarded to the radio client.  Must match the DAX
+    IQ rate configured on the radio.  Default: 48000.
 
 --bind-client-id UUID
     Client UUID string used for the FlexRadio ``client bind client_id=<uuid>``
@@ -41,16 +51,14 @@ Command-line arguments
 
 --bind-client UUID
     Deprecated alias for ``--bind-client-id``; accepted for backwards
-    compatibility and merged before constructing ``RadioIQVisualizer``.
+    compatibility.
 
 --log-level LEVEL
     Verbosity for the root logger and the ``flexclient`` logger.
     Choices: DEBUG, INFO, WARNING, ERROR, CRITICAL.  Default: INFO.
-    Applies ``logging.basicConfig`` if no handlers are already installed;
-    otherwise adjusts the root handler level in-place.
 
 --headless
-    Run without a GUI.  Starts the DSP engine and processes IQ data until
+    Run without a GUI.  Starts the decoder engine and processes IQ data until
     SIGINT or SIGTERM.
 
 --source {radio,wav}
@@ -66,7 +74,7 @@ Bootstrap sequence
    ``QTimer.singleShot(0, ...)`` — posting the quit request through the Qt
    event queue ensures it fires safely from the main thread even though Python
    delivers signals asynchronously.
-6. Instantiate and show ``RadioIQVisualizer``.
+6. Instantiate and show ``MAP144Visualizer``.
 7. Start a 500 ms Qt timer with a no-op slot.  Qt's C++ event loop blocks
    Python's GIL-based signal delivery; this timer forces the interpreter back
    into Python code periodically so that ``SIGINT`` (Ctrl-C) is noticed
@@ -80,7 +88,7 @@ import logging
 import signal
 import sys
 
-from map144gui.visualizer import RadioIQVisualizer
+from map144gui.visualizer import MAP144Visualizer
 
 
 def _configure_logging(level_name: str):
@@ -98,7 +106,7 @@ def main():
     """Launch the Radio IQ visualizer GUI."""
     import argparse
 
-    parser = argparse.ArgumentParser(description='Radio IQ Visualizer')
+    parser = argparse.ArgumentParser(description='map144 MSK144 meteor scatter decoder')
     parser.add_argument('--rate', type=int, default=48000,
                         help='Sample rate in Hz (default: 48000)')
     parser.add_argument('--bind-client-id', type=str, default=None,
@@ -148,7 +156,7 @@ def main():
     signal.signal(signal.SIGINT, _graceful_shutdown)
     signal.signal(signal.SIGTERM, _graceful_shutdown)
 
-    window = RadioIQVisualizer(
+    window = MAP144Visualizer(
         sample_rate=args.rate,
         bind_client_id=args.bind_client_id or args.bind_client,
     )

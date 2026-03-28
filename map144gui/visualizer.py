@@ -12,7 +12,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Main visualizer class and shared state for the modular radio IQ GUI."""
+"""MAP144Visualizer — main window for the map144 MSK144 meteor scatter decoder."""
 
 from PyQt5 import QtCore, QtWidgets
 
@@ -36,8 +36,8 @@ from .processing import N_SNR_HIST, CH_DETECT_SIZE, _METRIC_HIST_DEPTH
 from .displays import update_displays
 
 
-class RadioIQVisualizer(Engine, QtWidgets.QMainWindow):
-    """Main window with five synchronized displays for radio IQ data."""
+class MAP144Visualizer(Engine, QtWidgets.QMainWindow):
+    """Main window for the map144 MSK144 meteor scatter decoder."""
 
     setup_ui = setup_ui
     on_min_level_changed = on_min_level_changed
