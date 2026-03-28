@@ -249,9 +249,10 @@ class VITAReceiver:
         # Normalisation to ±1.0 is applied by the consumer (FLEX_DAXIQ_FULL_SCALE in runtime.py).
         
         # Interleaved I, Q pairs -> complex64
+        # FlexRadio DAXIQ interleaves I then Q.  Standard orientation: a signal
+        # at RF = LO + f produces I+jQ = exp(+j2πft), positive baseband frequency.
         n_samples = n_words // 2
-        samples = raw[0::2] + 1j * raw[1::2]
-        samples = samples.astype(np.complex64)
+        samples = (raw[0::2] + 1j * raw[1::2]).astype(np.complex64)
 
         return VitaPacket(
             stream_id=stream_id,
