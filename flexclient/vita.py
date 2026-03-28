@@ -89,6 +89,7 @@ import socket
 import threading
 import queue
 import struct
+import time
 from typing import Optional
 
 import numpy as np
@@ -115,6 +116,7 @@ class VITAReceiver:
         self.drop_count    = 0
         self.missed_count  = 0
         self._last_seq     = {}   # stream_id -> last 4-bit sequence number
+        self._last_drop_log = 0.0  # monotonic time of last drop log message
 
     def start(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -158,8 +160,11 @@ class VITAReceiver:
                     self.out_q.put_nowait(pkt)
                 except queue.Full:
                     self.drop_count += 1
-                    log.warning(f"VITA queue full, dropping packet "
-                                f"(total drops: {self.drop_count})")
+                    now = time.monotonic()
+                    if now - self._last_drop_log >= 1.0:
+                        self._last_drop_log = now
+                        log.debug(f"VITA queue full, dropping packet "
+                                  f"(total drops: {self.drop_count})")
             except socket.timeout:
                 continue
             except Exception as e:

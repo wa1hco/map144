@@ -228,6 +228,10 @@ def _start_radio_source(self) -> bool:
     try:
         self.radio_client.start()
         self._radio_started = True
+        if hasattr(self, '_jt9_markers'):
+            self._jt9_markers.clear()
+        if hasattr(self, 'decode_panel'):
+            self.decode_panel.clear()
         return True
     except Exception as exc:
         print(f"Radio client start error: {exc}", flush=True)
@@ -252,7 +256,10 @@ def _stop_radio_source(self):
 
 def _reset_wav_timeline(self):
     self._wav_time_cursor = 0.0
-    self.sample_buffer = np.array([], dtype=np.complex64)
+    self._sbuf_end = 0
+    self._ch_buf_end = 0
+    self._metric_hist_idx = 0
+    self._metric_hist_cnt = 0
     self.raw_buffer    = np.array([], dtype=np.complex64)
 
     self.spectrogram_data = np.full((self.max_history, self.fft_size), -130.0)
@@ -283,13 +290,19 @@ def _reset_wav_timeline(self):
     self.time_in_window = 0.0
     self.next_boundary = self.history_secs
 
-    # Reset LP filter streaming state and ring buffer
-    self._lp_zi_re = np.zeros(len(self._lp_taps) - 1, dtype=np.float64)
-    self._lp_zi_im = np.zeros(len(self._lp_taps) - 1, dtype=np.float64)
+    # Reset ring buffer, detection state, and SNR heatmap history
+    self._ch_snr_history[:] = 0.0
+    self._ch_snr_write_idx  = 0
+    self._ch_snr_boundary   = 0
     self._iq_ring[:] = 0
     self._iq_ring_pos = 0
     self._iq_abs_sample = 0
     self._detect_cooldowns = {}
+    self._iq_ring_gen = getattr(self, '_iq_ring_gen', 0) + 1
+    if hasattr(self, '_jt9_markers'):
+        self._jt9_markers.clear()
+    if hasattr(self, 'decode_panel'):
+        self.decode_panel.clear()
 
 
 def _process_wav_source_step(self):
@@ -346,7 +359,8 @@ def _process_wav_source_step(self):
         print(f"WAV playback complete: {wav_path}", flush=True)
         threading.Thread(
             target=_run_wav_comparison,
-            args=(wav_path, getattr(self, '_wav_run_start_time', None)),
+            args=(wav_path, getattr(self, '_wav_run_start_time', None),
+                  list(getattr(self, '_jt9_threads', []))),
             daemon=True,
         ).start()
         return
@@ -362,12 +376,20 @@ def _process_wav_source_step(self):
     time.sleep(chunk_size / self.sample_rate)
 
 
-def _run_wav_comparison(wav_path: str, run_start: datetime | None) -> None:
+def _run_wav_comparison(wav_path: str, run_start: datetime | None,
+                        jt9_threads: list | None = None) -> None:
     """Read manifest alongside wav_path, compare against decode log, write report.
 
     Runs in a daemon thread after WAV playback completes.  Writes a timestamped
     report to MSK144/detections/ with a per-simulation-file sequence number.
     """
+    # Wait for all jt9 decode threads that were running when WAV finished.
+    # jt9 has a 20-second timeout; cap our wait at 25 s to avoid hanging forever.
+    if jt9_threads:
+        print(f"[compare] Waiting for {len(jt9_threads)} pending jt9 thread(s)...", flush=True)
+        for t in jt9_threads:
+            t.join(timeout=25.0)
+
     wav_p = Path(wav_path)
     manifest_p = wav_p.with_suffix('.json')
     if not manifest_p.exists():
@@ -466,19 +488,14 @@ def _run_wav_comparison(wav_path: str, run_start: datetime | None) -> None:
 
     col_w = 13
     lines.append(f"{'#':>3}  {'Message':<{col_w}}  {'t (s)':>6}  {'fc (kHz)':>8}  "
-                 f"{'gen SNR':>7}  {'jt9 SNR':>7}  {'Δt (s)':>7}  Status")
-    lines.append("-" * 84)
+                 f"{'gen SNR':>7}  {'wid ms':>7}  Status")
+    lines.append("-" * 70)
 
     n_decoded = n_missed = n_garbled = 0
     matched_ids: set[int] = set()
 
     def _snr_str(v):
         return f"{v:>+4d} dB" if v is not None else "      ?"
-
-    def _delta_t_str(detected, placed):
-        if detected is None:
-            return "      ?"
-        return f"{detected - placed:>+6.2f}s"
 
     placements = sorted(placements, key=lambda p: p.get("delay_s", 0.0))
 
@@ -487,8 +504,10 @@ def _run_wav_comparison(wav_path: str, run_start: datetime | None) -> None:
         c_khz     = pl.get("center_hz", 0.0) / 1000.0
         delay_s   = pl.get("delay_s", 0.0)
         snr_db    = pl.get("snr_db")
+        width_ms  = pl.get("width_ms")
         gen_snr   = _snr_str(snr_db)
-        prefix    = f"{i+1:>3}  {msg:<{col_w}}  {delay_s:>6.2f}  {c_khz:>8.2f}  {gen_snr}"
+        width_str = f"{width_ms:>4d} ms" if width_ms is not None else "     ?"
+        prefix    = f"{i+1:>3}  {msg:<{col_w}}  {delay_s:>6.2f}  {c_khz:>8.2f}  {gen_snr}  {width_str}"
 
         hits = decode_by_msg.get(msg, [])
         if hits:
@@ -497,30 +516,28 @@ def _run_wav_comparison(wav_path: str, run_start: datetime | None) -> None:
             # of the same signal don't appear as false alarms.
             for h in hits:
                 matched_ids.add(id(h))
-            jsnr  = dec.get('jt9_snr_db')
             det_t = dec.get('t_sec')
             extra = f"  ×{len(hits)}" if len(hits) > 1 else ""
-            lines.append(f"{prefix}  {_snr_str(jsnr)}  {_delta_t_str(det_t, delay_s)}  DECODED{extra}   "
+            lines.append(f"{prefix}  DECODED{extra}   "
                          f"(t={det_t:.2f}s  fc={dec.get('fc_khz',float('nan')):.2f} kHz)")
             n_decoded += 1
         else:
             near = _pos_match(pl)
             if near and id(near) not in matched_ids:
                 matched_ids.add(id(near))
-                jsnr  = near.get('jt9_snr_db')
                 det_t = near.get('t_sec')
-                lines.append(f"{prefix}  {_snr_str(jsnr)}  {_delta_t_str(det_t, delay_s)}  GARBLED   "
+                lines.append(f"{prefix}  GARBLED   "
                              f"(jt9: '{near.get('message','')}'"
                              f"  t={det_t:.2f}s  fc={near.get('fc_khz',float('nan')):.2f} kHz)")
                 n_garbled += 1
             else:
-                lines.append(f"{prefix}  {'':>7}  {'':>7}  MISSED")
+                lines.append(f"{prefix}  MISSED")
                 n_missed += 1
 
     false_alarms = [d for d in decodes if id(d) not in matched_ids]
 
     lines.append("")
-    lines.append("─" * 84)
+    lines.append("─" * 70)
     total = len(placements)
     pct   = 100 * n_decoded / total if total else 0
     lines.append(f"Total signals  : {total}")
@@ -623,9 +640,29 @@ def _get_tuned_frequency_mhz(self):
 def closeEvent(self, event):
     """Clean up on window close."""
     from .visualizer import _SETTINGS
-    _SETTINGS.setValue('geometry',  self.saveGeometry())
-    _SETTINGS.setValue('min_level', self.min_level)
-    _SETTINGS.setValue('max_level', self.max_level)
+
+    # Signal panel windows that this is a real shutdown so their closeEvent
+    # does not ignore the event and block teardown.
+    self._app_closing = True
+
+    _SETTINGS.setValue('window_geometry',      self.saveGeometry())
+    _SETTINGS.setValue('min_level',            self.min_level)
+    _SETTINGS.setValue('max_level',            self.max_level)
+    _SETTINGS.setValue('detect_min_level',     self.detect_min_level)
+    _SETTINGS.setValue('detect_max_level',     self.detect_max_level)
+    _SETTINGS.setValue('nb_factor',            self.nb_factor)
+    _td_sl = getattr(self, 'td_scale_slider', None)
+    _SETTINGS.setValue('td_scale',             _td_sl.value() if _td_sl else 10)
+    _SETTINGS.setValue('td_span',              int(getattr(self, 'td_span_ms', 200)))
+
+    for win, geo_key, vis_key in [
+        (getattr(self, '_fast_graph_win',    None), 'fast_graph_geometry',  'fast_graph_visible'),
+        (getattr(self, '_detect_win',        None), 'detect_geometry',      'detect_visible'),
+        (getattr(self, '_radio_iface_win',   None), 'radio_iface_geometry', 'radio_iface_visible'),
+    ]:
+        if win is not None:
+            _SETTINGS.setValue(geo_key, win.saveGeometry())
+            _SETTINGS.setValue(vis_key, win.isVisible())
 
     print("Shutting down...")
     self.running = False

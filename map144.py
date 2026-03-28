@@ -18,13 +18,14 @@
 This is the top-level entry point for the radio IQ visualiser.  It is a thin
 bootstrap script whose only jobs are argument parsing, logging configuration,
 Qt application lifecycle management, and OS-signal handling.  All substantive
-functionality lives in the ``radio_iq_gui`` package.
+functionality lives in the ``map144gui`` package.
 
 Usage
 -----
 ::
 
-    python radio_gui.py [--rate RATE] [--bind-client-id UUID] [--log-level LEVEL]
+    python map144.py [--rate RATE] [--bind-client-id UUID] [--log-level LEVEL]
+    python map144.py --headless [--source radio|wav] [--wav PATH]
 
 Command-line arguments
 ----------------------
@@ -48,32 +49,38 @@ Command-line arguments
     Applies ``logging.basicConfig`` if no handlers are already installed;
     otherwise adjusts the root handler level in-place.
 
+--headless
+    Run without a GUI.  Starts the DSP engine and processes IQ data until
+    SIGINT or SIGTERM.
+
+--source {radio,wav}
+    Source mode for headless operation.  Default: radio.
+
 Bootstrap sequence
 ------------------
 1. Parse arguments.
 2. Configure logging (root logger + ``flexclient`` namespace).
-3. Create ``QApplication``; set ``quitOnLastWindowClosed = True``.
-4. Install ``SIGINT`` / ``SIGTERM`` handlers that call ``app.quit()`` via
+3. If --headless: instantiate Engine, set source_mode, call run_headless().
+4. Create ``QApplication``; set ``quitOnLastWindowClosed = True``.
+5. Install ``SIGINT`` / ``SIGTERM`` handlers that call ``app.quit()`` via
    ``QTimer.singleShot(0, ...)`` — posting the quit request through the Qt
    event queue ensures it fires safely from the main thread even though Python
    delivers signals asynchronously.
-5. Instantiate and show ``RadioIQVisualizer``.
-6. Start a 500 ms Qt timer with a no-op slot.  Qt's C++ event loop blocks
+6. Instantiate and show ``RadioIQVisualizer``.
+7. Start a 500 ms Qt timer with a no-op slot.  Qt's C++ event loop blocks
    Python's GIL-based signal delivery; this timer forces the interpreter back
    into Python code periodically so that ``SIGINT`` (Ctrl-C) is noticed
    promptly rather than waiting for the next Qt event.
-7. Keep a reference to the window on ``app._window`` to prevent premature
+8. Keep a reference to the window on ``app._window`` to prevent premature
    garbage collection by the Python runtime.
-8. Enter the Qt event loop via ``app.exec_()``.
+9. Enter the Qt event loop via ``app.exec_()``.
 """
 
 import logging
 import signal
 import sys
 
-from PyQt5 import QtCore, QtWidgets
-
-from radio_iq_gui.visualizer import RadioIQVisualizer
+from map144gui.visualizer import RadioIQVisualizer
 
 
 def _configure_logging(level_name: str):
@@ -89,20 +96,6 @@ def _configure_logging(level_name: str):
 
 def main():
     """Launch the Radio IQ visualizer GUI."""
-    import shutil
-    if shutil.which('jt9') is None:
-        print("error: jt9 not found on PATH", file=sys.stderr)
-        sys.exit(1)
-
-    app = QtWidgets.QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(True)
-
-    def _graceful_shutdown(_signum, _frame):
-        QtCore.QTimer.singleShot(0, app.quit)
-
-    signal.signal(signal.SIGINT, _graceful_shutdown)
-    signal.signal(signal.SIGTERM, _graceful_shutdown)
-
     import argparse
 
     parser = argparse.ArgumentParser(description='Radio IQ Visualizer')
@@ -115,9 +108,45 @@ def main():
     parser.add_argument('--log-level', type=str, default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help='Logging verbosity (default: INFO)')
+    parser.add_argument('--headless', action='store_true',
+                        help='Run without a GUI (headless DSP engine mode)')
+    parser.add_argument('--source', type=str, default='radio',
+                        choices=['radio', 'wav'],
+                        help='Source mode for headless operation (default: radio)')
+    parser.add_argument('--wav', type=str, default=None,
+                        help='Path to WAV file for headless wav source mode')
     args = parser.parse_args()
 
     _configure_logging(args.log_level)
+
+    if args.headless:
+        from map144gui.engine import Engine
+        engine = Engine(
+            sample_rate=getattr(args, 'rate', 48000),
+            bind_client_id=getattr(args, 'bind_client_id', None) or getattr(args, 'bind_client', None),
+        )
+        engine.source_mode = getattr(args, 'source', 'radio')
+        if hasattr(args, 'wav') and args.wav:
+            engine.selected_wav_path = args.wav
+            engine.source_mode = 'wav'
+        engine.run_headless()
+        sys.exit(0)
+
+    import shutil
+    if shutil.which('jt9') is None:
+        print("error: jt9 not found on PATH", file=sys.stderr)
+        sys.exit(1)
+
+    from PyQt5 import QtCore, QtWidgets
+
+    app = QtWidgets.QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(True)
+
+    def _graceful_shutdown(_signum, _frame):
+        QtCore.QTimer.singleShot(0, app.quit)
+
+    signal.signal(signal.SIGINT, _graceful_shutdown)
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
 
     window = RadioIQVisualizer(
         sample_rate=args.rate,

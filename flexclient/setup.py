@@ -155,7 +155,7 @@ class DAXIQSetup:
         # Create DAXIQ stream - radio needs client IP to send UDP stream to
         # DAXIQ uses configured local UDP port for I/Q data streaming
         client_ip = self.tcp.get_local_ip()
-        log.info(f"Creating DAXIQ stream to {client_ip}:{self.listen_port}")
+        log.debug(f"Creating DAXIQ stream to {client_ip}:{self.listen_port}")
         
         # If we have a panadapter, try to assign DAXIQ channel to it.
         # In bound/non-GUI contexts this is often required for UDP IQ packets to flow.
@@ -165,7 +165,7 @@ class DAXIQSetup:
                 resp = self.tcp.send_command(
                     f"dax iq set {self.dax_channel} pan=0x{self.pan_id:08x}"
                 )
-                log.info(f"DAXIQ channel {self.dax_channel} on panadapter 0x{self.pan_id:08x}: {resp}")
+                log.debug(f"DAXIQ channel {self.dax_channel} on panadapter 0x{self.pan_id:08x}: {resp}")
                 log.debug(f"DAXIQ assignment response: {resp}")
                 time.sleep(0.1)
             except RuntimeError as e:
@@ -178,7 +178,7 @@ class DAXIQSetup:
         self.stream_id = int(resp.strip(), 16) if resp.strip() else None
         if not self.stream_id:
             raise RuntimeError(f"Failed to create DAXIQ stream")
-        log.info(f"DAXIQ stream created: 0x{self.stream_id:08x}")
+        log.debug(f"DAXIQ stream created: 0x{self.stream_id:08x}")
 
         # Wait briefly for status message with slice/pan info
         time.sleep(0.2)  # Give radio time to send status
@@ -192,7 +192,7 @@ class DAXIQSetup:
                 log.warning(f"Could not subscribe to panadapter: {e}")
 
         # Do not force DAXIQ rate from this client; GUI/SmartSDR ownership typically controls it.
-        log.info("Using SmartSDR-configured DAXIQ rate")
+        log.debug("Using SmartSDR-configured DAXIQ rate")
         
         # Set frequency based on mode (slice or panadapter)
         if center_freq_mhz is not None:
@@ -203,7 +203,7 @@ class DAXIQSetup:
                     resp = self.tcp.send_command(
                         f"slice set {self.slice_id} RF_frequency={freq_hz}"
                     )
-                    log.info(f"Set slice {self.slice_id} frequency to {center_freq_mhz} MHz: {resp}")
+                    log.debug(f"Set slice {self.slice_id} frequency to {center_freq_mhz} MHz: {resp}")
                 except RuntimeError as e:
                     log.warning(f"Could not set slice frequency: {e}")
             elif self.slice_id == 0 and self.pan_id not in (None, 0):
@@ -214,7 +214,7 @@ class DAXIQSetup:
             else:
                 log.warning(f"DAXIQ channel {self.dax_channel} mode unknown (no slice or panadapter). Set frequency in SmartSDR.")
 
-        log.info(f"DAXIQ ready: stream_id=0x{self.stream_id:08x}")
+        log.debug(f"DAXIQ ready: stream_id=0x{self.stream_id:08x}")
         return self.stream_id
 
     def _subscribe_pan_status(self):

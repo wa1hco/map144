@@ -106,14 +106,14 @@ class FlexTCPClient:
         self._gui_clients = {}      # client_id -> metadata from status
 
     def connect(self):
-        log.info(f"Connecting to {self.radio.ip}:{self.radio.port}")
+        log.debug(f"Connecting to {self.radio.ip}:{self.radio.port}")
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.connect((self.radio.ip, self.radio.port))
         self._sock.settimeout(None)
         self._running = True
         self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._recv_thread.start()
-        log.info("TCP connected")
+        log.debug("TCP connected")
     
     def get_local_ip(self) -> str:
         """Get the local IP address used for this connection."""

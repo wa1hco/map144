@@ -137,14 +137,14 @@ PING_EXTRACT_START_S = 1.0       # first ping lands at t=1 s in msk144sim output
 PING_EXTRACT_DURATION_S = 1.0    # one second of ping audio to extract
 
 # Parameter encoding ranges (match message format "A[±][ff][ttt][±][dd][www]")
-FREQ_MIN_KHZ =  -15
-FREQ_MAX_KHZ =  +15
-TIME_MIN_DS  =   5               # deciseconds (0.5 s)
-TIME_MAX_DS  = 145               # deciseconds (15.0 s)
-SNR_MIN_DB   = +0
-SNR_MAX_DB   = +10
-WIDTH_MIN_MS =  100
-WIDTH_MAX_MS = 300
+FREQ_MIN_KHZ = -22
+FREQ_MAX_KHZ = +22
+TIME_MIN_DS  =   5               # deciseconds ( 0.5 s)
+TIME_MAX_DS  = 145               # deciseconds (14.5 s)
+SNR_MIN_DB   =  -1
+SNR_MAX_DB   =  +4
+WIDTH_MIN_MS = 200
+WIDTH_MAX_MS = 500
 WIDTH_CLAMP_MIN_MS = 10          # avoid division-by-zero inside msk144sim
 MSK144_SNR_BW_HZ = 2500.0        # WSJT-X reference bandwidth for MSK144 SNR
 MSK144SIM_GENERATE_SNR_DB = 55   # SNR passed to msk144sim.  55 dB is near the

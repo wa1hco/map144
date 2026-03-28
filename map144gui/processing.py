@@ -56,6 +56,7 @@ N_SNR_HIST          : 300     — rolling history depth for the ridgeline displa
 
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -74,6 +75,7 @@ CH_DETECT_SIZE     = 512        # samples at 12 kHz per detection FFT block
 NB_FACTOR          = 6.0        # time-domain blanker: zero samples > NB_FACTOR × running RMS envelope
 _NB_TAPER_N        = 24         # Hann taper half-width in samples (24 → 0.5 ms at 48 kHz)
 _EDGE_CH_SKIP      = 4          # skip channels within N of Nyquist (ch 24) — DAXIQ filter rolloff zone
+_DC_CH_SKIP        = 3          # skip channels within N of DC (ch 0) — LO leakage / DC offset zone
 _SQ_TONE_HZ        = 1000.0     # expected squared-domain tone offset from DC
 _SQ_NTOL_HZ        = 200.0      # half-width of each tone search window
 _METRIC_HIST_DEPTH = 300        # frames of rolling linear-peak history for percentile.
@@ -267,12 +269,15 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
             # Estimate fc from peak bin locations in each window (linear domain)
             lo_freq   = float(_SQ_FREQ[_LO_MASK][np.argmax(plin_all[ch_k][_LO_MASK])])
             hi_freq   = float(_SQ_FREQ[_HI_MASK][np.argmax(plin_all[ch_k][_HI_MASK])])
-            fc_offset = (lo_freq + hi_freq) / 4.0   # squaring doubled freqs
-            fc_hz     = ch_k * CHANNEL_SPACING_HZ + fc_offset
+            fc_offset  = (lo_freq + hi_freq) / 4.0   # squaring doubled freqs
+            # ch_k 25-47 are negative-frequency channels (-23 to -1 kHz)
+            ch_signed  = int(ch_k) if int(ch_k) <= N_CHANNELS // 2 else int(ch_k) - N_CHANNELS
+            fc_hz      = ch_signed * CHANNEL_SPACING_HZ + fc_offset
 
             abs_snap      = self._iq_abs_sample
             ring_state_fn = lambda: (self._iq_ring_pos, self._iq_abs_sample)
             output_dir    = str(Path(__file__).parent.parent / 'MSK144' / 'detections')
+            detect_ts     = datetime.now(timezone.utc).strftime('%Y-%m-%d_%H:%M:%S.%f')[:21]
 
             decode_queue = getattr(self, '_decode_queue', None)
             marker_id    = getattr(self, '_jt9_marker_next_id', 0)
@@ -297,18 +302,16 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                 args=(self._iq_ring, ring_state_fn,
                       abs_snap, self.sample_rate, fc_hz, output_dir,
                       t_in_window, decode_queue, marker_id,
-                      ring_gen, ring_gen_fn),
+                      ring_gen, ring_gen_fn, self.center_freq_mhz, detect_ts),
                 daemon=True,
             )
             t.start()
             if jt9_list is not None:
                 jt9_list.append(t)
-            # Record marker for heatmap overlay (fftshift display coords)
+            # Record marker for heatmap overlay; fc_hz is already a signed offset (-24..+24 kHz)
             marker_list = getattr(self, '_jt9_markers', None)
             if marker_list is not None:
                 display_khz = fc_hz / 1000.0
-                if display_khz >= N_CHANNELS / 2:
-                    display_khz -= N_CHANNELS
                 marker_list.append({
                     'id':       marker_id,
                     't':        t_in_window,

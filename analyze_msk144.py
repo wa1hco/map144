@@ -1049,24 +1049,17 @@ def plot_analysis(
         row1_title = "Spectrogram (original)"
     t0 = _tick('analysis: median_flatten_row1', t0)
 
-    # ── Row 2: squared-signal spectrogram ──────────────────────────────────
-    t2, f2, s2, det_norm = _compute_squared_spectrogram(samples, rate, fc_hz, ntol_hz)
-    t0 = _tick('operational: squared_spectrogram', t0)
+    # ── Row 2: detection heatmap (complex IQ) or squared spectrogram (mono) ─
+    per_ch = _compute_per_channel_metrics(samples, rate)
+    t0 = _tick('operational: per_channel_detection', t0)
 
-    floor2 = _estimate_median(s2)
-
-    # Align the squared spectrum's median noise floor with the normal spectrum
-    # so one set of baseline/gain sliders controls both rows (mirrors the fixed
-    # -15 dB offset baked into flex_gui's power_db_sq computation).
-    sq_offset = float(np.median(floor1)) - float(np.median(floor2))
-    s2     = s2     + sq_offset
-    floor2 = floor2 + sq_offset
-
-    t0 = _tick('analysis: median_floor_row2', t0)
-
-    # Expected squared-tone frequencies (for reference lines)
-    f_sq_high = 2.0 * (fc_hz + 500.0)
-    f_sq_low  = 2.0 * (fc_hz - 500.0)
+    if per_ch is None:
+        t2, f2, s2, det_norm = _compute_squared_spectrogram(samples, rate, fc_hz, ntol_hz)
+        floor2    = _estimate_median(s2)
+        sq_offset = float(np.median(floor1)) - float(np.median(floor2))
+        s2        = s2     + sq_offset
+        floor2    = floor2 + sq_offset
+        t0 = _tick('analysis: median_floor_row2', t0)
 
     # ── Figure layout ──────────────────────────────────────────────────────
     gui_cmap = _gui_colormap()
@@ -1107,46 +1100,77 @@ def plot_analysis(
     ax01.set_ylim(f1_min_khz, f1_max_khz)
     ax01.grid(True, alpha=0.25)
 
-    # ── [1,0]  Squared spectrogram ─────────────────────────────────────────
-    f2_min_khz = float(f2[0])  / 1000.0
-    f2_max_khz = float(f2[-1]) / 1000.0
+    # ── [1,0]  Detection heatmap or squared spectrogram ────────────────────
     ax10, ax11 = axes[1]
+    floor2_line = None   # only set in the mono / squared-spectrogram path
 
-    img2 = ax10.imshow(
-        s2.T, aspect='auto', origin='lower',
-        extent=_extent(t2, f2), cmap=gui_cmap, vmin=vmin0, vmax=vmax0,
-    )
-
-
-    ax10.set_title(
-        f"Squared-Signal Spectrogram  (fc={fc_hz:.0f} Hz, ntol=\u00b1{ntol_hz:.0f} Hz,"
-        f" sq_offset={sq_offset:+.0f} dB)"
-    )
-    ax10.set_xlabel("Time (s)")
-    ax10.set_ylabel("Frequency (kHz)")
-    ax10.set_ylim(f2_min_khz, f2_max_khz)
-    ax10.xaxis.set_major_locator(MultipleLocator(1.0))
-
-    # ── [1,1]  Squared-spectrum median noise floor vs frequency ────────────
-    floor2_line, = ax11.plot(floor2, f2 / 1000.0, lw=1.2, color='tab:orange')
-    ax11.set_title("Median Noise")
-    ax11.set_xlabel("Level (dB)")
-    ax11.set_ylabel("Frequency (kHz)")
-    ax11.set_xlim(vmin0, vmax0)
-    ax11.set_ylim(f2_min_khz, f2_max_khz)
-    ax11.grid(True, alpha=0.25)
+    if per_ch is not None:
+        _N_CH    = per_ch['pair_metric'].shape[1]
+        _ch_sp   = float(per_ch['channel_hz'][1] - per_ch['channel_hz'][0]) if len(per_ch['channel_hz']) > 1 else 1000.0
+        _half_ch = _N_CH // 2
+        _disp_hz = (np.arange(_N_CH) - _half_ch) * _ch_sp
+        pm_disp  = np.fft.fftshift(per_ch['pair_metric'], axes=1)
+        time_pc  = per_ch['time_s']
+        vmax_pm  = max(_PDET_THRESH_DB * 3, float(pm_disp.max()) * 1.05)
+        _dt_pc   = float(time_pc[1] - time_pc[0]) / 2.0 if len(time_pc) > 1 else 0.0
+        _half_f  = _ch_sp / 2000.0
+        ext_pc   = [float(time_pc[0]) - _dt_pc, float(time_pc[-1]) + _dt_pc,
+                    float(_disp_hz[0]) / 1000.0 - _half_f,
+                    float(_disp_hz[-1]) / 1000.0 + _half_f]
+        img2 = ax10.imshow(pm_disp.T, aspect='auto', origin='lower',
+                           extent=ext_pc, cmap='inferno', vmin=0.0, vmax=vmax_pm)
+        ax10.set_title(
+            f"Detection Heatmap — pair metric (dB above 25th-pct baseline, "
+            f"threshold = {_PDET_THRESH_DB} dB)"
+        )
+        ax10.set_xlabel("Time (s)")
+        ax10.set_ylabel("Frequency (kHz)")
+        ax10.set_ylim(ext_pc[2], ext_pc[3])
+        ax10.xaxis.set_major_locator(MultipleLocator(1.0))
+        ax11.set_visible(False)
+        t2_det       = time_pc
+        det_norm_det = pm_disp.max(axis=1)
+        det_thresh   = _PDET_THRESH_DB
+        det_label    = "Pair metric (dB)"
+    else:
+        f2_min_khz = float(f2[0])  / 1000.0
+        f2_max_khz = float(f2[-1]) / 1000.0
+        img2 = ax10.imshow(
+            s2.T, aspect='auto', origin='lower',
+            extent=_extent(t2, f2), cmap=gui_cmap, vmin=vmin0, vmax=vmax0,
+        )
+        ax10.set_title(
+            f"Squared-Signal Spectrogram  (fc={fc_hz:.0f} Hz, ntol=\u00b1{ntol_hz:.0f} Hz,"
+            f" sq_offset={sq_offset:+.0f} dB)"
+        )
+        ax10.set_xlabel("Time (s)")
+        ax10.set_ylabel("Frequency (kHz)")
+        ax10.set_ylim(f2_min_khz, f2_max_khz)
+        ax10.xaxis.set_major_locator(MultipleLocator(1.0))
+        # ── [1,1]  Squared-spectrum median noise floor vs frequency ──────────
+        floor2_line, = ax11.plot(floor2, f2 / 1000.0, lw=1.2, color='tab:orange')
+        ax11.set_title("Median Noise")
+        ax11.set_xlabel("Level (dB)")
+        ax11.set_ylabel("Frequency (kHz)")
+        ax11.set_xlim(vmin0, vmax0)
+        ax11.set_ylim(f2_min_khz, f2_max_khz)
+        ax11.grid(True, alpha=0.25)
+        t2_det       = t2
+        det_norm_det = det_norm
+        det_thresh   = DETECT_THRESH
+        det_label    = "Norm. metric"
 
     # ── [2,0]  Detection metric vs time (x-axis aligned with [1,0]) ────────
     ax20, ax21 = axes[2]
     ax20.sharex(ax10)
-    ax20.step(t2, det_norm, where='mid', color='tab:green', lw=1.0)
-    ax20.axhline(DETECT_THRESH, color='red', lw=0.9, ls='--',
-                 label=f'Threshold ({DETECT_THRESH})')
-    ax20.fill_between(t2, det_norm, DETECT_THRESH,
-                      where=(det_norm >= DETECT_THRESH),
+    ax20.step(t2_det, det_norm_det, where='mid', color='tab:green', lw=1.0)
+    ax20.axhline(det_thresh, color='red', lw=0.9, ls='--',
+                 label=f'Threshold ({det_thresh})')
+    ax20.fill_between(t2_det, det_norm_det, det_thresh,
+                      where=(det_norm_det >= det_thresh),
                       color='red', alpha=0.25, label='Detections')
     ax20.set_xlabel("Time (s)")
-    ax20.set_ylabel("Norm. metric")
+    ax20.set_ylabel(det_label)
     ax20.set_ylim(bottom=0.0)
     ax20.legend(fontsize=8, loc='upper right')
     ax20.grid(True, alpha=0.25)
@@ -1179,9 +1203,10 @@ def plot_analysis(
 
         def _apply_clim() -> None:
             img1.set_clim(clim[0], clim[1])
-            img2.set_clim(clim[0], clim[1])
             ax01.set_xlim(clim[0], clim[1])
-            ax11.set_xlim(clim[0], clim[1])
+            if per_ch is None:
+                img2.set_clim(clim[0], clim[1])
+                ax11.set_xlim(clim[0], clim[1])
             fig.canvas.draw_idle()
 
         def _on_slider(_val) -> None:
@@ -1193,7 +1218,8 @@ def plot_analysis(
         gain_slider.on_changed(_on_slider)
 
         def _on_scroll(event) -> None:
-            if event.inaxes not in (ax00, ax01, ax10, ax11):
+            _scroll_axes = (ax00, ax01) if per_ch is not None else (ax00, ax01, ax10, ax11)
+            if event.inaxes not in _scroll_axes:
                 return
             delta = SCROLL_STEP if event.button == 'up' else -SCROLL_STEP
             if event.key == 'control':
@@ -1232,39 +1258,71 @@ def plot_analysis(
             floor1_line.set_xdata(floor1n)
             floor1_line.set_ydata(f1n / 1000.0)
 
-            # Row 2
-            t2n, f2n, s2n, det_norm_n = _compute_squared_spectrogram(
-                new_samples, new_rate, fc_hz, ntol_hz
-            )
-            floor2n = _estimate_median(s2n)
-            sq_offset_n = float(np.median(floor1n)) - float(np.median(floor2n))
-            s2n     = s2n     + sq_offset_n
-            floor2n = floor2n + sq_offset_n
-            ax10.set_title(
-                f"Squared-Signal Spectrogram  (fc={fc_hz:.0f} Hz, ntol=\u00b1{ntol_hz:.0f} Hz,"
-                f" sq_offset={sq_offset_n:+.0f} dB)"
-            )
-            img2.set_data(s2n.T)
-            img2.set_extent(_extent(t2n, f2n))
-            f2n_min_khz = float(f2n[0])  / 1000.0
-            f2n_max_khz = float(f2n[-1]) / 1000.0
-            ax10.set_ylim(f2n_min_khz, f2n_max_khz)
-            floor2_line.set_xdata(floor2n)
-            floor2_line.set_ydata(f2n / 1000.0)
-            ax11.set_ylim(f2n_min_khz, f2n_max_khz)
-            ax11.relim()
-            ax11.autoscale_view(scalex=True, scaley=False)
+            # Row 2 — detection heatmap or squared spectrogram
+            per_ch_n = _compute_per_channel_metrics(new_samples, new_rate)
+            if per_ch_n is not None:
+                _N_CH_n    = per_ch_n['pair_metric'].shape[1]
+                _ch_sp_n   = float(per_ch_n['channel_hz'][1] - per_ch_n['channel_hz'][0]) if len(per_ch_n['channel_hz']) > 1 else 1000.0
+                _half_ch_n = _N_CH_n // 2
+                _disp_hz_n = (np.arange(_N_CH_n) - _half_ch_n) * _ch_sp_n
+                pm_disp_n  = np.fft.fftshift(per_ch_n['pair_metric'], axes=1)
+                time_pc_n  = per_ch_n['time_s']
+                vmax_pm_n  = max(_PDET_THRESH_DB * 3, float(pm_disp_n.max()) * 1.05)
+                _dt_pc_n   = float(time_pc_n[1] - time_pc_n[0]) / 2.0 if len(time_pc_n) > 1 else 0.0
+                _half_f_n  = _ch_sp_n / 2000.0
+                ext_pc_n   = [float(time_pc_n[0]) - _dt_pc_n, float(time_pc_n[-1]) + _dt_pc_n,
+                               float(_disp_hz_n[0]) / 1000.0 - _half_f_n,
+                               float(_disp_hz_n[-1]) / 1000.0 + _half_f_n]
+                img2.set_data(pm_disp_n.T)
+                img2.set_extent(ext_pc_n)
+                img2.set_clim(0.0, vmax_pm_n)
+                ax10.set_ylim(ext_pc_n[2], ext_pc_n[3])
+                ax10.set_title(
+                    f"Detection Heatmap — pair metric (dB above 25th-pct baseline, "
+                    f"threshold = {_PDET_THRESH_DB} dB)"
+                )
+                t2_det_n       = time_pc_n
+                det_norm_det_n = pm_disp_n.max(axis=1)
+                det_thresh_n   = _PDET_THRESH_DB
+                det_label_n    = "Pair metric (dB)"
+            else:
+                t2n, f2n, s2n, det_norm_n = _compute_squared_spectrogram(
+                    new_samples, new_rate, fc_hz, ntol_hz
+                )
+                floor2n = _estimate_median(s2n)
+                sq_offset_n = float(np.median(floor1n)) - float(np.median(floor2n))
+                s2n     = s2n     + sq_offset_n
+                floor2n = floor2n + sq_offset_n
+                ax10.set_title(
+                    f"Squared-Signal Spectrogram  (fc={fc_hz:.0f} Hz, ntol=\u00b1{ntol_hz:.0f} Hz,"
+                    f" sq_offset={sq_offset_n:+.0f} dB)"
+                )
+                img2.set_data(s2n.T)
+                img2.set_extent(_extent(t2n, f2n))
+                f2n_min_khz = float(f2n[0])  / 1000.0
+                f2n_max_khz = float(f2n[-1]) / 1000.0
+                ax10.set_ylim(f2n_min_khz, f2n_max_khz)
+                if floor2_line is not None:
+                    floor2_line.set_xdata(floor2n)
+                    floor2_line.set_ydata(f2n / 1000.0)
+                    ax11.set_ylim(f2n_min_khz, f2n_max_khz)
+                    ax11.relim()
+                    ax11.autoscale_view(scalex=True, scaley=False)
+                t2_det_n       = t2n
+                det_norm_det_n = det_norm_n
+                det_thresh_n   = DETECT_THRESH
+                det_label_n    = "Norm. metric"
 
             # Detection metric strip — clear and replot
             ax20.cla()
-            ax20.step(t2n, det_norm_n, where='mid', color='tab:green', lw=1.0)
-            ax20.axhline(DETECT_THRESH, color='red', lw=0.9, ls='--',
-                         label=f'Threshold ({DETECT_THRESH})')
-            ax20.fill_between(t2n, det_norm_n, DETECT_THRESH,
-                              where=(det_norm_n >= DETECT_THRESH),
+            ax20.step(t2_det_n, det_norm_det_n, where='mid', color='tab:green', lw=1.0)
+            ax20.axhline(det_thresh_n, color='red', lw=0.9, ls='--',
+                         label=f'Threshold ({det_thresh_n})')
+            ax20.fill_between(t2_det_n, det_norm_det_n, det_thresh_n,
+                              where=(det_norm_det_n >= det_thresh_n),
                               color='red', alpha=0.25, label='Detections')
             ax20.set_xlabel("Time (s)")
-            ax20.set_ylabel("Norm. metric")
+            ax20.set_ylabel(det_label_n)
             ax20.set_ylim(bottom=0.0)
             ax20.xaxis.set_major_locator(MultipleLocator(1.0))
             ax20.legend(fontsize=8, loc='upper right')

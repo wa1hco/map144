@@ -77,7 +77,7 @@ import logging
 from dataclasses import dataclass, field
 
 import numpy as np
-from scipy.signal import firwin, lfilter
+from scipy.signal import firwin
 
 log = logging.getLogger(__name__)
 
@@ -88,7 +88,7 @@ DECIMATE_FACTOR    = 4
 CH_SAMPLE_RATE     = 12000
 LP_CUTOFF_HZ       = 2700.0
 HP_CUTOFF_HZ       = 300.0
-LP_NUMTAPS         = 101        # scipy fallback tap count
+LP_NUMTAPS         = 23         # scipy fallback tap count (reduced for speed)
 
 # oversample_rate for pfb_channelizer_ccf:
 #   = CH_SAMPLE_RATE x N_CHANNELS / Fs_in = 12000 x 48 / 48000 = 12
@@ -141,7 +141,7 @@ def design_channelizer_filter(
 def _design_hp_filter(
     ch_rate: int   = CH_SAMPLE_RATE,
     cutoff:  float = HP_CUTOFF_HZ,
-    ntaps:   int   = 65,
+    ntaps:   int   = 15,
 ) -> np.ndarray:
     """HP FIR at *cutoff* Hz for the per-channel 300 Hz passband edge."""
     return firwin(ntaps, cutoff / (ch_rate / 2.0), pass_zero=False).astype(np.float64)
@@ -218,6 +218,8 @@ def make_channelizer_state(n_channels: int, lp_taps: np.ndarray) -> ChannelizerS
     hp_taps  = _design_hp_filter()
     hp_ntaps = len(hp_taps)
 
+    # _hp_zi stored as complex128 (real part = re state, imag part = im state)
+    # so _fir_filt_2d can split them without separate arrays in ChannelizerState.
     if _HAS_GNURADIO:
         fg    = _GRFlowgraph(n_channels, lp_taps, _OVERSAMPLE_RATE)
         hp_zi = np.zeros((n_channels, hp_ntaps - 1), dtype=np.complex128)
@@ -231,6 +233,31 @@ def make_channelizer_state(n_channels: int, lp_taps: np.ndarray) -> ChannelizerS
             _hp_taps=hp_taps, _hp_zi=hp_zi,
             zi_re=zi_re, zi_im=zi_im,
         )
+
+
+# ── Vectorized FIR helper ─────────────────────────────────────────────────────
+
+def _fir_filt_2d(b: np.ndarray, x: np.ndarray, zi: np.ndarray):
+    """FIR filter *x* (n_ch, N) along axis=1, returning (y, new_zi).
+
+    Uses stride-trick overlap to avoid scipy's apply_along_axis overhead.
+    *zi* shape: (n_ch, ntaps-1); holds the last ntaps-1 input samples.
+    """
+    ntaps  = len(b)
+    n_ch, N = x.shape
+    # Prepend state samples so the window can start at sample 0
+    x_ext = np.concatenate([zi, x], axis=1)          # (n_ch, ntaps-1 + N)
+    # Build sliding windows: shape (n_ch, N, ntaps) via strided view
+    s0, s1 = x_ext.strides
+    windows = np.lib.stride_tricks.as_strided(
+        x_ext,
+        shape=(n_ch, N, ntaps),
+        strides=(s0, s1, s1),
+    )
+    # Dot each window against the reversed taps — equivalent to convolution
+    y      = windows @ b[::-1]                        # (n_ch, N)
+    new_zi = x_ext[:, -(ntaps - 1):]                  # (n_ch, ntaps-1)
+    return y, new_zi
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -274,8 +301,9 @@ def apply_channelizer(
         )
         mixed = phase * raw[np.newaxis, :].astype(np.complex128)   # (n_ch, N)
 
-        filt_re, new_zi_re = lfilter(lp_taps, 1.0, mixed.real, axis=1, zi=state.zi_re)
-        filt_im, new_zi_im = lfilter(lp_taps, 1.0, mixed.imag, axis=1, zi=state.zi_im)
+        b_lp = lp_taps.astype(np.float64)
+        filt_re, new_zi_re = _fir_filt_2d(b_lp, mixed.real, state.zi_re)
+        filt_im, new_zi_im = _fir_filt_2d(b_lp, mixed.imag, state.zi_im)
         filtered = (filt_re + 1j * filt_im).astype(np.complex64)
 
         state.zi_re = new_zi_re
@@ -287,9 +315,11 @@ def apply_channelizer(
 
     # ── Per-channel HP filter (300 Hz, both paths) ────────────────────────
     ch_out_c128 = ch_out.astype(np.complex128)
-    hp_out, new_hp_zi = lfilter(
-        state._hp_taps, 1.0, ch_out_c128, axis=1, zi=state._hp_zi,
-    )
-    state._hp_zi = new_hp_zi
+    # Apply HP to real and imaginary parts separately so _fir_filt_2d (real-valued
+    # taps, real input) can use the BLAS matmul path without complex arithmetic.
+    hp_re, new_hp_zi_re = _fir_filt_2d(state._hp_taps, ch_out_c128.real, state._hp_zi.real)
+    hp_im, new_hp_zi_im = _fir_filt_2d(state._hp_taps, ch_out_c128.imag, state._hp_zi.imag)
+    state._hp_zi = new_hp_zi_re + 1j * new_hp_zi_im
+    hp_out = hp_re + 1j * hp_im
 
     return hp_out.astype(np.complex64)

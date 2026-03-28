@@ -12,7 +12,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""radio_iq_gui — modular radio IQ visualiser and MSK144 decoder.
+"""map144gui — modular radio IQ visualiser and MSK144 decoder.
 
 Package structure
 -----------------

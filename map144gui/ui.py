@@ -328,13 +328,12 @@ def setup_ui(self):
     # ── IF parameters ─────────────────────────────────────────────────────────
     if_grp, if_form = _form_group("IF Parameters")
     if_form.addRow("Center Freq:", _stat_label("_ri_freq_val"))
-    if_form.addRow("Bandwidth:",   _stat_label("_ri_bw_val"))
     if_form.addRow("Sample Rate:", _stat_label("_ri_rate_val"))
     ri_layout.addWidget(if_grp)
 
     # ── Stream health ─────────────────────────────────────────────────────────
     health_grp, health_form = _form_group("Stream Health")
-    health_form.addRow("Packets:", _stat_label("_ri_packets_val"))
+    health_form.addRow("Pkt Rate:", _stat_label("_ri_packets_val"))
     health_form.addRow("Loss:",    _stat_label("_ri_loss_val"))
     health_form.addRow("Drops:",   _stat_label("_ri_drops_val", color="#c76000"))
     ri_layout.addWidget(health_grp)

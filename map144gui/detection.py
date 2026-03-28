@@ -249,12 +249,16 @@ def extract_and_decode(
     marker_id: int = -1,
     ring_gen: int = 0,
     ring_gen_fn=None,
+    center_freq_mhz: float = 0.0,
+    detect_ts: str = "",
 ) -> None:
     """Extract IQ around detect_sample, mix fc to 1500 Hz, decimate to 12 kHz, run jt9.
 
-    iq_ring      – live ring buffer array (shared reference, not a snapshot)
-    ring_state_fn – callable returning (ring_pos, abs_sample) from the live writer
-    t_in_window  – seconds within the 15-s display window (0–15), used for logging.
+    iq_ring        – live ring buffer array (shared reference, not a snapshot)
+    ring_state_fn  – callable returning (ring_pos, abs_sample) from the live writer
+    t_in_window    – seconds within the 15-s display window (0–15), used for logging.
+    fc_hz          – carrier offset from center frequency in Hz (DSP use only).
+    center_freq_mhz – receiver center frequency in MHz; used to compute absolute RF freq.
     Intended to run in a background daemon thread.
     """
     pre_n  = int(0.500 * sample_rate)   # 500 ms before detection
@@ -302,20 +306,21 @@ def extract_and_decode(
     if peak > 0.0:
         audio = audio / peak * 0.9
 
-    t_sec = t_in_window
-    fc_khz = fc_hz / 1000.0
+    t_sec  = t_in_window
+    # rf_khz is the absolute RF frequency in kHz — used for all user-facing output.
+    # fc_hz is the signed offset from center (DSP use only, e.g. the mixer shift).
+    rf_khz = center_freq_mhz * 1000.0 + fc_hz / 1000.0
 
-    out_dir  = Path(output_dir)
+    out_dir   = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    _now      = datetime.now(timezone.utc)
-    launch_ts = _now.isoformat()
-    _ts_file  = _now.strftime('%Y%m%d_%H%M%SZ')
+    launch_ts = detect_ts or datetime.now(timezone.utc).strftime('%Y-%m-%d_%H:%M:%S.%f')[:21]
+    _ts_file  = launch_ts[:10].replace('-', '') + '_' + launch_ts[11:19].replace(':', '') + 'Z'
 
     def _log_launch(outcome: str, message: str = "", jt9_snr=None, jt9_line: str = ""):
         entry = {
             "timestamp": launch_ts,
             "t_sec":     round(t_sec, 3),
-            "fc_khz":    round(fc_khz, 3),
+            "rf_khz":    int(round(rf_khz)),
             "outcome":   outcome,   # "decoded" | "no_decode" | "timeout" | "error"
             "message":   message,
             "jt9_snr_db": jt9_snr,
@@ -354,10 +359,10 @@ def extract_and_decode(
                 # Filename: YYYYMMDD_HHMMSSZ_{freq_kHz}kHz_{message}.wav
                 # Spaces → underscore; any non-alphanumeric char → underscore.
                 msg_safe  = re.sub(r'[^A-Za-z0-9]+', '_', full_msg).strip('_')
-                fc_int    = int(round(fc_khz))
-                save_name = f"{_ts_file}_{fc_int}kHz_{msg_safe}.wav"
+                rf_int    = int(round(rf_khz))
+                save_name = f"{_ts_file}_{rf_int}kHz_{msg_safe}.wav"
                 shutil.move(tmp_path, str(out_dir / save_name))
-                print(f"[MSK144 DECODE]  t={t_sec:.2f}s  fc={fc_khz:.2f} kHz  {decoded}", flush=True)
+                print(f"[MSK144 DECODE]  t={t_sec:.2f}s  rf={rf_khz:.3f} kHz  {decoded}", flush=True)
 
                 if decode_queue is not None:
                     decode_queue.put({
@@ -365,7 +370,7 @@ def extract_and_decode(
                         'decoded':   True,
                         'message':   bare_msg,
                         't_sec':     t_sec,
-                        'fc_khz':    fc_khz,
+                        'rf_khz':    rf_khz,
                         'jt9_snr':   jt9_snr,
                     })
 
@@ -373,7 +378,7 @@ def extract_and_decode(
                 decode_entry = {
                     "timestamp":  launch_ts,
                     "t_sec":      round(t_sec, 3),
-                    "fc_khz":     round(fc_khz, 3),
+                    "rf_khz":     int(round(rf_khz)),
                     "message":    bare_msg,
                     "jt9_snr_db": jt9_snr,
                     "jt9_line":   decoded,
@@ -388,7 +393,7 @@ def extract_and_decode(
             Path(tmp_path).unlink(missing_ok=True)
 
     except subprocess.TimeoutExpired:
-        print(f"[MSK144]  jt9 timeout (>20s) at t={t_sec:.2f}s  fc={fc_khz:.2f} kHz", flush=True)
+        print(f"[MSK144]  jt9 timeout (>20s) at t={t_sec:.2f}s  rf={rf_khz:.3f} kHz", flush=True)
         _log_launch("timeout")
     except Exception as exc:
         print(f"[MSK144]  extract_and_decode error: {exc}", flush=True)

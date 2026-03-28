@@ -85,7 +85,7 @@ def discover(timeout: float = 3.0) -> list[FlexRadio]:
     sock.settimeout(timeout)
     sock.bind(("", DISCOVERY_PORT))  # Bind to port 4992 to receive broadcasts
 
-    log.info("Listening for FlexRadio discovery broadcasts...")
+    log.debug("Listening for FlexRadio discovery broadcasts...")
 
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -126,7 +126,7 @@ def discover(timeout: float = 3.0) -> list[FlexRadio]:
                 if oui == 0x001c2d and packet_class == 0xffff:
                     # Extract payload (key=value string)
                     payload = data[offset:].decode("utf-8", errors="replace").rstrip('\x00')
-                    log.info(_format_discovery_summary(payload, addr[0]))
+                    log.debug(_format_discovery_summary(payload, addr[0]))
                     radio = _parse_discovery(payload, addr[0])
                     if radio:
                         radios.append(radio)

@@ -174,9 +174,9 @@ def update_displays(self):
                 _marker_by_id[mid]['message'] = result.get('message')
             # Prepend to decode panel (most recent at top)
             msg     = result.get('message', '?')
-            fc_khz  = result.get('fc_khz', 0.0)
+            rf_khz  = result.get('rf_khz', 0.0)
             snr     = result.get('jt9_snr')
-            rf_mhz  = center_freq_mhz + fc_khz / 1000.0
+            rf_mhz  = rf_khz / 1000.0
             snr_str = f"{snr:+d} dB" if snr is not None else "  ?"
             self.decode_panel.insertItem(0, f"{rf_mhz:.3f}  {snr_str:>7}  {msg}")
 
@@ -386,13 +386,6 @@ def update_displays(self):
         else:
             self._ri_freq_val.setText(f"{self.center_freq_mhz:.6f} MHz (req)")
 
-    if hasattr(self, '_ri_bw_val'):
-        if dax is not None and dax.pan_bandwidth_hz:
-            bw_khz = dax.pan_bandwidth_hz / 1e3
-            self._ri_bw_val.setText(f"{bw_khz:.0f} kHz")
-        else:
-            self._ri_bw_val.setText("—")
-
     if hasattr(self, '_ri_rate_val'):
         self._ri_rate_val.setText(f"{self.sample_rate / 1000:.0f} kHz")
 
@@ -403,7 +396,10 @@ def update_displays(self):
             missed   = vita.missed_count
             drops    = vita.drop_count
             loss_pct = (missed / total * 100) if total > 0 else 0.0
-            self._ri_packets_val.setText(f"{total:,}")
+            prev     = getattr(self, '_ri_prev_packet_count', total)
+            rate     = (total - prev) * 10   # calls at 10 Hz → packets/sec
+            self._ri_prev_packet_count = total
+            self._ri_packets_val.setText(f"{rate:,} /s")
             if hasattr(self, '_ri_loss_val'):
                 self._ri_loss_val.setText(f"{loss_pct:.3f}%")
             if hasattr(self, '_ri_drops_val'):

@@ -163,7 +163,7 @@ class FlexDAXIQ:
             if not radios:
                 raise RuntimeError("No FlexRadio found on network")
             radio = radios[0]
-            log.info(f"Found radio: {radio.model} at {radio.ip}")
+            log.debug(f"Found radio: {radio.model} at {radio.ip}")
 
         # Connect TCP
         self._tcp = FlexTCPClient(radio)
@@ -174,9 +174,9 @@ class FlexDAXIQ:
 
         gui_clients = self._tcp.get_gui_clients()
         if gui_clients:
-            log.info("GUI clients discovered:")
+            log.debug("GUI clients discovered:")
             for idx, item in enumerate(gui_clients):
-                log.info(
+                log.debug(
                     "  [%d] station=%s program=%s host=%s ip=%s handle=%s client_id=%s",
                     idx,
                     item.get("station", "n/a") or "n/a",
@@ -187,10 +187,10 @@ class FlexDAXIQ:
                     item.get("client_id", "n/a") or "n/a",
                 )
         else:
-            log.info("GUI clients discovered: none with client_id yet")
+            log.debug("GUI clients discovered: none with client_id yet")
 
         if radio.gui_client_ids:
-            log.info(f"Discovery advertised GUI client_ids: {', '.join(radio.gui_client_ids)}")
+            log.debug(f"Discovery advertised GUI client_ids: {', '.join(radio.gui_client_ids)}")
 
         bind_client_id = self.bind_client_id
         if not bind_client_id:
@@ -200,21 +200,21 @@ class FlexDAXIQ:
             elif radio.gui_client_ids:
                 bind_client_id = radio.gui_client_ids[0]
             else:
-                log.info("No GUI client_id available for auto-bind")
+                log.debug("No GUI client_id available for auto-bind")
 
         if bind_client_id:
             bind_cmd = f"client bind client_id={bind_client_id}"
-            log.info(f"Sending bind command: {bind_cmd}")
+            log.debug(f"Sending bind command: {bind_cmd}")
             try:
                 self._tcp.send_command(bind_cmd)
-                log.info(f"Bound to GUI client_id {bind_client_id}")
+                log.debug(f"Bound to GUI client_id {bind_client_id}")
                 self._log_bound_context_diagnostics()
             except RuntimeError as e:
                 log.warning(f"Could not bind to GUI client_id {bind_client_id}: {e}")
                 log.warning(f"Bind command failed: {bind_cmd}")
 
         selected_port = _pick_udp_listen_port()
-        log.info(f"Using UDP:{selected_port} for DAXIQ stream")
+        log.debug(f"Using UDP:{selected_port} for DAXIQ stream")
         self.listen_port = selected_port
 
         self._dax_setup = DAXIQSetup(
@@ -235,7 +235,7 @@ class FlexDAXIQ:
             output_queue=self.sample_queue
         )
         self._vita.start()
-        log.info("DAXIQ stream running")
+        log.debug("DAXIQ stream running")
 
     def stop(self):
         if self._vita:
