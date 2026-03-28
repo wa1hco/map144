@@ -84,6 +84,11 @@ log = logging.getLogger(__name__)
 # ── Public constants ──────────────────────────────────────────────────────────
 N_CHANNELS         = 48
 CHANNEL_SPACING_HZ = 1000.0
+CHANNEL_OFFSET_HZ  = 500.0      # shift channel centres by +500 Hz so that USB MSK144
+                                  # signals at integer-kHz dial + 1500 Hz audio land exactly
+                                  # at a channel centre (carrier = N×1000 + 1500 Hz → offset
+                                  # channel k centred at k×1000 + 500 Hz = N×1000 + 1500 Hz
+                                  # when k = N+1, giving fc_offset = 0 and perfect mixing).
 DECIMATE_FACTOR    = 4
 CH_SAMPLE_RATE     = 12000
 LP_CUTOFF_HZ       = 2700.0
@@ -297,7 +302,7 @@ def apply_channelizer(
 
         k     = np.arange(n_channels, dtype=np.float64)[:, np.newaxis]
         phase = np.exp(
-            -2j * np.pi * k * channel_spacing_hz * t[np.newaxis, :] / sample_rate
+            -2j * np.pi * (k * channel_spacing_hz + CHANNEL_OFFSET_HZ) * t[np.newaxis, :] / sample_rate
         )
         mixed = phase * raw[np.newaxis, :].astype(np.complex128)   # (n_ch, N)
 

@@ -65,6 +65,7 @@ from .channelizer import (
     apply_channelizer,
     N_CHANNELS,
     CHANNEL_SPACING_HZ,
+    CHANNEL_OFFSET_HZ,
     CH_SAMPLE_RATE,
 )
 from .detection import extract_and_decode
@@ -272,7 +273,9 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
             fc_offset  = (lo_freq + hi_freq) / 4.0   # squaring doubled freqs
             # ch_k 25-47 are negative-frequency channels (-23 to -1 kHz)
             ch_signed  = int(ch_k) if int(ch_k) <= N_CHANNELS // 2 else int(ch_k) - N_CHANNELS
-            fc_hz      = ch_signed * CHANNEL_SPACING_HZ + fc_offset
+            # CHANNEL_OFFSET_HZ shifts channel centres by +500 Hz so that USB MSK144
+            # signals at integer-kHz dial + 1500 Hz audio land at fc_offset = 0.
+            fc_hz      = ch_signed * CHANNEL_SPACING_HZ + CHANNEL_OFFSET_HZ + fc_offset
 
             abs_snap      = self._iq_abs_sample
             ring_state_fn = lambda: (self._iq_ring_pos, self._iq_abs_sample)
