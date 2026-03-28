@@ -305,7 +305,9 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                 args=(self._iq_ring, ring_state_fn,
                       abs_snap, self.sample_rate, fc_hz, output_dir,
                       t_in_window, decode_queue, marker_id,
-                      ring_gen, ring_gen_fn, self.center_freq_mhz, detect_ts),
+                      ring_gen, ring_gen_fn,
+                      getattr(self, 'display_center_freq_mhz', self.center_freq_mhz),
+                      detect_ts),
                 daemon=True,
             )
             t.start()
