@@ -105,8 +105,8 @@ from scipy.signal import decimate
 
 JT9_BASE_ARGS = [
     'jt9', "--msk144",
-    "-p", "15", "-L", "1400", "-H", "1600",
-    "-f", "1500", "-F", "200", "-d", "3",
+    "-p", "15", "-L", "900", "-H", "2100",
+    "-f", "1500", "-F", "600", "-d", "3",
 ]
 
 _DECODE_RATE = 12000        # target WAV sample rate for jt9
