@@ -69,6 +69,7 @@ class Engine:
         _sbuf_cap = self.fft_size * 6
         self._sbuf = np.zeros(_sbuf_cap, dtype=np.complex64)
         self._sbuf_end = 0
+        self._sbuf_t0  = 0.0   # wall-clock time of _sbuf[0], anchored to VITA timestamps
 
         # Noise blanker state
         self._nb_env = None
@@ -89,15 +90,12 @@ class Engine:
         self.spec_staging = np.full((self.max_history, self.fft_size), -130.0)
         self.spec_boundary = int(current_time / self.history_secs)
         self.spec_staging_filled = False
-        initial_index = int(self.time_in_window * self.blocks_per_sec)
-        self.spec_write_index = min(max(initial_index, 0), self.max_history - 1)
 
         # Real-time spectrogram buffers
         self.realtime_data = np.full((self.max_history, self.fft_size), -130.0)
         self.realtime_time = self.history_secs
         self.realtime_filled = False
         self._realtime_boundary = self.spec_boundary
-        self.realtime_write_index = min(max(initial_index, 0), self.max_history - 1)
 
         # Noise floor arrays
         self.accumulated_noise_floor = np.full(self.fft_size, -125.0)

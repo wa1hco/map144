@@ -123,21 +123,22 @@ def setup_ui(self):
     colormap = pg.ColorMap(positions, colors)
 
     # ── Plot widgets ──────────────────────────────────────────────────────────
-    self.spectrogram_plot = pg.PlotWidget(title="Accumulated (15 sec snapshot)")
-    self.spectrogram_plot.setLabel('left', 'Frequency', units='MHz')
-    self.spectrogram_plot.setLabel('bottom', 'Time', units='s')
-    self.spectrogram_img = pg.ImageItem(axisOrder='col-major')
-    self.spectrogram_plot.addItem(self.spectrogram_img)
-    self.spectrogram_plot.setAspectLocked(False)
-    self.spectrogram_img.setColorMap(colormap)
-
-    self.realtime_plot = pg.PlotWidget(title="Real-time (15 sec)")
+    self.realtime_plot = pg.PlotWidget(title="Current (15 sec)")
     self.realtime_plot.setLabel('left', 'Frequency', units='MHz')
     self.realtime_plot.setLabel('bottom', 'Time', units='s')
     self.realtime_img = pg.ImageItem(axisOrder='col-major')
     self.realtime_plot.addItem(self.realtime_img)
     self.realtime_plot.setAspectLocked(False)
     self.realtime_img.setColorMap(colormap)
+    self.realtime_plot.setXRange(0, float(self.history_secs), padding=0)
+
+    self.spectrogram_plot = pg.PlotWidget(title="Previous (15 sec snapshot)")
+    self.spectrogram_plot.setLabel('left', 'Frequency', units='MHz')
+    self.spectrogram_plot.setLabel('bottom', 'Time', units='s')
+    self.spectrogram_img = pg.ImageItem(axisOrder='col-major')
+    self.spectrogram_plot.addItem(self.spectrogram_img)
+    self.spectrogram_plot.setAspectLocked(False)
+    self.spectrogram_img.setColorMap(colormap)
 
     _half_ch = N_CHANNELS // 2
     self._detect_freq_min_khz  = -float(_half_ch)
@@ -162,7 +163,13 @@ def setup_ui(self):
         self._detect_freq_min_khz + self._detect_freq_span_khz + 0.5,
         padding=0,
     )
-    self.ch_detect_plot.setXLink(self.realtime_plot)
+    # Do NOT setXLink here.  PyQtGraph's link is bidirectional: any bounds-change
+    # signal on ch_detect_plot (from setImage) calls linkedViewChanged on
+    # realtime_plot and forces its range, overriding explicit setXRange calls.
+    # Both plots are kept at [0, 15] by explicit setXRange each frame instead.
+    self.realtime_plot.getViewBox().disableAutoRange()
+    self.spectrogram_plot.getViewBox().disableAutoRange()
+    self.ch_detect_plot.getViewBox().disableAutoRange()
 
     # ── Slider bar helper ─────────────────────────────────────────────────────
     def _make_slider_bar(title, min_label_ref, min_range, min_default,
@@ -232,8 +239,8 @@ def setup_ui(self):
     fg_layout = QtWidgets.QVBoxLayout(self._fast_graph_win)
     fg_layout.setContentsMargins(0, 0, 0, 0)
     fg_layout.setSpacing(0)
-    fg_layout.addWidget(self.spectrogram_plot, stretch=1)
-    fg_layout.addWidget(self.realtime_plot,    stretch=1)
+    fg_layout.addWidget(self.realtime_plot,    stretch=1)   # upper: current window (WSJTX style)
+    fg_layout.addWidget(self.spectrogram_plot, stretch=1)   # lower: previous window
     fg_layout.addWidget(iq_sliders)
 
     # ── Panel window: Detection Heatmap ───────────────────────────────────────

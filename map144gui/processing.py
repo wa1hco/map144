@@ -334,10 +334,28 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         self._ch_buf_end = remaining
 
     # ── 4. Overlap-FFT for waterfall display (blanked signal) ─────────────────
-    # Accumulate cleaned samples into pre-allocated slide-left buffer.
+    # Anchor _sbuf_t0 to the VITA packet timestamp so each FFT block is placed
+    # at its exact sample-accurate receive time, not at time.time() during
+    # processing.  Using time.time() causes dark vertical stripes: when the
+    # runtime processes a batch of packets quickly the clock barely advances,
+    # mapping many blocks to the same row; the clock then jumps, skipping rows.
+    #
+    # WAV source: timestamp_frac encodes picoseconds (ts_frac = frac_s * 1e12).
+    # Radio source: FlexRadio DAXIQ TSF=1, timestamp_frac = sample count/second.
+    _sbuf_end_before = self._sbuf_end   # samples already buffered before this packet
+
     new_n = len(cleaned)
     self._sbuf[self._sbuf_end:self._sbuf_end + new_n] = cleaned
     self._sbuf_end += new_n
+
+    if self.source_mode == "wav":
+        _pkt_time = float(timestamp_int) + float(timestamp_frac) * 1e-12
+    elif timestamp_int > 0:
+        _pkt_time = float(timestamp_int) + float(timestamp_frac) / self.sample_rate
+    else:
+        _pkt_time = time.time()
+    # Time of _sbuf[0] = packet's first-sample time minus already-buffered samples
+    self._sbuf_t0 = _pkt_time - _sbuf_end_before / self.sample_rate
 
     fft_window  = self._fft_window   # pre-computed float32 Hanning window
     window_gain = self._window_gain  # pre-computed scalar
@@ -350,16 +368,16 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         magnitude = np.abs(X) / (self.fft_size * window_gain)
         power_db  = 20.0 * np.log10(magnitude / full_scale + 1e-12)
 
-        # Wall-clock / WAV-cursor time
-        if self.source_mode == "wav":
-            current_wall_time = float(getattr(self, "_wav_time_cursor", 0.0))
-            wav_block_seconds = (self.fft_size // 2) / self.sample_rate
-        else:
-            current_wall_time = time.time()
-            wav_block_seconds = 0.0
+        # Sample-accurate time for this block: _sbuf_t0 is the time of _sbuf[0],
+        # which is always the first sample of the current block since the buffer
+        # slides by exactly one hop after each block is processed below.
+        current_wall_time = self._sbuf_t0
         time_in_window = current_wall_time % self.history_secs
 
         # ── Accumulated spectrogram ───────────────────────────────────────
+        # Each block is written at the row corresponding to its receive time so
+        # the column position matches wall-clock time modulo the 15-second window,
+        # matching the WSJTX Fast Graph convention.
         spec_boundary = int(current_wall_time / self.history_secs)
         if spec_boundary != self.spec_boundary:
             self.spectrogram_data    = self.spec_staging.copy()
@@ -367,34 +385,23 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
             self.accumulated_noise_floor = np.percentile(self.spec_staging, 10, axis=0)
             self.spec_staging        = np.full((self.max_history, self.fft_size), -130.0)
             self.spec_boundary       = spec_boundary
-            self.spec_write_index    = min(
-                max(int(time_in_window * self.blocks_per_sec), 0), self.max_history - 1
-            )
             self.next_boundary = current_wall_time + (
                 self.history_secs - (current_wall_time % self.history_secs)
             )
 
-        if 0 <= self.spec_write_index < self.max_history:
-            self.spec_staging[self.spec_write_index] = power_db
-        self.spec_write_index += 1
+        staging_idx = min(max(int(time_in_window * self.blocks_per_sec), 0), self.max_history - 1)
+        self.spec_staging[staging_idx] = power_db
 
         # ── Real-time spectrogram ─────────────────────────────────────────
         realtime_boundary = int(current_wall_time / self.history_secs)
         if realtime_boundary != self._realtime_boundary:
             self.realtime_data         = np.full((self.max_history, self.fft_size), -130.0)
             self._realtime_boundary    = realtime_boundary
-            self.realtime_write_index  = min(
-                max(int(time_in_window * self.blocks_per_sec), 0), self.max_history - 1
-            )
 
-        if 0 <= self.realtime_write_index < self.max_history:
-            self.realtime_data[self.realtime_write_index] = power_db
-            self.realtime_filled = True
-            self._realtime_dirty = True
-        self.realtime_write_index += 1
-
-        if self.source_mode == "wav":
-            self._wav_time_cursor = current_wall_time + wav_block_seconds
+        rt_idx = min(max(int(time_in_window * self.blocks_per_sec), 0), self.max_history - 1)
+        self.realtime_data[rt_idx] = power_db
+        self.realtime_filled  = True
+        self._realtime_dirty  = True
 
         # Slide sample buffer left by one hop (in-place copy, no allocation)
         hop = self.fft_size // 2
@@ -402,3 +409,11 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         if remaining > 0:
             self._sbuf[:remaining] = self._sbuf[hop:self._sbuf_end]
         self._sbuf_end = max(0, remaining)
+        # Advance the time anchor by exactly one hop so the next block's
+        # current_wall_time is sample-accurate without calling time.time().
+        self._sbuf_t0 += hop / self.sample_rate
+
+    # Keep _wav_time_cursor in sync for the WAV source step (it uses this to
+    # timestamp the next packet it will send into process_iq_data).
+    if self.source_mode == "wav":
+        self._wav_time_cursor = self._sbuf_t0 + self._sbuf_end / self.sample_rate

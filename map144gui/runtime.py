@@ -273,19 +273,7 @@ def _reset_wav_timeline(self):
 
     self.spec_boundary = 0
     self._realtime_boundary = 0
-
-    self.spec_write_index = 0
-    self.realtime_write_index = 0
-
-    self.sq_spectrogram_data = np.full((self.max_history, self.fft_size), -130.0)
-    self.sq_spec_staging = np.full((self.max_history, self.fft_size), -130.0)
-    self.sq_spec_staging_filled = False
-    self.sq_realtime_data = np.full((self.max_history, self.fft_size), -130.0)
-    self.sq_realtime_filled = False
-    self.sq_spec_boundary = 0
-    self._sq_realtime_boundary = 0
-    self.sq_spec_write_index = 0
-    self.sq_realtime_write_index = 0
+    self._sbuf_t0 = 0.0
 
     self.time_in_window = 0.0
     self.next_boundary = self.history_secs
@@ -590,14 +578,31 @@ def run_radio_source(self):
                 time.sleep(1.0)
                 continue
 
+            # Drain up to 64 packets per loop iteration so the pipeline
+            # catches up quickly after a CPU-load burst.  Without batching,
+            # a 1-second stall at 375 pkt/s produces 375 queued packets that
+            # would take 375 individual loop iterations (each re-checking the
+            # source_mode guard) to drain.
             try:
-                packet = self.radio_client.sample_queue.get(timeout=1.0)
-                # Normalise FlexRadio DAXIQ samples from ±32768 ADC scale to ±1.0.
-                chunk = (np.asarray(packet.samples, dtype=np.complex64)
-                         / FLEX_DAXIQ_FULL_SCALE)
-                self.process_iq_data(chunk, packet.timestamp_int, packet.timestamp_frac)
-            except queue.Empty:
-                continue
+                drained = 0
+                while drained < 64:
+                    try:
+                        packet = self.radio_client.sample_queue.get_nowait()
+                    except queue.Empty:
+                        if drained == 0:
+                            # Nothing available at all — block briefly rather
+                            # than spinning.
+                            try:
+                                packet = self.radio_client.sample_queue.get(timeout=1.0)
+                            except queue.Empty:
+                                break
+                        else:
+                            break
+                    # Normalise FlexRadio DAXIQ samples from ±32768 ADC scale to ±1.0.
+                    chunk = (np.asarray(packet.samples, dtype=np.complex64)
+                             / FLEX_DAXIQ_FULL_SCALE)
+                    self.process_iq_data(chunk, packet.timestamp_int, packet.timestamp_frac)
+                    drained += 1
             except Exception as exc:
                 print(f"Queue get/process error: {exc}", flush=True)
                 import traceback

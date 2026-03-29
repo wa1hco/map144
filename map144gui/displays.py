@@ -154,6 +154,10 @@ def update_displays(self):
             )
         )
 
+        # setXRange/setYRange must come AFTER setImage and setRect.
+        # sigBoundsChanged fires synchronously on those calls and triggers
+        # autoRange; an explicit setXRange after that overrides the result.
+        # (The accumulated spectrogram has always used this order and works.)
         self.realtime_plot.setXRange(0, self.realtime_time, padding=0)
         self.realtime_plot.setYRange(freq_min, freq_max, padding=0)
 

@@ -108,7 +108,7 @@ class VITAReceiver:
                  output_queue: Optional[queue.Queue] = None):
         self.listen_port  = listen_port
         self.filter_sid   = stream_id      # None = accept all streams
-        self.out_q        = output_queue or queue.Queue(maxsize=200)
+        self.out_q        = output_queue or queue.Queue(maxsize=4000)
         self._sock        = None
         self._running     = False
         self._thread      = None
@@ -163,8 +163,8 @@ class VITAReceiver:
                     now = time.monotonic()
                     if now - self._last_drop_log >= 1.0:
                         self._last_drop_log = now
-                        log.debug(f"VITA queue full, dropping packet "
-                                  f"(total drops: {self.drop_count})")
+                        log.warning(f"VITA queue full, dropping packet "
+                                    f"(total drops: {self.drop_count})")
             except socket.timeout:
                 continue
             except Exception as e:
