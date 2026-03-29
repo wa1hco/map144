@@ -114,6 +114,75 @@ _DECIMATE_FACTOR = 4        # 48 kHz → 12 kHz
 _TARGET_FC_HZ = 1500.0      # jt9 expects the signal at this frequency
 _JT9_SEMAPHORE = threading.Semaphore(4)   # max concurrent jt9 processes
 
+# Pre-computed SNR estimator constants (at _DECODE_RATE = 12000 Hz)
+_SNR_N_FFT    = 1024                         # ≈ 11.7 Hz/bin  → 85 ms window
+_SNR_WINDOW   = np.hanning(_SNR_N_FFT).astype(np.float64)
+_SNR_FREQS    = np.fft.rfftfreq(_SNR_N_FFT, 1.0 / _DECODE_RATE)
+_SNR_BIN_HZ   = float(_DECODE_RATE) / _SNR_N_FFT
+# Signal band: MSK144 tones at ±500 Hz around 1500 Hz carrier → 1000–2000 Hz.
+# Widen slightly to cover jt9's ±600 Hz search window.
+_SNR_SIG_MASK  = (_SNR_FREQS >= 900.0) & (_SNR_FREQS <= 2100.0)
+# Noise band: above DC artefacts, below Nyquist rolloff, excluding signal band.
+_SNR_NOISE_MASK = (_SNR_FREQS > 200.0) & (_SNR_FREQS < 5500.0) & ~_SNR_SIG_MASK
+_SNR_REF_BINS  = 2500.0 / _SNR_BIN_HZ  # 2500 Hz reference bandwidth in bins
+
+
+def _estimate_snr_db(audio: np.ndarray) -> int | None:
+    """Estimate MSK144 SNR in dB referenced to 2500 Hz bandwidth (WSJTX convention).
+
+    jt9 cannot compute a meaningful SNR from a short burst WAV because it has
+    no noise-only baseline.  This function uses the 500 ms pre-burst segment
+    (zero-padded leading silence + noise before detection) as the noise
+    reference and scans the burst region for the peak in-band power window.
+
+    audio   – float32 mono at _DECODE_RATE (12 kHz), structured as:
+                [pad_n_dec] [pre_n_dec (noise)] [burst + post] [pad_n_dec]
+              where pad_n_dec = 100 ms, pre_n_dec = 500 ms.
+
+    Returns SNR rounded to the nearest integer dB, or None on failure.
+    """
+    pad_n_dec  = int(0.100 * _DECODE_RATE)   # 1200 samples
+    pre_n_dec  = int(0.500 * _DECODE_RATE)   # 6000 samples
+    noise_end  = pad_n_dec + pre_n_dec        # 7200
+    burst_start = noise_end
+
+    if len(audio) <= noise_end:
+        return None
+
+    # ── Noise floor: overlap-averaged PSD from the pre-burst segment ─────────
+    noise_seg = audio[pad_n_dec:noise_end].astype(np.float64)
+    hop       = _SNR_N_FFT // 2
+    psds      = []
+    for off in range(0, max(1, len(noise_seg) - _SNR_N_FFT + 1), hop):
+        blk = noise_seg[off:off + _SNR_N_FFT]
+        if len(blk) < _SNR_N_FFT:
+            blk = np.pad(blk, (0, _SNR_N_FFT - len(blk)))
+        psds.append(np.abs(np.fft.rfft(blk * _SNR_WINDOW)) ** 2)
+    if not psds:
+        return None
+    noise_per_bin = float(np.median(np.mean(psds, axis=0)[_SNR_NOISE_MASK]))
+    if noise_per_bin <= 0.0:
+        return None
+
+    # ── Signal: peak in-band power over N_FFT-sample windows in burst region ─
+    burst_seg  = audio[burst_start:].astype(np.float64)
+    best_sig   = 0.0
+    for off in range(0, max(1, len(burst_seg) - _SNR_N_FFT + 1), _SNR_N_FFT // 4):
+        blk = burst_seg[off:off + _SNR_N_FFT]
+        if len(blk) < _SNR_N_FFT:
+            break
+        psd     = np.abs(np.fft.rfft(blk * _SNR_WINDOW)) ** 2
+        in_band = float(np.sum(psd[_SNR_SIG_MASK]))
+        best_sig = max(best_sig, in_band)
+
+    if best_sig <= 0.0:
+        return None
+
+    # SNR = in-band signal power / (noise_per_bin × ref_bins)
+    # Both use the same FFT normalisation so units cancel cleanly.
+    snr_db = 10.0 * np.log10(best_sig / (noise_per_bin * _SNR_REF_BINS))
+    return int(round(snr_db))
+
 
 
 def scan_for_pairs(
@@ -302,6 +371,10 @@ def extract_and_decode(
     i_dec = decimate(np.real(iq_mixed).astype(np.float64), _DECIMATE_FACTOR, zero_phase=False)
     audio = i_dec.astype(np.float32)
 
+    # Estimate SNR before normalisation (ratio is preserved, but avoids
+    # any subtle numerical difference from the peak-scale step).
+    est_snr = _estimate_snr_db(audio)
+
     peak = float(np.max(np.abs(audio)))
     if peak > 0.0:
         audio = audio / peak * 0.9
@@ -357,7 +430,13 @@ def extract_and_decode(
                 tokens   = decoded.split()
                 full_msg = " ".join(tokens[5:]) if len(tokens) >= 6 else decoded
                 bare_msg = full_msg   # kept for decode_queue / log compatibility
-                jt9_snr  = int(tokens[1]) if len(tokens) >= 2 else None
+                try:
+                    jt9_snr = int(tokens[1]) if len(tokens) >= 2 else None
+                except (ValueError, IndexError):
+                    jt9_snr = None
+                # jt9 cannot compute SNR from a short burst WAV (no noise baseline).
+                # Use our pre-burst estimate when jt9 gives nothing.
+                snr = jt9_snr if jt9_snr is not None else est_snr
 
                 # Filename: YYYYMMDD_HHMMSSZ_{freq_kHz}kHz_{message}.wav
                 # Spaces → underscore; any non-alphanumeric char → underscore.
@@ -374,7 +453,7 @@ def extract_and_decode(
                         'message':   bare_msg,
                         't_sec':     t_sec,
                         'radio_khz': radio_khz,
-                        'jt9_snr':   jt9_snr,
+                        'jt9_snr':   snr,
                         'utc_time':  datetime.now(timezone.utc).strftime('%H:%M:%S'),
                     })
 
@@ -382,15 +461,15 @@ def extract_and_decode(
                 decode_entry = {
                     "timestamp":  launch_ts,
                     "t_sec":      round(t_sec, 3),
-                    "radio_khz":     int(round(radio_khz)),
+                    "radio_khz":  int(round(radio_khz)),
                     "message":    bare_msg,
-                    "jt9_snr_db": jt9_snr,
+                    "jt9_snr_db": snr,
                     "jt9_line":   decoded,
                 }
                 with open(out_dir / "decodes.jsonl", "a") as lf:
                     lf.write(json.dumps(decode_entry) + "\n")
 
-                _log_launch("decoded", message=bare_msg, jt9_snr=jt9_snr, jt9_line=decoded)
+                _log_launch("decoded", message=bare_msg, jt9_snr=snr, jt9_line=decoded)
             else:
                 _log_launch("no_decode")
         finally:
