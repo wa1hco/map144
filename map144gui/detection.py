@@ -131,9 +131,29 @@ def _estimate_snr_db(audio: np.ndarray) -> int | None:
     """Estimate MSK144 SNR in dB referenced to 2500 Hz bandwidth (WSJTX convention).
 
     jt9 cannot compute a meaningful SNR from a short burst WAV because it has
-    no noise-only baseline.  This function uses the 500 ms pre-burst segment
-    (zero-padded leading silence + noise before detection) as the noise
-    reference and scans the burst region for the peak in-band power window.
+    no noise-only baseline to compare against.  This function uses the audio
+    we already have to produce an equivalent estimate:
+
+    Noise
+        Overlap-averaged PSD (50 % hop, Hanning window) over the 500 ms
+        pre-burst segment (audio[1200:7200] at 12 kHz).  That segment
+        contains pure receiver noise — no signal — so the median power
+        across the out-of-band bins (200–5500 Hz, excluding the signal
+        band) gives a stable noise-density estimate in power/bin.
+
+    Signal
+        A 1024-sample (≈ 85 ms) Hanning-windowed FFT is slid through the
+        burst region in 256-sample steps.  The peak sum of in-band power
+        (900–2100 Hz, covering both MSK144 tones at 1000 Hz and 2000 Hz
+        plus jt9's ±600 Hz search window) represents the burst power at
+        its strongest moment.
+
+    Reference bandwidth
+        SNR = 10·log10(signal_bins / (noise_per_bin × ref_bins))
+        where ref_bins = 2500 Hz / bin_width (≈ 213 bins at 12 kHz /
+        1024-point FFT).  Both signal and noise use the same FFT
+        normalisation so units cancel.  The 2500 Hz reference matches the
+        WSJTX convention for all weak-signal modes.
 
     audio   – float32 mono at _DECODE_RATE (12 kHz), structured as:
                 [pad_n_dec] [pre_n_dec (noise)] [burst + post] [pad_n_dec]
