@@ -66,6 +66,8 @@ class Engine:
         self.radio_client = None
         self.airspy_client = None
         self._airspy_started = False
+        self.rtlsdr_client = None
+        self._rtlsdr_started = False
 
         # Overlap-add buffer for waterfall FFT
         _sbuf_cap = self.fft_size * 6

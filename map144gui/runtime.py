@@ -190,6 +190,51 @@ def _stop_airspy_source(self):
     self._airspy_started = False
 
 
+def _connect_rtlsdr_client(self):
+    """Instantiate NesdrSmartSource on first use (called from on_select_source_rtlsdr)."""
+    if getattr(self, 'rtlsdr_client', None) is not None:
+        return
+    try:
+        from .rtlsdr_source import NesdrSmartSource
+        self.rtlsdr_client = NesdrSmartSource(
+            center_freq_mhz=50.260,   # MSK144 6m calling frequency
+            target_rate=self.sample_rate,
+        )
+        print("[rtlsdr] NesdrSmartSource created", flush=True)
+    except Exception as exc:
+        print(f"[rtlsdr] NesdrSmartSource creation failed: {exc}", flush=True)
+        self.rtlsdr_client = None
+
+
+def _start_rtlsdr_source(self) -> bool:
+    if getattr(self, '_rtlsdr_started', False):
+        return True
+    if getattr(self, 'rtlsdr_client', None) is None:
+        return False
+    try:
+        self.rtlsdr_client.start()
+        self._rtlsdr_started = True
+        if hasattr(self, '_jt9_markers'):
+            self._jt9_markers.clear()
+        if hasattr(self, 'decode_panel'):
+            self.decode_panel.clear()
+        return True
+    except Exception as exc:
+        print(f"[rtlsdr] start error: {exc}", flush=True)
+        import traceback; traceback.print_exc()
+        return False
+
+
+def _stop_rtlsdr_source(self):
+    if not getattr(self, '_rtlsdr_started', False):
+        return
+    try:
+        self.rtlsdr_client.stop()
+    except Exception:
+        pass
+    self._rtlsdr_started = False
+
+
 def _connect_radio_client(self):
     """Instantiate FlexDAXIQ on first use (called from on_select_source_radio)."""
     if self.radio_client is not None:
@@ -618,7 +663,39 @@ def run_radio_source(self):
                     _stop_radio_source(self)
                 if getattr(self, '_airspy_started', False):
                     _stop_airspy_source(self)
+                if getattr(self, '_rtlsdr_started', False):
+                    _stop_rtlsdr_source(self)
                 _process_wav_source_step(self)
+                continue
+
+            if self.source_mode == "rtlsdr":
+                if self._radio_started:
+                    _stop_radio_source(self)
+                if getattr(self, '_airspy_started', False):
+                    _stop_airspy_source(self)
+                if not _start_rtlsdr_source(self):
+                    time.sleep(1.0)
+                    continue
+                try:
+                    drained = 0
+                    while drained < 64:
+                        try:
+                            packet = self.rtlsdr_client.sample_queue.get_nowait()
+                        except queue.Empty:
+                            if drained == 0:
+                                try:
+                                    packet = self.rtlsdr_client.sample_queue.get(timeout=1.0)
+                                except queue.Empty:
+                                    break
+                            else:
+                                break
+                        # RTL-SDR outputs ±1.0 float32 after uint8 conversion — no scaling.
+                        chunk = np.asarray(packet.samples, dtype=np.complex64)
+                        self.process_iq_data(chunk, packet.timestamp_int, packet.timestamp_frac)
+                        drained += 1
+                except Exception as exc:
+                    print(f"[rtlsdr] queue/process error: {exc}", flush=True)
+                    import traceback; traceback.print_exc()
                 continue
 
             if self.source_mode == "airspy":
@@ -701,6 +778,10 @@ def _get_tuned_frequency_mhz(self):
         ac = getattr(self, 'airspy_client', None)
         freq = ac.center_freq_mhz_actual if ac is not None else 28.180
         return freq, "Airspy HF+", None
+    if self.source_mode == "rtlsdr":
+        rc = getattr(self, 'rtlsdr_client', None)
+        freq = rc.center_freq_mhz_actual if rc is not None else 50.260
+        return freq, "NESDR Smart", None
 
     tuned_freq_mhz = None
     tuned_source = None
@@ -758,6 +839,8 @@ def closeEvent(self, event):
         _stop_radio_source(self)
     if getattr(self, '_airspy_started', False):
         _stop_airspy_source(self)
+    if getattr(self, '_rtlsdr_started', False):
+        _stop_rtlsdr_source(self)
 
     if hasattr(self, 'client_thread') and self.client_thread.isRunning():
         self.client_thread.quit()

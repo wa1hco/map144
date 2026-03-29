@@ -101,6 +101,12 @@ def setup_ui(self):
     self.source_action_group.addAction(self.source_airspy_action)
     file_menu.addAction(self.source_airspy_action)
 
+    self.source_rtlsdr_action = QtWidgets.QAction("NESDR Smart (RTL-SDR)", self)
+    self.source_rtlsdr_action.setCheckable(True)
+    self.source_rtlsdr_action.triggered.connect(self.on_select_source_rtlsdr)
+    self.source_action_group.addAction(self.source_rtlsdr_action)
+    file_menu.addAction(self.source_rtlsdr_action)
+
     self.source_wav_action = QtWidgets.QAction("WAV File", self)
     self.source_wav_action.setCheckable(True)
     self.source_wav_action.triggered.connect(self.on_select_source_wav)
@@ -550,6 +556,15 @@ def on_select_source_airspy(self):
     self.selected_wav_path = None
     self.source_airspy_action.setChecked(True)
     self.statusBar().showMessage("Source: Airspy HF+")
+
+
+def on_select_source_rtlsdr(self):
+    from .runtime import _connect_rtlsdr_client
+    _connect_rtlsdr_client(self)
+    self.source_mode = "rtlsdr"
+    self.selected_wav_path = None
+    self.source_rtlsdr_action.setChecked(True)
+    self.statusBar().showMessage("Source: NESDR Smart (RTL-SDR)")
 
 
 def on_select_source_radio(self):

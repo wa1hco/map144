@@ -348,8 +348,8 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
     self._sbuf[self._sbuf_end:self._sbuf_end + new_n] = cleaned
     self._sbuf_end += new_n
 
-    if self.source_mode in ("wav", "airspy"):
-        # WAV and Airspy HF+ both encode fractional seconds as picoseconds.
+    if self.source_mode in ("wav", "airspy", "rtlsdr"):
+        # WAV, Airspy HF+, and RTL-SDR all encode fractional seconds as picoseconds.
         _pkt_time = float(timestamp_int) + float(timestamp_frac) * 1e-12
     elif timestamp_int > 0:
         # FlexRadio DAXIQ: TSF=1, timestamp_frac = sample count within second.
