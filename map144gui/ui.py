@@ -95,6 +95,12 @@ def setup_ui(self):
     self.source_action_group.addAction(self.source_radio_action)
     file_menu.addAction(self.source_radio_action)
 
+    self.source_airspy_action = QtWidgets.QAction("Airspy HF+", self)
+    self.source_airspy_action.setCheckable(True)
+    self.source_airspy_action.triggered.connect(self.on_select_source_airspy)
+    self.source_action_group.addAction(self.source_airspy_action)
+    file_menu.addAction(self.source_airspy_action)
+
     self.source_wav_action = QtWidgets.QAction("WAV File", self)
     self.source_wav_action.setCheckable(True)
     self.source_wav_action.triggered.connect(self.on_select_source_wav)
@@ -535,6 +541,15 @@ def on_td_span_changed(self, value):
     self.td_span_ms = float(value)
     self.td_span_val_label.setText(f"{value} ms")
     self.td_plot.setTitle(f'IQ Magnitude — {value} ms')
+
+
+def on_select_source_airspy(self):
+    from .runtime import _connect_airspy_client
+    _connect_airspy_client(self)
+    self.source_mode = "airspy"
+    self.selected_wav_path = None
+    self.source_airspy_action.setChecked(True)
+    self.statusBar().showMessage("Source: Airspy HF+")
 
 
 def on_select_source_radio(self):

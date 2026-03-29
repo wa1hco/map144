@@ -145,6 +145,51 @@ def setup_radio_client(self):
     self.client_thread.start()
 
 
+def _connect_airspy_client(self):
+    """Instantiate AirspyHFSource on first use (called from on_select_source_airspy)."""
+    if getattr(self, 'airspy_client', None) is not None:
+        return
+    try:
+        from .airspy_source import AirspyHFSource
+        self.airspy_client = AirspyHFSource(
+            center_freq_mhz=self.center_freq_mhz,
+            target_rate=self.sample_rate,
+        )
+        print("[airspy] AirspyHFSource created", flush=True)
+    except Exception as exc:
+        print(f"[airspy] AirspyHFSource creation failed: {exc}", flush=True)
+        self.airspy_client = None
+
+
+def _start_airspy_source(self) -> bool:
+    if getattr(self, '_airspy_started', False):
+        return True
+    if getattr(self, 'airspy_client', None) is None:
+        return False
+    try:
+        self.airspy_client.start()
+        self._airspy_started = True
+        if hasattr(self, '_jt9_markers'):
+            self._jt9_markers.clear()
+        if hasattr(self, 'decode_panel'):
+            self.decode_panel.clear()
+        return True
+    except Exception as exc:
+        print(f"[airspy] start error: {exc}", flush=True)
+        import traceback; traceback.print_exc()
+        return False
+
+
+def _stop_airspy_source(self):
+    if not getattr(self, '_airspy_started', False):
+        return
+    try:
+        self.airspy_client.stop()
+    except Exception:
+        pass
+    self._airspy_started = False
+
+
 def _connect_radio_client(self):
     """Instantiate FlexDAXIQ on first use (called from on_select_source_radio)."""
     if self.radio_client is not None:
@@ -571,7 +616,37 @@ def run_radio_source(self):
             if self.source_mode == "wav":
                 if self._radio_started:
                     _stop_radio_source(self)
+                if getattr(self, '_airspy_started', False):
+                    _stop_airspy_source(self)
                 _process_wav_source_step(self)
+                continue
+
+            if self.source_mode == "airspy":
+                if self._radio_started:
+                    _stop_radio_source(self)
+                if not _start_airspy_source(self):
+                    time.sleep(1.0)
+                    continue
+                try:
+                    drained = 0
+                    while drained < 64:
+                        try:
+                            packet = self.airspy_client.sample_queue.get_nowait()
+                        except queue.Empty:
+                            if drained == 0:
+                                try:
+                                    packet = self.airspy_client.sample_queue.get(timeout=1.0)
+                                except queue.Empty:
+                                    break
+                            else:
+                                break
+                        # Airspy HF+ outputs ±1.0 float32 — no scaling needed.
+                        chunk = np.asarray(packet.samples, dtype=np.complex64)
+                        self.process_iq_data(chunk, packet.timestamp_int, packet.timestamp_frac)
+                        drained += 1
+                except Exception as exc:
+                    print(f"[airspy] queue/process error: {exc}", flush=True)
+                    import traceback; traceback.print_exc()
                 continue
 
             if not _start_radio_source(self):
@@ -622,6 +697,10 @@ def _get_tuned_frequency_mhz(self):
     """Return current tuned frequency and source label from radio client status."""
     if self.source_mode == "wav":
         return self.center_freq_mhz, "WAV", None
+    if self.source_mode == "airspy":
+        ac = getattr(self, 'airspy_client', None)
+        freq = ac.center_freq_mhz_actual if ac is not None else self.center_freq_mhz
+        return freq, "Airspy HF+", None
 
     tuned_freq_mhz = None
     tuned_source = None
@@ -677,6 +756,8 @@ def closeEvent(self, event):
 
     if hasattr(self, 'radio_client'):
         _stop_radio_source(self)
+    if getattr(self, '_airspy_started', False):
+        _stop_airspy_source(self)
 
     if hasattr(self, 'client_thread') and self.client_thread.isRunning():
         self.client_thread.quit()

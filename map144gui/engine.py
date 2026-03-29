@@ -64,6 +64,8 @@ class Engine:
         self._wav_nonce_loaded = -1
         self._wav_run_start_time = None
         self.radio_client = None
+        self.airspy_client = None
+        self._airspy_started = False
 
         # Overlap-add buffer for waterfall FFT
         _sbuf_cap = self.fft_size * 6

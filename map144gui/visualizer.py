@@ -30,6 +30,7 @@ from .ui import (
     on_td_span_changed,
     on_select_source_radio,
     on_select_source_wav,
+    on_select_source_airspy,
 )
 from .runtime import setup_radio_client, _connect_radio_client, run_radio_source, _get_tuned_frequency_mhz, closeEvent
 from .processing import N_SNR_HIST, CH_DETECT_SIZE, _METRIC_HIST_DEPTH
@@ -49,6 +50,7 @@ class MAP144Visualizer(Engine, QtWidgets.QMainWindow):
     on_td_span_changed  = on_td_span_changed
     on_select_source_radio = on_select_source_radio
     on_select_source_wav = on_select_source_wav
+    on_select_source_airspy = on_select_source_airspy
     setup_radio_client = setup_radio_client
     _connect_radio_client = _connect_radio_client
     run_radio_source = run_radio_source
