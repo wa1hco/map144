@@ -222,6 +222,7 @@ def _start_rtlsdr_source(self) -> bool:
     except Exception as exc:
         print(f"[rtlsdr] start error: {exc}", flush=True)
         import traceback; traceback.print_exc()
+        self.rtlsdr_client = None   # prevent retry spam — user must re-select source
         return False
 
 
