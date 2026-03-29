@@ -177,12 +177,13 @@ def update_displays(self):
                 _marker_by_id[mid]['decoded'] = True
                 _marker_by_id[mid]['message'] = result.get('message')
             # Prepend to decode panel (most recent at top)
-            msg     = result.get('message', '?')
-            radio_khz  = result.get('radio_khz', 0.0)
-            snr     = result.get('jt9_snr')
-            rf_mhz  = radio_khz / 1000.0
-            snr_str = f"{snr:+d} dB" if snr is not None else "  ?"
-            self.decode_panel.insertItem(0, f"{rf_mhz:.3f}  {snr_str:>7}  {msg}")
+            msg       = result.get('message', '?')
+            radio_khz = result.get('radio_khz', 0.0)
+            snr       = result.get('jt9_snr')
+            utc_time  = result.get('utc_time', '')
+            rf_mhz    = radio_khz / 1000.0
+            snr_str   = f"{snr:+d} dB" if snr is not None else "  ?"
+            self.decode_panel.insertItem(0, f"{utc_time}  {rf_mhz:.3f}  {snr_str:>7}  {msg}")
 
     # ── Detection heatmap + markers — skip when panel is hidden ──────────────
     _detect_win = getattr(self, '_detect_win', None)

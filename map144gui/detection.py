@@ -373,8 +373,9 @@ def extract_and_decode(
                         'decoded':   True,
                         'message':   bare_msg,
                         't_sec':     t_sec,
-                        'radio_khz':    radio_khz,
+                        'radio_khz': radio_khz,
                         'jt9_snr':   jt9_snr,
+                        'utc_time':  datetime.now(timezone.utc).strftime('%H:%M:%S'),
                     })
 
                 # Append to decode log for post-run comparison with manifest
