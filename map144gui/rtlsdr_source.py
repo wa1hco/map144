@@ -167,10 +167,12 @@ class NesdrSmartSource:
 
     def __init__(self, center_freq_mhz: float = 50.260,
                  device_index: int = 0,
-                 target_rate: int = _TARGET_RATE):
+                 target_rate: int = _TARGET_RATE,
+                 gain_db: float = 20.0):
         self.center_freq_mhz        = center_freq_mhz
         self.device_index           = device_index
         self.target_rate            = target_rate
+        self.gain_db                = gain_db   # tuner gain; None → hardware AGC
         self.sample_queue           = queue.Queue(maxsize=4000)
         self.center_freq_mhz_actual = center_freq_mhz
 
@@ -204,9 +206,20 @@ class NesdrSmartSource:
         actual_hz = _lib.rtlsdr_get_center_freq(self._dev)
         self.center_freq_mhz_actual = actual_hz / 1e6
 
-        # Auto gain — let the R820T2 AGC manage level
-        _lib.rtlsdr_set_tuner_gain_mode(self._dev, ctypes.c_int(0))
-        _lib.rtlsdr_set_agc_mode(self._dev, ctypes.c_int(1))
+        # Gain: fixed manual gain keeps amplitude comparable to other sources.
+        # Full AGC (gain_db=None) maximises signal into the 8-bit ADC, producing
+        # a noise floor ~100x higher than Airspy HF+ or FlexRadio.
+        if self.gain_db is None:
+            _lib.rtlsdr_set_tuner_gain_mode(self._dev, ctypes.c_int(0))  # auto
+            _lib.rtlsdr_set_agc_mode(self._dev, ctypes.c_int(1))
+            applied_gain = 'auto'
+        else:
+            _lib.rtlsdr_set_tuner_gain_mode(self._dev, ctypes.c_int(1))  # manual
+            _lib.rtlsdr_set_agc_mode(self._dev, ctypes.c_int(0))
+            # rtlsdr_set_tuner_gain takes tenths of a dB
+            _lib.rtlsdr_set_tuner_gain(self._dev,
+                                       ctypes.c_int(int(self.gain_db * 10)))
+            applied_gain = f"{self.gain_db} dB"
 
         _lib.rtlsdr_reset_buffer(self._dev)
 
@@ -220,7 +233,8 @@ class NesdrSmartSource:
         self._thread.start()
 
         print(f"[rtlsdr] started: {self.center_freq_mhz_actual:.4f} MHz  "
-              f"hw={_HW_RATE} Hz  decimation={_DECIMATE}x", flush=True)
+              f"hw={_HW_RATE} Hz  decimation={_DECIMATE}x  gain={applied_gain}",
+              flush=True)
 
     def stop(self):
         self._running = False
