@@ -152,7 +152,7 @@ def _connect_airspy_client(self):
     try:
         from .airspy_source import AirspyHFSource
         self.airspy_client = AirspyHFSource(
-            center_freq_mhz=self.center_freq_mhz,
+            center_freq_mhz=28.180,   # MSK144 10m calling frequency
             target_rate=self.sample_rate,
         )
         print("[airspy] AirspyHFSource created", flush=True)
@@ -699,7 +699,7 @@ def _get_tuned_frequency_mhz(self):
         return self.center_freq_mhz, "WAV", None
     if self.source_mode == "airspy":
         ac = getattr(self, 'airspy_client', None)
-        freq = ac.center_freq_mhz_actual if ac is not None else self.center_freq_mhz
+        freq = ac.center_freq_mhz_actual if ac is not None else 28.180
         return freq, "Airspy HF+", None
 
     tuned_freq_mhz = None
