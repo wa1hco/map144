@@ -12,110 +12,135 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""AirspyHFSource: SoapySDR wrapper for Airspy HF+ IQ streaming.
+"""AirspyHFSource: ctypes wrapper for Airspy HF+ IQ streaming via libairspyhf.
 
 Presents the same ``sample_queue`` / ``start()`` / ``stop()`` interface as
 ``FlexDAXIQ`` so ``run_radio_source`` can drive it without special-casing.
 
+No SoapySDR required — uses libairspyhf.so directly.
+
 Hardware notes
 --------------
-The Airspy HF+ (and HF+ Discovery) outputs complex float32 IQ already
-normalised to ±1.0 — no ADC scale factor is applied at ingress.
+The Airspy HF+ outputs complex float32 IQ already normalised to ±1.0.
 
 Sample rate
 -----------
-The pipeline expects 48 kHz IQ.  ``AirspyHFSource`` first attempts to
-configure the device at 48 kHz directly.  If that rate is not available
-it falls back to 96 kHz and decimates each chunk by 2 using a short FIR
-anti-aliasing filter before enqueueing.
+The pipeline expects 48 kHz IQ.  ``AirspyHFSource`` queries the hardware for
+available rates and prefers 48 kHz.  If only 192/384/768 kHz rates are
+available it takes the lowest available rate ≥ 48 kHz and decimates down to
+48 kHz using a multi-stage FIR anti-alias filter.
 
 Timestamps
 ----------
-SoapyAirspyHF does not provide hardware timestamps.  Each chunk is
-stamped with the wall-clock time of the *first sample* in that chunk,
-derived by tracking the cumulative sample count since ``start()`` was
-called:
+libairspyhf does not provide hardware timestamps.  Each chunk is stamped with
+the wall-clock time of the first sample, derived by tracking cumulative sample
+count since ``start()`` was called:
 
-    t_chunk = t_start + abs_samples_before_chunk / hw_sample_rate
+    t_chunk = t_start + abs_samples_before_chunk / sample_rate
 
-Fractional seconds are encoded as integer picoseconds, matching the WAV
-source convention so that ``processing.py`` can use the same 1e-12 scale
-factor for both sources.
-
-Dependencies
-------------
-    pip install SoapySDR          (or install with GNU Radio)
-    SoapyAirspyHF driver module   (usually ships with Airspy tools)
-
-The SoapySDR driver for Airspy HF+ is provided by the ``SoapyAirspyHF``
-module, typically installed alongside ``airspyhf-host`` tools.
+Fractional seconds are encoded as integer picoseconds, matching the WAV source
+convention so that ``processing.py`` can use the same 1e-12 scale factor.
 """
 
+import ctypes
+import ctypes.util
 import queue
-import threading
 import time
 from typing import Optional
 
 import numpy as np
 
+# ---------------------------------------------------------------------------
+# Load libairspyhf
+# ---------------------------------------------------------------------------
+
+def _load_lib():
+    for name in ('airspyhf', 'libairspyhf.so.0', 'libairspyhf.so.1'):
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            pass
+    # Try absolute paths common on Linux
+    for path in ('/usr/local/lib/libairspyhf.so.0',
+                 '/usr/local/lib/libairspyhf.so',
+                 '/usr/lib/x86_64-linux-gnu/libairspyhf.so.1'):
+        try:
+            return ctypes.CDLL(path)
+        except OSError:
+            pass
+    raise RuntimeError(
+        "libairspyhf not found.  Install with: sudo apt install libairspyhf1"
+    )
+
 try:
-    import SoapySDR
-    from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CF32
-    _SOAPY_AVAILABLE = True
-except ImportError:
-    _SOAPY_AVAILABLE = False
+    _lib = _load_lib()
+    _AIRSPYHF_AVAILABLE = True
+except RuntimeError:
+    _lib = None
+    _AIRSPYHF_AVAILABLE = False
 
-# Chunk size fed to the processing pipeline (samples at the target 48 kHz rate)
-_CHUNK_SAMPLES = 1024   # ≈ 21 ms per chunk — matches FlexRadio DAXIQ packet cadence
+# ---------------------------------------------------------------------------
+# ctypes structures matching airspyhf.h
+# ---------------------------------------------------------------------------
 
-# Target sample rate for the pipeline
-_TARGET_RATE = 48000
-
-# Preferred hardware rates to try, in order.  96 kHz with 2× decimate is the
-# reliable fallback when 48 kHz is not offered by the firmware.
-_PREFERRED_HW_RATES = [48000, 96000]
+class _ComplexFloat(ctypes.Structure):
+    _fields_ = [('re', ctypes.c_float), ('im', ctypes.c_float)]
 
 
-def _decimate2(samples: np.ndarray) -> np.ndarray:
-    """Simple 2× FIR decimate (anti-alias filter + downsample by 2).
+class _Transfer(ctypes.Structure):
+    pass  # forward declaration — fields set after class definition
 
-    Uses a 15-tap half-band FIR (Kaiser-windowed sinc) to attenuate
-    aliases before keeping every other sample.  The filter is pre-computed
-    once at import time.
+
+# airspyhf_sample_block_cb_fn signature
+_CB_FUNC_TYPE = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(_Transfer))
+
+_Transfer._fields_ = [
+    ('device',        ctypes.c_void_p),
+    ('ctx',           ctypes.c_void_p),
+    ('samples',       ctypes.POINTER(_ComplexFloat)),
+    ('sample_count',  ctypes.c_int),
+    ('dropped_samples', ctypes.c_uint64),
+]
+
+# ---------------------------------------------------------------------------
+# Decimate-to-48kHz helper (multi-stage if needed)
+# ---------------------------------------------------------------------------
+
+def _build_decimator(factor: int):
+    """Return a stateful callable that decimates complex64 by *factor*.
+
+    Uses cascaded half-band FIR stages (factor must be a power of 2).
+    Each stage anti-aliases with a 15-tap Kaiser-windowed sinc at 0.45 × Nyquist
+    then keeps every other sample.
     """
-    return _DECIMATE2_FILTER(samples)
-
-
-def _build_decimate2_filter():
-    """Return a callable that applies a 2× anti-alias FIR + downsample."""
     from scipy.signal import firwin, lfilter
-    taps = firwin(15, 0.45).astype(np.float32)  # cutoff 0.45 × Nyquist
-    zi   = [np.zeros(len(taps) - 1)]             # mutable state for lfilter
+
+    assert factor > 0 and (factor & (factor - 1)) == 0, "factor must be power of 2"
+    n_stages = factor.bit_length() - 1  # log2(factor)
+
+    taps = firwin(15, 0.45).astype(np.float32)
+    # One zi per stage per channel (real / imag share a filter)
+    zi_r = [np.zeros(len(taps) - 1) for _ in range(n_stages)]
+    zi_i = [np.zeros(len(taps) - 1) for _ in range(n_stages)]
 
     def _apply(samples: np.ndarray) -> np.ndarray:
-        # Apply to I and Q independently so we can keep complex dtype
-        real = samples.real.astype(np.float32)
-        imag = samples.imag.astype(np.float32)
-        filtered_r, zi[0] = _lfilter_r(taps, 1.0, real, zi=zi[0])
-        filtered_i = lfilter(taps, 1.0, imag)
-        combined   = (filtered_r[::2] + 1j * filtered_i[::2]).astype(np.complex64)
-        return combined
+        r = samples.real.astype(np.float32)
+        i = samples.imag.astype(np.float32)
+        for s in range(n_stages):
+            r, zi_r[s] = lfilter(taps, 1.0, r, zi=zi_r[s])
+            i, zi_i[s] = lfilter(taps, 1.0, i, zi=zi_i[s])
+            r = r[::2]
+            i = i[::2]
+        return (r + 1j * i).astype(np.complex64)
 
-    from scipy.signal import lfilter as _lf
-
-    def _lfilter_r(b, a, x, zi):
-        y, zo = _lf(b, a, x, zi=zi)
-        return y, zo
-
-    _apply.__name__ = '_decimate2_apply'
     return _apply
 
 
-_DECIMATE2_FILTER = _build_decimate2_filter()
-
+# ---------------------------------------------------------------------------
+# Packet compatible with VitaPacket interface expected by runtime.py
+# ---------------------------------------------------------------------------
 
 class _AirspyPacket:
-    """Minimal packet compatible with the VitaPacket interface expected by runtime.py."""
     __slots__ = ('samples', 'timestamp_int', 'timestamp_frac')
 
     def __init__(self, samples, timestamp_int, timestamp_frac):
@@ -124,8 +149,15 @@ class _AirspyPacket:
         self.timestamp_frac = timestamp_frac
 
 
+# ---------------------------------------------------------------------------
+# Main class
+# ---------------------------------------------------------------------------
+
+_TARGET_RATE = 48000
+
+
 class AirspyHFSource:
-    """SoapySDR wrapper for Airspy HF+ that mimics the FlexDAXIQ queue interface.
+    """libairspyhf ctypes wrapper that mimics the FlexDAXIQ queue interface.
 
     Usage::
 
@@ -137,125 +169,138 @@ class AirspyHFSource:
         src.stop()
 
     ``pkt.samples`` is complex64 in ±1.0 scale.  ``pkt.timestamp_int`` and
-    ``pkt.timestamp_frac`` use the same picosecond encoding as the WAV source:
-    ``t = timestamp_int + timestamp_frac * 1e-12``.
+    ``pkt.timestamp_frac`` use picosecond encoding:
+        t = timestamp_int + timestamp_frac * 1e-12
     """
 
     def __init__(self, center_freq_mhz: float = 50.260, target_rate: int = _TARGET_RATE):
-        self.center_freq_mhz = center_freq_mhz
-        self.target_rate     = target_rate
-        self.sample_queue    = queue.Queue(maxsize=4000)
-
-        self._sdr       = None
-        self._stream    = None
-        self._thread    = None
-        self._running   = False
-        self._hw_rate   = None     # actual hardware sample rate
-        self._decimate  = False    # True when hw_rate == 2 × target_rate
-
-        # Frequency info exposed for _get_tuned_frequency_mhz
+        self.center_freq_mhz        = center_freq_mhz
+        self.target_rate            = target_rate
+        self.sample_queue           = queue.Queue(maxsize=4000)
         self.center_freq_mhz_actual = center_freq_mhz
 
-    # ── Public API ────────────────────────────────────────────────────────────
+        self._dev       = ctypes.c_void_p(None)
+        self._running   = False
+        self._hw_rate   = target_rate
+        self._decimator = None   # callable or None
+        self._cb_ref    = None   # keep callback alive (prevent GC)
+
+        # Timestamp tracking — set in start(), updated in callback
+        self._t_start   = 0.0
+        self._abs_samps = 0     # cumulative hw samples received
+
+    # ── Public API ────────────────────────────────────────────────────────
 
     def start(self):
-        if not _SOAPY_AVAILABLE:
-            raise RuntimeError(
-                "SoapySDR Python module not found.  "
-                "Install it with your package manager or 'pip install SoapySDR', "
-                "and ensure the SoapyAirspyHF driver module is on the SoapySDR path."
-            )
+        if not _AIRSPYHF_AVAILABLE:
+            raise RuntimeError("libairspyhf not available — install libairspyhf1")
 
-        self._sdr = SoapySDR.Device({'driver': 'airspyhf'})
+        # Open device
+        ret = _lib.airspyhf_open(ctypes.byref(self._dev))
+        if ret != 0:
+            raise RuntimeError(f"airspyhf_open failed: {ret}")
 
-        # Choose the best available hardware sample rate
-        available = [int(r) for r in self._sdr.listSampleRates(SOAPY_SDR_RX, 0)]
+        # Query available sample rates — two-step API:
+        #   step 1: len=0  → buffer[0] receives the count of available rates
+        #   step 2: len=N  → buffer filled with N rate values
+        cnt_buf = (ctypes.c_uint32 * 1)()
+        _lib.airspyhf_get_samplerates(self._dev, cnt_buf, 0)
+        n_rates = cnt_buf[0]
+        if n_rates > 0:
+            rate_buf = (ctypes.c_uint32 * n_rates)()
+            _lib.airspyhf_get_samplerates(self._dev, rate_buf, n_rates)
+            available = sorted(rate_buf[i] for i in range(n_rates))
+        else:
+            available = [768000, 384000, 192000, 96000, 48000]  # safe fallback
+
+        # Pick the lowest available rate ≥ target (prefer exact match)
         hw_rate = None
-        for preferred in _PREFERRED_HW_RATES:
-            if preferred in available:
-                hw_rate = preferred
+        for r in sorted(available):
+            if r >= self.target_rate:
+                hw_rate = r
                 break
         if hw_rate is None:
-            # Fall back to lowest available rate ≥ target; decimate later if needed
-            above = sorted(r for r in available if r >= self.target_rate)
-            hw_rate = above[0] if above else max(available)
+            hw_rate = max(available)
 
-        self._hw_rate  = hw_rate
-        self._decimate = (hw_rate == self.target_rate * 2)
+        # Build decimator if needed
+        factor = hw_rate // self.target_rate
+        if factor > 1:
+            self._decimator = _build_decimator(factor)
+        else:
+            self._decimator = None
+        self._hw_rate = hw_rate
 
-        self._sdr.setSampleRate(SOAPY_SDR_RX, 0, float(hw_rate))
-        self._sdr.setFrequency(SOAPY_SDR_RX, 0, self.center_freq_mhz * 1e6)
-        self.center_freq_mhz_actual = self._sdr.getFrequency(SOAPY_SDR_RX, 0) / 1e6
+        ret = _lib.airspyhf_set_samplerate(self._dev, ctypes.c_uint32(hw_rate))
+        if ret != 0:
+            raise RuntimeError(f"airspyhf_set_samplerate({hw_rate}) failed: {ret}")
 
-        # Read-back the actual rate (may differ slightly from requested)
-        self._hw_rate = int(self._sdr.getSampleRate(SOAPY_SDR_RX, 0))
+        ret = _lib.airspyhf_set_freq_double(
+            self._dev, ctypes.c_double(self.center_freq_mhz * 1e6))
+        if ret != 0:
+            raise RuntimeError(f"airspyhf_set_freq_double failed: {ret}")
 
-        self._stream  = self._sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
-        self._sdr.activateStream(self._stream)
+        # Enable built-in IQ correction / IF shift
+        _lib.airspyhf_set_lib_dsp(self._dev, ctypes.c_uint8(1))
 
-        self._running = True
-        self._thread  = threading.Thread(target=self._recv_loop, daemon=True,
-                                         name='airspyhf-recv')
-        self._thread.start()
+        self.center_freq_mhz_actual = self.center_freq_mhz  # no readback API
+
+        self._t_start   = time.time()
+        self._abs_samps = 0
+        self._running   = True
+
+        # Keep a reference so the GC doesn't collect the C callback
+        self._cb_ref = _CB_FUNC_TYPE(self._callback)
+        ret = _lib.airspyhf_start(self._dev, self._cb_ref, None)
+        if ret != 0:
+            self._running = False
+            raise RuntimeError(f"airspyhf_start failed: {ret}")
+
         print(f"[airspy] started: {self.center_freq_mhz_actual:.4f} MHz  "
-              f"hw={self._hw_rate} Hz  decimate={self._decimate}", flush=True)
+              f"hw={hw_rate} Hz  decimation={factor}x", flush=True)
 
     def stop(self):
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
-            self._thread = None
-        if self._stream is not None and self._sdr is not None:
+        if self._dev:
             try:
-                self._sdr.deactivateStream(self._stream)
-                self._sdr.closeStream(self._stream)
+                _lib.airspyhf_stop(self._dev)
+                _lib.airspyhf_close(self._dev)
             except Exception:
                 pass
-            self._stream = None
-        if self._sdr is not None:
-            try:
-                self._sdr = None   # SoapySDR Device is closed on GC
-            except Exception:
-                pass
+            self._dev = ctypes.c_void_p(None)
+        self._cb_ref = None
 
-    # ── Internal receive loop ─────────────────────────────────────────────────
+    # ── Internal callback (called from libairspyhf thread) ────────────────
 
-    def _recv_loop(self):
-        """Read IQ from the hardware and put _AirspyPacket objects onto sample_queue."""
-        hw_rate    = self._hw_rate
-        chunk_hw   = _CHUNK_SAMPLES * (2 if self._decimate else 1)
-        buff       = np.zeros(chunk_hw, dtype=np.complex64)
-        t_start    = time.time()
-        abs_samps  = 0   # cumulative samples at hw_rate
+    def _callback(self, transfer_ptr) -> int:
+        if not self._running:
+            return 0
 
-        while self._running:
-            sr = self._sdr.readStream(self._stream, [buff], chunk_hw,
-                                      timeoutUs=1_000_000)
-            if sr.ret <= 0:
-                # Timeout or error — readStream returns 0 on timeout
-                if sr.ret < 0:
-                    print(f"[airspy] readStream error {sr.ret}", flush=True)
-                continue
+        transfer = transfer_ptr.contents
+        n        = transfer.sample_count
+        if n <= 0:
+            return 0
 
-            n_read = sr.ret
-            chunk  = buff[:n_read].copy()
+        # Compute timestamp of first sample in this chunk
+        t_chunk     = self._t_start + self._abs_samps / self._hw_rate
+        self._abs_samps += n
 
-            # Compute wall-clock time of the first sample in this chunk.
-            # We track abs_samps rather than calling time.time() each chunk
-            # to avoid jitter that would cause gaps in the spectrogram.
-            t_chunk = t_start + abs_samps / hw_rate
-            abs_samps += n_read
+        # Copy samples from C buffer to numpy array
+        raw = np.ctypeslib.as_array(
+            ctypes.cast(transfer.samples, ctypes.POINTER(ctypes.c_float)),
+            shape=(n * 2,)
+        ).copy()
+        chunk = raw.view(np.complex64)
 
-            if self._decimate and n_read >= 2:
-                chunk = _decimate2(chunk)
+        if self._decimator is not None:
+            chunk = self._decimator(chunk)
 
-            # Encode as picoseconds (same convention as WAV source so
-            # processing.py uses the same 1e-12 scale path).
-            ts_int  = int(t_chunk)
-            ts_frac = int((t_chunk - ts_int) * 1e12)
+        ts_int  = int(t_chunk)
+        ts_frac = int((t_chunk - ts_int) * 1e12)
 
-            pkt = _AirspyPacket(chunk.astype(np.complex64), ts_int, ts_frac)
-            try:
-                self.sample_queue.put_nowait(pkt)
-            except queue.Full:
-                pass   # Drop and continue — same behaviour as VITAReceiver
+        pkt = _AirspyPacket(chunk, ts_int, ts_frac)
+        try:
+            self.sample_queue.put_nowait(pkt)
+        except queue.Full:
+            pass  # drop — same behaviour as VITAReceiver
+
+        return 0
