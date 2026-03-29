@@ -206,7 +206,7 @@ def setup_ui(self):
     # ── Central widget: callsign decode list ──────────────────────────────────
     _mono9 = _QtGui.QFont("Monospace", 9)
 
-    _decode_header = QtWidgets.QLabel("Freq        SNR   Message")
+    _decode_header = QtWidgets.QLabel("UTC       Freq        SNR   Message")
     _decode_header.setFont(_mono9)
     _decode_header.setStyleSheet(
         "QLabel { background: #2a2a2a; color: #aaaaaa; "
