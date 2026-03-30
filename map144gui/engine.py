@@ -76,7 +76,9 @@ class Engine:
         self._sbuf_t0  = 0.0   # wall-clock time of _sbuf[0], anchored to VITA timestamps
 
         # Noise blanker state
-        self._nb_env = None
+        self._nb_env      = None   # running mean magnitude (display)
+        self._nb_floor    = None   # noise floor derived from per-bin averages (display)
+        self._nb_spec_avg = None   # per-bin running average power, shape (NB_FFT_SIZE,)
         self._nb_blanked_count = 0
         self._nb_total_count = 0
 

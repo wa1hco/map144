@@ -473,9 +473,10 @@ def _update_iq_nb_window(self):
         x_axis  = np.linspace(0.0, span_ms, span_n, endpoint=False)
         self.td_plot.setXRange(0.0, span_ms, padding=0)
         self.td_curve.setData(x_axis, display)
-        if self._nb_env is not None:
+        nb_floor = getattr(self, '_nb_floor', None)
+        if nb_floor is not None:
             nb_k = float(getattr(self, 'nb_factor', 6))
-            self.td_thresh_line.setValue(nb_k * float(self._nb_env))
+            self.td_thresh_line.setValue(nb_k * float(nb_floor))
 
     if hasattr(self, '_nb_count_val'):
         _nb_t = getattr(self, '_nb_total_count', 0)

@@ -16,9 +16,14 @@
 
 Pipeline (in order of execution)
 ---------------------------------
-0. **Time-domain noise blanker** — samples whose amplitude exceeds
-   NB_FACTOR × running RMS envelope are zeroed.  The envelope tracker uses
-   only unblanked samples so impulses cannot inflate the threshold.
+0. **Wideband FFT noise blanker (Linrad-style)** — input is divided into
+   NB_FFT_SIZE blocks.  Each block is FFT'd; the per-bin power is normalised
+   by a per-bin running average.  If more than NB_BROADBAND_FRAC of bins
+   have normalised power above nb_factor² the block is a broadband impulse
+   and is zeroed (with Hann-taper fade at the edges).  Narrowband signals
+   (meteor bursts, beacons) elevate only a few bins and are not blanked.
+   Per-bin averages are updated only from non-blanked blocks, preventing
+   impulses from inflating the threshold.
 
 1. **Ring buffer** — cleaned IQ samples are written into a 5-second circular
    buffer.  extract_and_decode reads this buffer when a signal is confirmed.
@@ -73,7 +78,10 @@ from .detection import extract_and_decode
 DETECT_THRESH_DB   = 3.5        # dB above 25th-percentile noise baseline
 DETECT_MERGE_GAP_S = 1.0        # suppress re-trigger within this window (s)
 CH_DETECT_SIZE     = 512        # samples at 12 kHz per detection FFT block
-NB_FACTOR          = 6.0        # time-domain blanker: zero samples > NB_FACTOR × running RMS envelope
+NB_FACTOR          = 6.0        # blanker amplitude threshold (hot bin power > NB_FACTOR² × avg)
+NB_FFT_SIZE        = 256        # detection block size: 5.3 ms at 48 kHz
+NB_BROADBAND_FRAC  = 0.30       # fraction of hot bins required to declare broadband impulse
+NB_SPEC_AVG_TC     = 2.0        # per-bin spectrum averaging time constant (seconds)
 _NB_TAPER_N        = 24         # Hann taper half-width in samples (24 → 0.5 ms at 48 kHz)
 _EDGE_CH_SKIP      = 4          # skip channels within N of Nyquist (ch 24) — DAXIQ filter rolloff zone
 _DC_CH_SKIP        = 3          # skip channels within N of DC (ch 0) — LO leakage / DC offset zone
@@ -121,40 +129,79 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
 
     raw = iq_samples.astype(np.complex64)
 
-    # ── 0. Time-domain noise blanker ─────────────────────────────────────────
-    # Zero samples whose amplitude exceeds nb_factor × running RMS envelope.
-    # The envelope is updated only from unblanked samples so large impulses
-    # cannot raise the threshold and hide themselves.
-    nb_factor    = float(getattr(self, 'nb_factor', NB_FACTOR))
-    mag          = np.abs(raw).astype(np.float32)
+    # ── 0. Wideband FFT noise blanker (Linrad-style) ─────────────────────────
+    # Divide input into NB_FFT_SIZE blocks.  For each block, FFT and compute
+    # per-bin power normalised by a per-bin running average.  If the fraction
+    # of bins whose normalised power exceeds nb_factor² is greater than
+    # NB_BROADBAND_FRAC, the block is a broadband impulse and is blanked.
+    #
+    # A narrowband signal (meteor burst ≈ 2 kHz, beacon ≈ 500 Hz) elevates
+    # only a few of the NB_FFT_SIZE bins — well below NB_BROADBAND_FRAC.
+    # A broadband impulse (lightning, power-line click) elevates nearly all
+    # bins simultaneously — well above NB_BROADBAND_FRAC.
+    # The per-bin average is only updated from non-blanked blocks, so impulses
+    # cannot inflate the threshold.
+    nb_factor        = float(getattr(self, 'nb_factor', NB_FACTOR))
+    metric_threshold = nb_factor * nb_factor   # amplitude ratio → power ratio
+    mag              = np.abs(raw).astype(np.float32)
 
-    if self._nb_env is None:
-        self._nb_env = float(np.median(mag)) if len(mag) > 0 else 1e-6
+    # Initialise per-bin averages from the first available block.
+    if self._nb_spec_avg is None:
+        first = raw[:NB_FFT_SIZE] if len(raw) >= NB_FFT_SIZE else raw
+        X0 = np.fft.fft(first, n=NB_FFT_SIZE)
+        self._nb_spec_avg = np.maximum(np.abs(X0).astype(np.float64) ** 2, 1e-30)
+        rms = float(np.sqrt(np.mean(self._nb_spec_avg) / NB_FFT_SIZE))
+        self._nb_env   = max(rms, 1e-9)
+        self._nb_floor = self._nb_env
 
-    threshold    = nb_factor * self._nb_env
-    not_blanked  = mag <= threshold
-    blanked_mask = ~not_blanked
+    n_blocks = len(raw) // NB_FFT_SIZE
+    alpha    = 1.0 - np.exp(-NB_FFT_SIZE / (NB_SPEC_AVG_TC * self.sample_rate))
 
+    # Per-sample blanking mask: 1.0 = blank, 0.0 = keep.
+    blank_mask = np.zeros(len(raw), dtype=np.float32)
     self._nb_total_count += len(raw)
-    if np.any(blanked_mask):
-        # Soft blanking: convolve the binary mask with a Hann kernel so each
-        # blanked region fades in/out smoothly rather than creating a rectangular
-        # hole whose sinc sidelobes spread energy into the edge channels.
+
+    for i in range(n_blocks):
+        s = i * NB_FFT_SIZE
+        e = s + NB_FFT_SIZE
+        X = np.fft.fft(raw[s:e])
+        P = np.abs(X).astype(np.float64) ** 2
+
+        # Normalise each bin by its running average and count hot bins.
+        n_hot       = int(np.sum(P > metric_threshold * self._nb_spec_avg))
+        is_broadband = n_hot > NB_BROADBAND_FRAC * NB_FFT_SIZE
+
+        if is_broadband:
+            blank_mask[s:e] = 1.0
+            self._nb_blanked_count += NB_FFT_SIZE
+        else:
+            # Update per-bin averages only from clean blocks.
+            self._nb_spec_avg = (1.0 - alpha) * self._nb_spec_avg + alpha * P
+
+    # Partial block at end of chunk passes through unchanged (no blanking decision).
+
+    # Soft-blank: Hann-taper the edges of each blanked region so the abrupt
+    # transition to zero does not create rectangular-hole sinc sidelobes.
+    if np.any(blank_mask):
         soft_blank = np.minimum(
-            np.convolve(blanked_mask.astype(np.float32), _NB_TAPER_KERNEL, mode='same'),
+            np.convolve(blank_mask, _NB_TAPER_KERNEL, mode='same'),
             1.0,
         )
         cleaned = (raw * (1.0 - soft_blank)).astype(np.complex64)
-        self._nb_blanked_count += int(np.sum(blanked_mask))
     else:
         cleaned = raw.copy()
 
-    # Update envelope from unblanked samples (2 s EMA time constant)
+    # Update display estimates from per-bin averages.
+    # _nb_floor: noise floor amplitude implied by the median per-bin power.
+    # _nb_env:   running mean of non-blanked sample amplitudes (signal level).
+    rms = float(np.sqrt(np.mean(self._nb_spec_avg) / NB_FFT_SIZE))
+    self._nb_floor = max(rms, 1e-9)
+    not_blanked = blank_mask == 0.0
     if np.any(not_blanked):
         n_ok      = int(np.sum(not_blanked))
-        alpha     = 1.0 - np.exp(-n_ok / (2.0 * self.sample_rate))
+        alpha_env = 1.0 - np.exp(-n_ok / (2.0 * self.sample_rate))
         chunk_env = float(np.mean(mag[not_blanked]))
-        self._nb_env = (1.0 - alpha) * self._nb_env + alpha * chunk_env
+        self._nb_env = (1.0 - alpha_env) * self._nb_env + alpha_env * chunk_env
 
 
     chunk_len = len(cleaned)
