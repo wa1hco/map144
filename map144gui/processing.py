@@ -178,6 +178,10 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
             # Update per-bin averages only from clean blocks.
             self._nb_spec_avg = (1.0 - alpha) * self._nb_spec_avg + alpha * P
 
+        # Keep last block for the spectrum display.
+        self._nb_last_P   = P
+        self._nb_last_hot = n_hot
+
     # Partial block at end of chunk passes through unchanged (no blanking decision).
 
     # Soft-blank: Hann-taper the edges of each blanked region so the abrupt

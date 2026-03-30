@@ -177,13 +177,51 @@ def setup_iq_nb_window(self, view_action):
     td_span_row.addWidget(self.td_span_slider, stretch=1)
     layout.addLayout(td_span_row)
 
-    # Noise blanker group
+    # Blanker spectrum plot — shows per-bin noise floor and current block
+    from .processing import NB_FFT_SIZE
+    _nb_freqs = np.fft.fftshift(np.fft.fftfreq(NB_FFT_SIZE, 1.0 / 48000)) / 1000.0
+    _nb_zeros = np.full(NB_FFT_SIZE, -120.0, dtype=np.float32)
+
+    self.nb_spec_plot = pg.PlotWidget()
+    self.nb_spec_plot.setBackground('#111111')
+    self.nb_spec_plot.setLabel('bottom', 'Frequency', units='kHz')
+    self.nb_spec_plot.setLabel('left', '')
+    self.nb_spec_plot.setTitle('Blanker Spectrum — floor / block')
+    self.nb_spec_plot.getAxis('left').setWidth(45)
+    self.nb_spec_plot.setMinimumHeight(120)
+    self.nb_spec_plot.setMaximumHeight(160)
+    self.nb_spec_plot.setXRange(_nb_freqs[0], _nb_freqs[-1], padding=0)
+    self.nb_spec_plot.setYRange(-120.0, 0.0, padding=0)
+    self.nb_spec_plot.getViewBox().disableAutoRange()
+
+    # Green: slowly-adapting per-bin noise floor
+    self.nb_floor_curve = pg.PlotCurveItem(
+        _nb_freqs, _nb_zeros.copy(),
+        pen=pg.mkPen('#66bb6a', width=1),
+    )
+    self.nb_spec_plot.addItem(self.nb_floor_curve)
+    # Cyan: most recent block spectrum
+    self.nb_block_curve = pg.PlotCurveItem(
+        _nb_freqs, _nb_zeros.copy(),
+        pen=pg.mkPen('#4fc3f7', width=1, style=QtCore.Qt.DotLine),
+    )
+    self.nb_spec_plot.addItem(self.nb_block_curve)
+    # Red dashed: threshold = floor + 20*log10(nb_factor) dB
+    self.nb_thresh_curve = pg.PlotCurveItem(
+        _nb_freqs, _nb_zeros.copy(),
+        pen=pg.mkPen('#ff7043', width=1, style=QtCore.Qt.DashLine),
+    )
+    self.nb_spec_plot.addItem(self.nb_thresh_curve)
+
+    layout.addWidget(self.nb_spec_plot)
+
+    # Noise blanker controls
     nb_group = QtWidgets.QGroupBox("Spectral Noise Blanker")
     nb_vbox  = QtWidgets.QVBoxLayout(nb_group)
     nb_vbox.setSpacing(3)
 
     nb_factor_row = QtWidgets.QHBoxLayout()
-    nb_factor_row.addWidget(QtWidgets.QLabel("K (× noise floor):"))
+    nb_factor_row.addWidget(QtWidgets.QLabel("K (amplitude, K²=power ratio):"))
     self.nb_factor_label = QtWidgets.QLabel(f"{self.nb_factor:.1f}")
     self.nb_factor_label.setStyleSheet(
         "QLabel { color: #c8e6c9; font-family: monospace; min-width: 32px; }"
@@ -198,15 +236,22 @@ def setup_iq_nb_window(self, view_action):
     nb_factor_row.addWidget(nb_sl, stretch=1)
     nb_vbox.addLayout(nb_factor_row)
 
-    nb_event_row = QtWidgets.QHBoxLayout()
-    nb_event_row.addWidget(QtWidgets.QLabel("Blanked blocks:"))
-    self._nb_count_val = QtWidgets.QLabel("0")
+    nb_status_row = QtWidgets.QHBoxLayout()
+    nb_status_row.addWidget(QtWidgets.QLabel("Blanked:"))
+    self._nb_count_val = QtWidgets.QLabel("0.00%")
     self._nb_count_val.setStyleSheet(
-        "QLabel { color: #c76000; font-family: monospace; }"
+        "QLabel { color: #c76000; font-family: monospace; min-width: 52px; }"
     )
-    nb_event_row.addWidget(self._nb_count_val)
-    nb_event_row.addStretch()
-    nb_vbox.addLayout(nb_event_row)
+    nb_status_row.addWidget(self._nb_count_val)
+    nb_status_row.addSpacing(12)
+    nb_status_row.addWidget(QtWidgets.QLabel("Hot bins:"))
+    self._nb_hot_val = QtWidgets.QLabel(f"0/{NB_FFT_SIZE}")
+    self._nb_hot_val.setStyleSheet(
+        "QLabel { color: #ffb74d; font-family: monospace; min-width: 52px; }"
+    )
+    nb_status_row.addWidget(self._nb_hot_val)
+    nb_status_row.addStretch()
+    nb_vbox.addLayout(nb_status_row)
 
     layout.addWidget(nb_group)
     layout.addStretch()
@@ -456,7 +501,9 @@ def update_source_windows(self):
 
 
 def _update_iq_nb_window(self):
-    # IQ plot update at 5 Hz
+    from .processing import NB_FFT_SIZE
+
+    # IQ magnitude plot — update at 5 Hz (every other 10 Hz tick)
     if hasattr(self, 'td_curve') and self._noise_floor_ctr % 2 == 0:
         buf = self._td_mag_buf
         pos = self._td_mag_pos
@@ -478,11 +525,40 @@ def _update_iq_nb_window(self):
             nb_k = float(getattr(self, 'nb_factor', 6))
             self.td_thresh_line.setValue(nb_k * float(nb_floor))
 
+    # Blanker spectrum — floor, current block, threshold curves
+    if hasattr(self, 'nb_floor_curve'):
+        spec_avg = getattr(self, '_nb_spec_avg', None)
+        last_P   = getattr(self, '_nb_last_P',   None)
+        nb_k     = float(getattr(self, 'nb_factor', 6.0))
+        ref      = 20.0 * np.log10(NB_FFT_SIZE)   # 0 dBFS reference for full-scale complex tone
+
+        _freqs = np.fft.fftshift(np.fft.fftfreq(NB_FFT_SIZE, 1.0 / 48000)) / 1000.0
+
+        if spec_avg is not None:
+            floor_db = np.fft.fftshift(
+                10.0 * np.log10(np.maximum(spec_avg, 1e-30)) - ref
+            ).astype(np.float32)
+            self.nb_floor_curve.setData(_freqs, floor_db)
+            # Threshold = floor + 20*log10(K) dB  (since metric threshold = K²)
+            thresh_db = floor_db + 20.0 * np.log10(max(nb_k, 1.0))
+            self.nb_thresh_curve.setData(_freqs, thresh_db)
+
+        if last_P is not None:
+            block_db = np.fft.fftshift(
+                10.0 * np.log10(np.maximum(last_P, 1e-30)) - ref
+            ).astype(np.float32)
+            self.nb_block_curve.setData(_freqs, block_db)
+
+    # Status row
     if hasattr(self, '_nb_count_val'):
         _nb_t = getattr(self, '_nb_total_count', 0)
         _nb_b = getattr(self, '_nb_blanked_count', 0)
         _nb_pct = (100.0 * _nb_b / _nb_t) if _nb_t > 0 else 0.0
         self._nb_count_val.setText(f"{_nb_pct:.2f}%")
+
+    if hasattr(self, '_nb_hot_val'):
+        hot = getattr(self, '_nb_last_hot', 0)
+        self._nb_hot_val.setText(f"{hot}/{NB_FFT_SIZE}")
 
 
 def _update_flex_window(self, sig_str, noise_str, rate_str, drops_str):

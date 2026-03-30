@@ -79,6 +79,8 @@ class Engine:
         self._nb_env      = None   # running mean magnitude (display)
         self._nb_floor    = None   # noise floor derived from per-bin averages (display)
         self._nb_spec_avg = None   # per-bin running average power, shape (NB_FFT_SIZE,)
+        self._nb_last_P   = None   # per-bin power of the most recent block (display)
+        self._nb_last_hot = 0      # hot-bin count of the most recent block (display)
         self._nb_blanked_count = 0
         self._nb_total_count = 0
 
