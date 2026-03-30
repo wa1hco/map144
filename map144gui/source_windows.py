@@ -525,8 +525,11 @@ def _update_iq_nb_window(self):
             nb_k = float(getattr(self, 'nb_factor', 6))
             self.td_thresh_line.setValue(nb_k * float(nb_floor))
 
-    # Blanker spectrum — floor, current block, threshold curves
-    if hasattr(self, 'nb_floor_curve'):
+    # Blanker spectrum — floor, current block, threshold curves.
+    # Gate to 2 Hz: the floor and threshold are slowly-adapting averages that
+    # do not benefit from more frequent redraws, and these three paint() calls
+    # showed up as 32% of wall time in the profiler during noise pulse events.
+    if hasattr(self, 'nb_floor_curve') and self._noise_floor_ctr % 5 == 0:
         spec_avg = getattr(self, '_nb_spec_avg', None)
         last_P   = getattr(self, '_nb_last_P',   None)
         nb_k     = float(getattr(self, 'nb_factor', 6.0))

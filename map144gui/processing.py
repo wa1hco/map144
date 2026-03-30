@@ -92,6 +92,12 @@ _METRIC_HIST_DEPTH = 300        # frames of rolling linear-peak history for perc
                                  # so 300 frames ≈ 6.4 s.  As long as pings occupy < 25 % of
                                  # that window the 25th percentile stays at the noise floor,
                                  # mirroring the xmed normalisation in WSJT-X msk144spd.f90.
+_METRIC_HIST_STRIDE = 3         # subsample history for partition — evaluate every 3rd frame
+                                 # (63 ms effective resolution) at 1/3 the compute cost.
+_COINCIDENCE_MAX_CH = 8         # max channels that may trigger simultaneously.
+                                 # MSK144 signal ≈ 2 kHz wide → triggers ≤ 3 adjacent channels.
+                                 # If ≥ _COINCIDENCE_MAX_CH channels fire in one hop it is
+                                 # broadband noise that slipped past the blanker — suppress all.
 _CH_DETECT_HOP     = CH_DETECT_SIZE // 2   # 50 % overlap hop
 # Enough slots to cover one full 15-second window at the channeliser hop rate
 N_SNR_HIST = int(15 * CH_SAMPLE_RATE / _CH_DETECT_HOP) + 2   # ≈ 705
@@ -279,8 +285,12 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         hist  = (self._metric_hist_buf[:self._metric_hist_cnt]
                  if self._metric_hist_cnt < _METRIC_HIST_DEPTH
                  else self._metric_hist_buf)
-        k     = max(0, int(len(hist) * 0.25))                        # 25th-pct index
-        pct25 = np.maximum(np.partition(hist, k, axis=0)[k], 1e-30)  # (48,) O(N) vs O(N log N)
+        # Subsample history by _METRIC_HIST_STRIDE before partition — reduces the
+        # (300, 48) array to (100, 48) for a 3× speedup with negligible accuracy loss
+        # at the 25th-percentile noise baseline (21 ms → 63 ms effective resolution).
+        hist_s = hist[::_METRIC_HIST_STRIDE]
+        k      = max(0, int(len(hist_s) * 0.25))                       # 25th-pct index
+        pct25  = np.maximum(np.partition(hist_s, k, axis=0)[k], 1e-30) # (48,) O(N) vs O(N log N)
 
         pair_metric = np.maximum(
             10.0 * np.log10(np.maximum(raw_lin / pct25, 1e-30)), 0.0
@@ -311,7 +321,23 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
             1, int(DETECT_MERGE_GAP_S * CH_SAMPLE_RATE / _CH_DETECT_HOP)
         )
 
-        for ch_k in np.where(pair_metric > DETECT_THRESH_DB)[0]:
+        _triggered = np.where(pair_metric > DETECT_THRESH_DB)[0]
+
+        # Coincidence gate — if too many channels fire simultaneously it is
+        # broadband noise that slipped past the FFT blanker (e.g. a semi-broadband
+        # impulse that elevated fewer than NB_BROADBAND_FRAC bins per block but
+        # still spread energy across the full channelised band).
+        # A real MSK144 signal is ≈2 kHz wide and triggers at most 3 adjacent
+        # channels; anything above _COINCIDENCE_MAX_CH is suppressed entirely.
+        if len(_triggered) >= _COINCIDENCE_MAX_CH:
+            for _ck in _triggered:
+                self._detect_cooldowns[_ck] = cooldown_hops
+            self._ch_buf[:, :len(self._ch_buf[0])] = 0  # flush buffer — samples are contaminated
+            self._ch_buf_end = 0
+            # Slide-left is handled at the bottom of the while loop; break out now.
+            break
+
+        for ch_k in _triggered:
             _nyquist_ch = N_CHANNELS // 2  # ch 24 = ±24 kHz Nyquist
             if abs(int(ch_k) - _nyquist_ch) <= _EDGE_CH_SKIP:
                 continue
