@@ -340,22 +340,14 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
     # runtime processes a batch of packets quickly the clock barely advances,
     # mapping many blocks to the same row; the clock then jumps, skipping rows.
     #
-    # WAV source: timestamp_frac encodes picoseconds (ts_frac = frac_s * 1e12).
-    # Radio source: FlexRadio DAXIQ TSF=1, timestamp_frac = sample count/second.
     _sbuf_end_before = self._sbuf_end   # samples already buffered before this packet
 
     new_n = len(cleaned)
     self._sbuf[self._sbuf_end:self._sbuf_end + new_n] = cleaned
     self._sbuf_end += new_n
 
-    if self.source_mode in ("wav", "airspy", "rtlsdr"):
-        # WAV, Airspy HF+, and RTL-SDR all encode fractional seconds as picoseconds.
-        _pkt_time = float(timestamp_int) + float(timestamp_frac) * 1e-12
-    elif timestamp_int > 0:
-        # FlexRadio DAXIQ: TSF=1, timestamp_frac = sample count within second.
-        _pkt_time = float(timestamp_int) + float(timestamp_frac) / self.sample_rate
-    else:
-        _pkt_time = time.time()
+    # All sources must deliver timestamp_frac as picoseconds (adapter responsibility).
+    _pkt_time = float(timestamp_int) + float(timestamp_frac) * 1e-12
     # Time of _sbuf[0] = packet's first-sample time minus already-buffered samples
     self._sbuf_t0 = _pkt_time - _sbuf_end_before / self.sample_rate
 

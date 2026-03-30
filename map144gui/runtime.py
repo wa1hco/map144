@@ -236,6 +236,60 @@ def _stop_rtlsdr_source(self):
     self._rtlsdr_started = False
 
 
+def _connect_usrp_client(self):
+    """Instantiate USRPSource on first use (called from on_select_source_usrp)."""
+    if getattr(self, 'usrp_client', None) is not None:
+        return
+    try:
+        from .usrp_source import USRPSource
+        from .visualizer import _SETTINGS as _S
+        try:
+            _gain = float(_S.value('usrp_gain_db', 50.0))
+        except (ValueError, TypeError):
+            _gain = 50.0
+        _ant = str(_S.value('usrp_antenna', 'RX2'))
+        self.usrp_client = USRPSource(
+            center_freq_mhz=50.260,   # MSK144 6m calling frequency
+            target_rate=self.sample_rate,
+            gain_db=_gain,
+            antenna=_ant,
+        )
+        print("[usrp] USRPSource created", flush=True)
+    except Exception as exc:
+        print(f"[usrp] USRPSource creation failed: {exc}", flush=True)
+        self.usrp_client = None
+
+
+def _start_usrp_source(self) -> bool:
+    if getattr(self, '_usrp_started', False):
+        return True
+    if getattr(self, 'usrp_client', None) is None:
+        return False
+    try:
+        self.usrp_client.start()
+        self._usrp_started = True
+        if hasattr(self, '_jt9_markers'):
+            self._jt9_markers.clear()
+        if hasattr(self, 'decode_panel'):
+            self.decode_panel.clear()
+        return True
+    except Exception as exc:
+        print(f"[usrp] start error: {exc}", flush=True)
+        import traceback; traceback.print_exc()
+        self.usrp_client = None   # prevent retry spam
+        return False
+
+
+def _stop_usrp_source(self):
+    if not getattr(self, '_usrp_started', False):
+        return
+    try:
+        self.usrp_client.stop()
+    except Exception:
+        pass
+    self._usrp_started = False
+
+
 def _connect_radio_client(self):
     """Instantiate FlexDAXIQ on first use (called from on_select_source_radio)."""
     if self.radio_client is not None:
@@ -666,6 +720,8 @@ def run_radio_source(self):
                     _stop_airspy_source(self)
                 if getattr(self, '_rtlsdr_started', False):
                     _stop_rtlsdr_source(self)
+                if getattr(self, '_usrp_started', False):
+                    _stop_usrp_source(self)
                 _process_wav_source_step(self)
                 continue
 
@@ -674,6 +730,8 @@ def run_radio_source(self):
                     _stop_radio_source(self)
                 if getattr(self, '_airspy_started', False):
                     _stop_airspy_source(self)
+                if getattr(self, '_usrp_started', False):
+                    _stop_usrp_source(self)
                 if not _start_rtlsdr_source(self):
                     time.sleep(1.0)
                     continue
@@ -702,6 +760,8 @@ def run_radio_source(self):
             if self.source_mode == "airspy":
                 if self._radio_started:
                     _stop_radio_source(self)
+                if getattr(self, '_usrp_started', False):
+                    _stop_usrp_source(self)
                 if not _start_airspy_source(self):
                     time.sleep(1.0)
                     continue
@@ -724,6 +784,38 @@ def run_radio_source(self):
                         drained += 1
                 except Exception as exc:
                     print(f"[airspy] queue/process error: {exc}", flush=True)
+                    import traceback; traceback.print_exc()
+                continue
+
+            if self.source_mode == "usrp":
+                if self._radio_started:
+                    _stop_radio_source(self)
+                if getattr(self, '_airspy_started', False):
+                    _stop_airspy_source(self)
+                if getattr(self, '_rtlsdr_started', False):
+                    _stop_rtlsdr_source(self)
+                if not _start_usrp_source(self):
+                    time.sleep(1.0)
+                    continue
+                try:
+                    drained = 0
+                    while drained < 64:
+                        try:
+                            packet = self.usrp_client.sample_queue.get_nowait()
+                        except queue.Empty:
+                            if drained == 0:
+                                try:
+                                    packet = self.usrp_client.sample_queue.get(timeout=1.0)
+                                except queue.Empty:
+                                    break
+                            else:
+                                break
+                        # UHD fc32 stream outputs ±1.0 float32 — no scaling needed.
+                        chunk = np.asarray(packet.samples, dtype=np.complex64)
+                        self.process_iq_data(chunk, packet.timestamp_int, packet.timestamp_frac)
+                        drained += 1
+                except Exception as exc:
+                    print(f"[usrp] queue/process error: {exc}", flush=True)
                     import traceback; traceback.print_exc()
                 continue
 
@@ -754,7 +846,11 @@ def run_radio_source(self):
                     # Normalise FlexRadio DAXIQ samples from ±32768 ADC scale to ±1.0.
                     chunk = (np.asarray(packet.samples, dtype=np.complex64)
                              / FLEX_DAXIQ_FULL_SCALE)
-                    self.process_iq_data(chunk, packet.timestamp_int, packet.timestamp_frac)
+                    # FlexRadio VITA-49 TSF=1: timestamp_frac is a sample count
+                    # within the current second.  Convert to picoseconds so the
+                    # pipeline receives a uniform timestamp encoding.
+                    ts_frac_ps = int(packet.timestamp_frac * (1_000_000_000_000 / self.sample_rate))
+                    self.process_iq_data(chunk, packet.timestamp_int, ts_frac_ps)
                     drained += 1
             except Exception as exc:
                 print(f"Queue get/process error: {exc}", flush=True)
@@ -769,6 +865,7 @@ def run_radio_source(self):
             time.sleep(0.25)
 
     _stop_radio_source(self)
+    _stop_usrp_source(self)
 
 
 def _get_tuned_frequency_mhz(self):
@@ -783,6 +880,10 @@ def _get_tuned_frequency_mhz(self):
         rc = getattr(self, 'rtlsdr_client', None)
         freq = rc.center_freq_mhz_actual if rc is not None else 50.260
         return freq, "NESDR Smart", None
+    if self.source_mode == "usrp":
+        uc = getattr(self, 'usrp_client', None)
+        freq = uc.center_freq_mhz_actual if uc is not None else 50.260
+        return freq, "USRP B210", None
 
     tuned_freq_mhz = None
     tuned_source = None
@@ -822,13 +923,18 @@ def closeEvent(self, event):
     _SETTINGS.setValue('td_span',              int(getattr(self, 'td_span_ms', 200)))
 
     for win, geo_key, vis_key in [
-        (getattr(self, '_fast_graph_win',    None), 'fast_graph_geometry',  'fast_graph_visible'),
-        (getattr(self, '_detect_win',        None), 'detect_geometry',      'detect_visible'),
-        (getattr(self, '_radio_iface_win',   None), 'radio_iface_geometry', 'radio_iface_visible'),
+        (getattr(self, '_fast_graph_win', None), 'fast_graph_geometry', 'fast_graph_visible'),
+        (getattr(self, '_detect_win',     None), 'detect_geometry',     'detect_visible'),
+        (getattr(self, '_iq_nb_win',      None), 'iq_nb_geometry',      'iq_nb_visible'),
+        (getattr(self, '_flex_win',       None), 'flex_geometry',       None),
+        (getattr(self, '_usrp_win',       None), 'usrp_geometry',       None),
+        (getattr(self, '_airspy_win',     None), 'airspy_geometry',     None),
+        (getattr(self, '_rtlsdr_win',     None), 'rtlsdr_geometry',     None),
     ]:
         if win is not None:
             _SETTINGS.setValue(geo_key, win.saveGeometry())
-            _SETTINGS.setValue(vis_key, win.isVisible())
+            if vis_key is not None:
+                _SETTINGS.setValue(vis_key, win.isVisible())
 
     print("Shutting down...")
     self.running = False

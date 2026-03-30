@@ -100,14 +100,9 @@ LP_NUMTAPS         = 23         # scipy fallback tap count (reduced for speed)
 _OVERSAMPLE_RATE   = CH_SAMPLE_RATE * N_CHANNELS // 48000   # 12
 
 # ── GNURadio availability ─────────────────────────────────────────────────────
-try:
-    from gnuradio import gr, blocks            # type: ignore[import]
-    from gnuradio.filter import pfb, firdes    # type: ignore[import]
-    _HAS_GNURADIO = True
-    log.info("GNURadio found -- using pfb_channelizer_ccf backend")
-except ImportError:
-    _HAS_GNURADIO = False
-    log.info("GNURadio not found -- using scipy mix/filter/decimate backend")
+_HAS_GNURADIO = False   # use scipy backend unconditionally
+_WIN_HAMMING = 2
+log.info("using scipy mix/filter/decimate backend")
 
 
 # ── Filter design ─────────────────────────────────────────────────────────────
@@ -131,7 +126,7 @@ def design_channelizer_filter(
             sample_rate,
             cutoff_hz,
             transition,
-            firdes.WIN_HAMMING,
+            _WIN_HAMMING,
         )
         taps = list(taps)
         rem  = len(taps) % N_CHANNELS
