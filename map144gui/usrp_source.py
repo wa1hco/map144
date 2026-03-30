@@ -214,6 +214,18 @@ class USRPSource:
 
         self._decimator = _make_decimator()
         self._nco_phase = 0.0
+        # Precompute NCO rotation table for one full recv buffer.
+        # _recv_loop multiplies chunk by (scalar_rot * table[:ns]) which is
+        # two cheap ops instead of np.arange + np.exp per chunk.
+        if self.lo_offset_hz != 0.0:
+            _nco_step = -2.0 * np.pi * self.lo_offset_hz / _HW_RATE
+            self._nco_table = np.exp(
+                1j * np.arange(_RECV_SIZE, dtype=np.float64) * _nco_step
+            ).astype(np.complex64)
+            self._nco_step = _nco_step
+        else:
+            self._nco_table = None
+            self._nco_step = 0.0
         self._running = True
         self._thread = threading.Thread(target=self._recv_loop, daemon=True,
                                         name='usrp-recv')
@@ -270,12 +282,16 @@ class USRPSource:
             # LO artifact at -lo_offset_hz.  The NCO must run at _HW_RATE, not
             # the decimated target_rate — shifting by 40 kHz after decimation
             # to 48 kHz would exceed the 24 kHz Nyquist and alias.
-            if self.lo_offset_hz != 0.0:
-                step  = -2.0 * np.pi * self.lo_offset_hz / _HW_RATE
-                ns    = len(chunk)
-                phase = self._nco_phase + step * np.arange(ns, dtype=np.float64)
-                chunk = (chunk * np.exp(1j * phase).astype(np.complex64)).astype(np.complex64)
-                self._nco_phase = float((self._nco_phase + step * ns) % (2.0 * np.pi))
+            # The precomputed table holds one full buffer of exp(j*step*n); a single
+            # scalar rotation factor advances the phase across chunks — avoiding the
+            # per-chunk np.arange + np.exp that profiled at ~15% of recv_loop.
+            if self._nco_table is not None:
+                ns  = len(chunk)
+                rot = np.exp(1j * self._nco_phase).astype(np.complex64)
+                chunk = chunk * (rot * self._nco_table[:ns])
+                self._nco_phase = float(
+                    (self._nco_phase + self._nco_step * ns) % (2.0 * np.pi)
+                )
 
             chunk = self._decimator(chunk)
 

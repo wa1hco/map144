@@ -350,6 +350,14 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                 if len(jt9_list) >= 12:   # 3× semaphore width; beyond this, drop
                     self._detect_cooldowns[ch_k] = cooldown_hops
                     continue
+                # Skip if an active decode is already running within ±2 channels.
+                # A real meteor burst triggers every channel in its bandwidth; without
+                # this guard each burst spawns a burst of duplicate jt9 processes.
+                if any(abs(getattr(th, '_fc_hz', float('inf')) - fc_hz)
+                       < CHANNEL_SPACING_HZ * 2
+                       for th in jt9_list):
+                    self._detect_cooldowns[ch_k] = cooldown_hops
+                    continue
 
             t = threading.Thread(
                 target=extract_and_decode,
@@ -361,6 +369,7 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                       detect_ts),
                 daemon=True,
             )
+            t._fc_hz = fc_hz
             t.start()
             if jt9_list is not None:
                 jt9_list.append(t)

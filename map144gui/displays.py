@@ -118,23 +118,30 @@ def update_displays(self):
                 _k = max(0, int(len(_a) * 0.10))
                 self.accumulated_noise_floor = np.partition(_a, _k, axis=0)[_k]
 
-        self.spectrogram_img.setImage(
-            spec_array,
-            autoLevels=False,
-            levels=[self.min_level, self.max_level],
-        )
+        # Gate setImage to once per 15-second boundary — the accumulated
+        # spectrogram only changes when processing.py flips spec_boundary,
+        # so calling setImage every 100 ms burns GPU/CPU for no visual gain.
+        _acc_boundary = getattr(self, '_acc_boundary_rendered', None)
+        if _acc_boundary != self.spec_boundary:
+            self._acc_boundary_rendered = self.spec_boundary
 
-        self.spectrogram_img.setRect(
-            QtCore.QRectF(
-                0,
-                freq_min,
-                self.max_time,
-                freq_max - freq_min,
+            self.spectrogram_img.setImage(
+                spec_array,
+                autoLevels=False,
+                levels=[self.min_level, self.max_level],
             )
-        )
 
-        self.spectrogram_plot.setXRange(0, self.max_time, padding=0)
-        self.spectrogram_plot.setYRange(freq_min, freq_max, padding=0)
+            self.spectrogram_img.setRect(
+                QtCore.QRectF(
+                    0,
+                    freq_min,
+                    self.max_time,
+                    freq_max - freq_min,
+                )
+            )
+
+            self.spectrogram_plot.setXRange(0, self.max_time, padding=0)
+            self.spectrogram_plot.setYRange(freq_min, freq_max, padding=0)
 
     if self.realtime_filled and getattr(self, '_realtime_dirty', False):
         self._realtime_dirty = False
