@@ -948,6 +948,8 @@ def closeEvent(self, event):
         _stop_airspy_source(self)
     if getattr(self, '_rtlsdr_started', False):
         _stop_rtlsdr_source(self)
+    if getattr(self, '_usrp_started', False):
+        _stop_usrp_source(self)
 
     if hasattr(self, 'client_thread') and self.client_thread.isRunning():
         self.client_thread.quit()
