@@ -69,7 +69,8 @@ class VitaPacket:
     """Unpacked VITA-49 IQ data packet."""
     stream_id:      int
     timestamp_int:  int         # integer seconds (GPS epoch or Unix)
-    timestamp_frac: int         # fractional timestamp (picoseconds typically)
+    timestamp_frac: int         # fractional timestamp — units depend on tsf field
+    tsf:            int         # TSF field from header: 0=none, 1=sample count, 2=picoseconds
     sequence:       int
     samples:        np.ndarray  # complex64 array, I+jQ
 

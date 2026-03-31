@@ -823,35 +823,80 @@ def run_radio_source(self):
                 time.sleep(1.0)
                 continue
 
-            # Drain up to 64 packets per loop iteration so the pipeline
-            # catches up quickly after a CPU-load burst.  Without batching,
-            # a 1-second stall at 375 pkt/s produces 375 queued packets that
-            # would take 375 individual loop iterations (each re-checking the
-            # source_mode guard) to drain.
+            # Drain packets and batch them before calling process_iq_data.
+            #
+            # FlexRadio sends 128-sample VITA-49 UDP packets at 375 pkt/s.
+            # Calling process_iq_data once per packet has two problems:
+            #   1. The noise blanker (NB_FFT_SIZE=256) never fires because
+            #      128 < 256 → n_blocks=0 every call → all Flex IQ passes
+            #      through unblanked, causing excess false detections.
+            #   2. Python/numpy call overhead at 375/s is significant.
+            # Accumulate packets until the batch reaches _FLEX_BATCH_SAMPLES
+            # (1024 = 4 × NB_FFT_SIZE = ~21 ms), then call once with the
+            # combined chunk and the timestamp of the first packet in the batch.
+            _FLEX_BATCH_SAMPLES = 1024
             try:
                 drained = 0
+                _batch_chunks   = []
+                _batch_ts_int   = None
+                _batch_ts_frac  = None
+                _batch_n        = 0
+
                 while drained < 64:
                     try:
                         packet = self.radio_client.sample_queue.get_nowait()
                     except queue.Empty:
-                        if drained == 0:
-                            # Nothing available at all — block briefly rather
-                            # than spinning.
+                        if drained == 0 and _batch_n == 0:
+                            # Nothing available — block briefly rather than spinning.
                             try:
                                 packet = self.radio_client.sample_queue.get(timeout=1.0)
                             except queue.Empty:
                                 break
                         else:
                             break
+
                     # Normalise FlexRadio DAXIQ samples from ±32768 ADC scale to ±1.0.
-                    chunk = (np.asarray(packet.samples, dtype=np.complex64)
-                             / FLEX_DAXIQ_FULL_SCALE)
-                    # FlexRadio VITA-49 TSF=1: timestamp_frac is a sample count
-                    # within the current second.  Convert to picoseconds so the
-                    # pipeline receives a uniform timestamp encoding.
-                    ts_frac_ps = int(packet.timestamp_frac * (1_000_000_000_000 / self.sample_rate))
-                    self.process_iq_data(chunk, packet.timestamp_int, ts_frac_ps)
+                    pkt_chunk = (np.asarray(packet.samples, dtype=np.complex64)
+                                 / FLEX_DAXIQ_FULL_SCALE)
                     drained += 1
+
+                    if _batch_ts_int is None:
+                        # Timestamp of the first packet anchors the batch.
+                        _batch_ts_int  = packet.timestamp_int
+                        # Convert timestamp_frac to picoseconds based on the TSF
+                        # field carried in each packet.  The Flex may send either:
+                        #   TSF=1  sample count within current second
+                        #   TSF=2  real-time picoseconds (already correct)
+                        # Applying the TSF=1 formula to TSF=2 values multiplies by
+                        # ~20 million and makes staging_idx jump across the whole
+                        # spectrogram, producing hopping vertical stripes.
+                        _tsf = getattr(packet, 'tsf', 1)
+                        if _tsf == 2:
+                            _batch_ts_frac = int(packet.timestamp_frac)
+                        else:
+                            _batch_ts_frac = int(
+                                packet.timestamp_frac * (1_000_000_000_000 / self.sample_rate)
+                            )
+
+                    _batch_chunks.append(pkt_chunk)
+                    _batch_n += len(pkt_chunk)
+
+                    if _batch_n >= _FLEX_BATCH_SAMPLES:
+                        self.process_iq_data(
+                            np.concatenate(_batch_chunks),
+                            _batch_ts_int, _batch_ts_frac,
+                        )
+                        _batch_chunks  = []
+                        _batch_ts_int  = None
+                        _batch_ts_frac = None
+                        _batch_n       = 0
+
+                # Flush any remaining samples shorter than a full batch.
+                if _batch_chunks:
+                    self.process_iq_data(
+                        np.concatenate(_batch_chunks),
+                        _batch_ts_int, _batch_ts_frac,
+                    )
             except Exception as exc:
                 print(f"Queue get/process error: {exc}", flush=True)
                 import traceback

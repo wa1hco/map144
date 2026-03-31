@@ -109,7 +109,7 @@ class FlexDAXIQ:
         self.dax_channel     = dax_channel
         self.listen_port     = listen_port
         self.bind_client_id = bind_client_id or bind_client_handle
-        self.sample_queue    = queue.Queue(maxsize=500)
+        self.sample_queue    = queue.Queue(maxsize=4000)
         self._tcp            = None
         self._dax_setup      = None
         self._vita           = None

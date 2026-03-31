@@ -258,6 +258,7 @@ class VITAReceiver:
             stream_id=stream_id,
             timestamp_int=timestamp_int,
             timestamp_frac=timestamp_frac,
+            tsf=tsf,
             sequence=sequence,
             samples=samples
         )
