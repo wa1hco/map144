@@ -434,6 +434,13 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
 
     # All sources must deliver timestamp_frac as picoseconds (adapter responsibility).
     _pkt_time = float(timestamp_int) + float(timestamp_frac) * 1e-12
+    # Sanity check: if timestamp_int is implausibly small (< year 2001 Unix epoch)
+    # the source clock is not locked to UTC (power-on counter, GPS not synced,
+    # etc.).  Fall back to wall-clock time so the spectrogram is placed correctly
+    # instead of cycling in a 0–1 s window.  This handles both Flex GPS-not-locked
+    # and B210-style clocks that start at 0 before set_time_now() takes effect.
+    if timestamp_int < 1_000_000_000:
+        _pkt_time = time.time()
     # Time of _sbuf[0] = packet's first-sample time minus already-buffered samples
     self._sbuf_t0 = _pkt_time - _sbuf_end_before / self.sample_rate
 

@@ -46,17 +46,24 @@ import pyqtgraph as pg
 
 
 class _PanelWindow(QtWidgets.QWidget):
-    """Free-floating display panel that hides instead of closing."""
+    """Free-floating display panel that hides instead of closing.
+
+    Constructed with Qt parent=None so the window manager does NOT mark it as
+    WM_TRANSIENT_FOR the main window.  On X11/Linux some WMs send
+    WM_DELETE_WINDOW to transient children during a move, which Qt converts to
+    a closeEvent and causes the panel to hide spontaneously when dragged.
+    The visualizer reference is kept in _parent_win for _app_closing only.
+    """
 
     def __init__(self, title, view_action, parent, geo_key=None):
-        super().__init__(parent, QtCore.Qt.Window)
+        super().__init__(None, QtCore.Qt.Window)   # top-level — no WM transient
+        self._parent_win  = parent                 # for _app_closing check only
         self.setWindowTitle(title)
         self._view_action = view_action
         self._geo_key = geo_key
 
     def closeEvent(self, event):
-        parent = self.parent()
-        if parent is not None and getattr(parent, '_app_closing', False):
+        if getattr(self._parent_win, '_app_closing', False):
             event.accept()
             return
         self._save_geometry()
