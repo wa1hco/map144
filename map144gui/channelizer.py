@@ -93,7 +93,8 @@ DECIMATE_FACTOR    = 4
 CH_SAMPLE_RATE     = 12000
 LP_CUTOFF_HZ       = 2700.0
 HP_CUTOFF_HZ       = 300.0
-LP_NUMTAPS         = 23         # scipy fallback tap count (reduced for speed)
+LP_NUMTAPS         = 7          # scipy fallback tap count — 7 taps gives adequate
+                                  # stopband rejection for 2700 Hz cutoff at 48 kHz
 
 # oversample_rate for pfb_channelizer_ccf:
 #   = CH_SAMPLE_RATE x N_CHANNELS / Fs_in = 12000 x 48 / 48000 = 12
@@ -141,7 +142,7 @@ def design_channelizer_filter(
 def _design_hp_filter(
     ch_rate: int   = CH_SAMPLE_RATE,
     cutoff:  float = HP_CUTOFF_HZ,
-    ntaps:   int   = 15,
+    ntaps:   int   = 9,
 ) -> np.ndarray:
     """HP FIR at *cutoff* Hz for the per-channel 300 Hz passband edge."""
     return firwin(ntaps, cutoff / (ch_rate / 2.0), pass_zero=False).astype(np.float64)
@@ -212,6 +213,10 @@ class ChannelizerState:
     zi_im:     np.ndarray = field(default=None, repr=False)
     abs_sample: int       = 0
 
+    # Precomputed NCO: per-channel complex rotation step and current phase
+    _mix_step:  np.ndarray = field(default=None, repr=False)  # (n_ch,) complex64
+    _mix_phase: np.ndarray = field(default=None, repr=False)  # (n_ch,) complex64
+
 
 def make_channelizer_state(n_channels: int, lp_taps: np.ndarray) -> ChannelizerState:
     """Allocate all channelizer state (and GNURadio flowgraph if available)."""
@@ -220,10 +225,17 @@ def make_channelizer_state(n_channels: int, lp_taps: np.ndarray) -> ChannelizerS
 
     # _hp_zi stored as complex128 (real part = re state, imag part = im state)
     # so _fir_filt_2d can split them without separate arrays in ChannelizerState.
+    # Precompute per-channel NCO step: exp(-2j*pi*(k*spacing + offset)/rate)
+    k         = np.arange(n_channels, dtype=np.float64)
+    fc        = k * CHANNEL_SPACING_HZ + CHANNEL_OFFSET_HZ
+    mix_step  = np.exp(-2j * np.pi * fc / 48000).astype(np.complex64)
+    mix_phase = np.ones(n_channels, dtype=np.complex64)
+
     if _HAS_GNURADIO:
         fg    = _GRFlowgraph(n_channels, lp_taps, _OVERSAMPLE_RATE)
         hp_zi = np.zeros((n_channels, hp_ntaps - 1), dtype=np.complex128)
-        return ChannelizerState(_gr=fg, _hp_taps=hp_taps, _hp_zi=hp_zi)
+        return ChannelizerState(_gr=fg, _hp_taps=hp_taps, _hp_zi=hp_zi,
+                                _mix_step=mix_step, _mix_phase=mix_phase)
     else:
         lp_ntaps = len(lp_taps)
         zi_re    = np.zeros((n_channels, lp_ntaps - 1), dtype=np.float64)
@@ -232,6 +244,7 @@ def make_channelizer_state(n_channels: int, lp_taps: np.ndarray) -> ChannelizerS
         return ChannelizerState(
             _hp_taps=hp_taps, _hp_zi=hp_zi,
             zi_re=zi_re, zi_im=zi_im,
+            _mix_step=mix_step, _mix_phase=mix_phase,
         )
 
 
@@ -240,23 +253,23 @@ def make_channelizer_state(n_channels: int, lp_taps: np.ndarray) -> ChannelizerS
 def _fir_filt_2d(b: np.ndarray, x: np.ndarray, zi: np.ndarray):
     """FIR filter *x* (n_ch, N) along axis=1, returning (y, new_zi).
 
-    Uses stride-trick overlap to avoid scipy's apply_along_axis overhead.
-    *zi* shape: (n_ch, ntaps-1); holds the last ntaps-1 input samples.
+    Stride-trick overlap + matmul.  Taps and zi must already be float64
+    (callers must not pass float32 or mixed dtypes — that forces astype
+    copies which dominate runtime).
+
+    *zi* shape: (n_ch, ntaps-1).
     """
-    ntaps  = len(b)
+    ntaps   = len(b)
     n_ch, N = x.shape
-    # Prepend state samples so the window can start at sample 0
-    x_ext = np.concatenate([zi, x], axis=1)          # (n_ch, ntaps-1 + N)
-    # Build sliding windows: shape (n_ch, N, ntaps) via strided view
-    s0, s1 = x_ext.strides
+    x_ext   = np.concatenate([zi, x], axis=1)          # (n_ch, ntaps-1+N)
+    s0, s1  = x_ext.strides
     windows = np.lib.stride_tricks.as_strided(
         x_ext,
         shape=(n_ch, N, ntaps),
         strides=(s0, s1, s1),
     )
-    # Dot each window against the reversed taps — equivalent to convolution
-    y      = windows @ b[::-1]                        # (n_ch, N)
-    new_zi = x_ext[:, -(ntaps - 1):]                  # (n_ch, ntaps-1)
+    y      = windows @ b[::-1]                          # (n_ch, N)
+    new_zi = x_ext[:, -(ntaps - 1):].copy()            # (n_ch, ntaps-1)
     return y, new_zi
 
 
@@ -293,13 +306,21 @@ def apply_channelizer(
             lp_taps = design_channelizer_filter(sample_rate)
 
         N = len(raw)
-        t = state.abs_sample + np.arange(N, dtype=np.float64)
 
-        k     = np.arange(n_channels, dtype=np.float64)[:, np.newaxis]
-        phase = np.exp(
-            -2j * np.pi * (k * channel_spacing_hz + CHANNEL_OFFSET_HZ) * t[np.newaxis, :] / sample_rate
-        )
-        mixed = phase * raw[np.newaxis, :].astype(np.complex128)   # (n_ch, N)
+        # ── NCO mixing: angle accumulation → single exp call ─────────────
+        # Accumulate phase angles (real arithmetic) then call exp once per
+        # channel.  np.cumsum on (n_ch, N) float32 is much faster than
+        # np.cumprod on complex64 (no complex multiply, better vectorization).
+        angles = np.angle(state._mix_step).astype(np.float32)          # (n_ch,)
+        phase0 = np.angle(state._mix_phase).astype(np.float32)         # (n_ch,)
+        # angle_mat[k, n] = phase0[k] + angles[k] * n
+        n_idx      = np.arange(N, dtype=np.float32)
+        angle_mat  = phase0[:, np.newaxis] + np.outer(angles, n_idx)   # (n_ch, N)
+        phase      = np.exp(1j * angle_mat).astype(np.complex64)       # single exp
+        # Advance phase state for next call
+        state._mix_phase = np.exp(1j * (phase0 + angles * N)).astype(np.complex64)
+
+        mixed = phase * raw[np.newaxis, :]               # (n_ch, N) complex64
 
         b_lp = lp_taps.astype(np.float64)
         filt_re, new_zi_re = _fir_filt_2d(b_lp, mixed.real, state.zi_re)
@@ -314,12 +335,10 @@ def apply_channelizer(
     state.abs_sample += len(raw)
 
     # ── Per-channel HP filter (300 Hz, both paths) ────────────────────────
+    # Apply to real and imaginary separately so _fir_filt_2d uses real SGEMM.
     ch_out_c128 = ch_out.astype(np.complex128)
-    # Apply HP to real and imaginary parts separately so _fir_filt_2d (real-valued
-    # taps, real input) can use the BLAS matmul path without complex arithmetic.
     hp_re, new_hp_zi_re = _fir_filt_2d(state._hp_taps, ch_out_c128.real, state._hp_zi.real)
     hp_im, new_hp_zi_im = _fir_filt_2d(state._hp_taps, ch_out_c128.imag, state._hp_zi.imag)
     state._hp_zi = new_hp_zi_re + 1j * new_hp_zi_im
-    hp_out = hp_re + 1j * hp_im
 
-    return hp_out.astype(np.complex64)
+    return (hp_re + 1j * hp_im).astype(np.complex64)

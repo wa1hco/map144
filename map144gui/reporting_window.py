@@ -59,7 +59,7 @@ def setup_reporting_window(self, view_action):
     udp_form.setHorizontalSpacing(8)
 
     self._rpt_wsjtx_cb = QtWidgets.QCheckBox("Enable")
-    self._rpt_wsjtx_cb.setChecked(bool(_SETTINGS.value('reporting_wsjtx_enabled', False)))
+    self._rpt_wsjtx_cb.setChecked(_SETTINGS.value('reporting_wsjtx_enabled', False, type=bool))
     udp_form.addRow("", self._rpt_wsjtx_cb)
 
     self._rpt_wsjtx_host = QtWidgets.QLineEdit(
@@ -77,6 +77,31 @@ def setup_reporting_window(self, view_action):
 
     layout.addWidget(udp_grp)
 
+    # ── DX Cluster ───────────────────────────────────────────────────────────
+    dx_grp  = QtWidgets.QGroupBox("DX Cluster")
+    dx_form = QtWidgets.QFormLayout(dx_grp)
+    dx_form.setVerticalSpacing(4)
+    dx_form.setHorizontalSpacing(8)
+
+    self._rpt_dx_cb = QtWidgets.QCheckBox("Enable")
+    self._rpt_dx_cb.setChecked(_SETTINGS.value('reporting_dx_enabled', False, type=bool))
+    dx_form.addRow("", self._rpt_dx_cb)
+
+    self._rpt_dx_host = QtWidgets.QLineEdit(
+        str(_SETTINGS.value('reporting_dx_host', 'dxc.ve7cc.net'))
+    )
+    dx_form.addRow("Host:", self._rpt_dx_host)
+
+    self._rpt_dx_port = QtWidgets.QSpinBox()
+    self._rpt_dx_port.setRange(1, 65535)
+    try:
+        self._rpt_dx_port.setValue(int(_SETTINGS.value('reporting_dx_port', 7373)))
+    except (ValueError, TypeError):
+        self._rpt_dx_port.setValue(7373)
+    dx_form.addRow("Port:", self._rpt_dx_port)
+
+    layout.addWidget(dx_grp)
+
     # ── PSKReporter ───────────────────────────────────────────────────────────
     psk_grp  = QtWidgets.QGroupBox("PSKReporter")
     psk_form = QtWidgets.QFormLayout(psk_grp)
@@ -84,9 +109,9 @@ def setup_reporting_window(self, view_action):
     psk_form.setHorizontalSpacing(8)
 
     self._rpt_psk_cb = QtWidgets.QCheckBox("Enable")
-    self._rpt_psk_cb.setChecked(bool(_SETTINGS.value('reporting_psk_enabled', False)))
+    self._rpt_psk_cb.setChecked(_SETTINGS.value('reporting_psk_enabled', False, type=bool))
     psk_form.addRow("", self._rpt_psk_cb)
-    psk_form.addRow("Upload interval:", QtWidgets.QLabel("5 min (fixed)"))
+    psk_form.addRow("Protocol:", QtWidgets.QLabel("IPFIX UDP → report.pskreporter.info:4739"))
 
     layout.addWidget(psk_grp)
 
@@ -111,6 +136,8 @@ def setup_reporting_window(self, view_action):
     stat_form.addRow("PSK spots queued:", _slbl("_rpt_psk_queued_val"))
     stat_form.addRow("PSK spots uploaded:", _slbl("_rpt_psk_uploaded_val"))
     stat_form.addRow("Last PSK upload:", _slbl("_rpt_psk_time_val"))
+    stat_form.addRow("DX cluster:", _slbl("_rpt_dx_status_val", "disabled"))
+    stat_form.addRow("DX spots sent:", _slbl("_rpt_dx_sent_val"))
     stat_form.addRow("Last error:", _slbl("_rpt_error_val", "none"))
     layout.addWidget(stat_grp)
 
@@ -132,6 +159,9 @@ def _on_reporting_apply(self):
     wsjtx_h  = self._rpt_wsjtx_host.text().strip()
     wsjtx_p  = self._rpt_wsjtx_port.value()
     psk_en   = self._rpt_psk_cb.isChecked()
+    dx_en    = self._rpt_dx_cb.isChecked()
+    dx_h     = self._rpt_dx_host.text().strip()
+    dx_p     = self._rpt_dx_port.value()
 
     _SETTINGS.setValue('reporting_mycall',          my_call)
     _SETTINGS.setValue('reporting_mygrid',           my_grid)
@@ -139,10 +169,14 @@ def _on_reporting_apply(self):
     _SETTINGS.setValue('reporting_wsjtx_host',       wsjtx_h)
     _SETTINGS.setValue('reporting_wsjtx_port',       wsjtx_p)
     _SETTINGS.setValue('reporting_psk_enabled',      psk_en)
+    _SETTINGS.setValue('reporting_dx_enabled',       dx_en)
+    _SETTINGS.setValue('reporting_dx_host',          dx_h)
+    _SETTINGS.setValue('reporting_dx_port',          dx_p)
 
     rpt = getattr(self, 'reporter', None)
     if rpt is not None:
-        rpt.apply_settings(my_call, my_grid, wsjtx_en, wsjtx_h, wsjtx_p, psk_en)
+        rpt.apply_settings(my_call, my_grid, wsjtx_en, wsjtx_h, wsjtx_p,
+                           psk_en, dx_en, dx_h, dx_p)
 
 
 def update_reporting_window(self):
@@ -160,6 +194,8 @@ def update_reporting_window(self):
     _set('_rpt_psk_queued_val',  str(rpt.stat_psk_queued))
     _set('_rpt_psk_uploaded_val',f"{rpt.stat_psk_uploaded:,}")
     _set('_rpt_psk_time_val',    rpt.stat_last_psk_time or "—")
+    _set('_rpt_dx_status_val',   rpt.stat_dx_status)
+    _set('_rpt_dx_sent_val',     f"{rpt.stat_dx_sent:,}")
     err = rpt.stat_last_error or "none"
     lbl = getattr(self, '_rpt_error_val', None)
     if lbl is not None:

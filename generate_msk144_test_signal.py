@@ -141,8 +141,8 @@ FREQ_MIN_KHZ = -22
 FREQ_MAX_KHZ = +22
 TIME_MIN_DS  =   5               # deciseconds ( 0.5 s)
 TIME_MAX_DS  = 145               # deciseconds (14.5 s)
-SNR_MIN_DB   =  -1
-SNR_MAX_DB   =  +4
+SNR_MIN_DB   =  +2
+SNR_MAX_DB   =  +10
 WIDTH_MIN_MS = 200
 WIDTH_MAX_MS = 500
 WIDTH_CLAMP_MIN_MS = 10          # avoid division-by-zero inside msk144sim
@@ -341,15 +341,21 @@ def generate_synthetic_ping(width_ms: int, sample_rate: int = 12000) -> tuple[np
     return samples, sample_rate
 
 
-def generate_ping_wav(msg: str) -> tuple[np.ndarray, int]:
+def generate_ping_wav(msg: str, width_ms: int = None, snr_db: int = None) -> tuple[np.ndarray, int]:
     """Call msk144sim to generate a ping, extract the first ping at t=1 s.
 
     Returns (samples, sample_rate) where samples covers PING_EXTRACT_DURATION_S
     seconds of 12 kHz mono audio starting at t=PING_EXTRACT_START_S.
+
+    width_ms and snr_db may be supplied explicitly (for callsign messages) or
+    left as None to decode them from the diagnostic "A..." message format.
     """
-    params = decode_ping_message(msg)
-    width_s = max(params['width_ms'], WIDTH_CLAMP_MIN_MS) / 1000.0
-    snr_db  = params['snr_db']
+    if width_ms is None or snr_db is None:
+        params   = decode_ping_message(msg)
+        width_ms = width_ms if width_ms is not None else params['width_ms']
+        snr_db   = snr_db   if snr_db   is not None else params['snr_db']
+
+    width_s = max(width_ms, WIDTH_CLAMP_MIN_MS) / 1000.0
 
     work_dir = Path(tempfile.mkdtemp(prefix='msk144sim_'))
     try:
@@ -380,7 +386,7 @@ def generate_ping_wav(msg: str) -> tuple[np.ndarray, int]:
     # same Gamma envelope msk144sim uses to drive the noise to zero wherever the
     # signal is near-silent.  Combined with MSK144SIM_GENERATE_SNR_DB=55 this
     # makes the embedded noise ~60 dB below the peak signal — invisible.
-    width_s_eff = max(params['width_ms'], WIDTH_CLAMP_MIN_MS) / 1000.0
+    width_s_eff = max(width_ms, WIDTH_CLAMP_MIN_MS) / 1000.0
     n = ping.size
     t_norm = np.arange(n, dtype=np.float64) / sample_rate / width_s_eff
     # Exact msk144sim envelope: e·t·exp(−t) for t∈[0,10], else 0
@@ -1269,6 +1275,8 @@ def main() -> None:
                         help='Source bandpass lower edge Hz – strip out-of-band noise (default: 300)')
     parser.add_argument('--source-bp-hi', type=float, default=2700.0,
                         help='Source bandpass upper edge Hz (default: 2700)')
+    parser.add_argument('--callsigns', action='store_true',
+                        help='Use real callsign messages (CQ/QSO format) instead of diagnostic A... messages')
     parser.add_argument('--skip-plots', action='store_true',
                         help='Skip output spectrogram plot')
     parser.add_argument('--output-dir', default='MSK144/simulations',
@@ -1303,13 +1311,33 @@ def main() -> None:
     sig_buf = np.zeros(n_total, dtype=np.complex64)
     placements: list[tuple[str, float, float]] = []
 
+    # Pool of real callsign messages for --callsigns mode
+    _CALLSIGN_MESSAGES = [
+        "CQ W1AW FN31",
+        "CQ K1TTT FN32",
+        "CQ W2FU FN20",
+        "CQ KA1G FN42",
+        "CQ VE3EJ FN03",
+        "CQ W4RX EM84",
+        "CQ K8TS EN82",
+        "CQ K2TER FN30",
+        "CQ W1ZM FN42",
+        "CQ N1JEZ FN42",
+        "W1AW K1TTT FN32",
+        "K1TTT W1AW FN31",
+    ]
+
     if args.count > 0:
         # ── Generate pings via msk144sim ───────────────────────────────────────
         if shutil.which('msk144sim') is None:
             print("error: msk144sim not found on PATH", file=sys.stderr)
             sys.exit(1)
-        print(f"Generating {args.count} pings via msk144sim:")
-        print(f"  Message format: A[±][ff][ttt][±][dd][www]")
+
+        if args.callsigns:
+            print(f"Generating {args.count} pings via msk144sim (callsign messages):")
+        else:
+            print(f"Generating {args.count} pings via msk144sim:")
+            print(f"  Message format: A[±][ff][ttt][±][dd][www]")
         print(f"  freq {FREQ_MIN_KHZ}..{FREQ_MAX_KHZ} kHz  "
               f"time {TIME_MIN_DS}..{TIME_MAX_DS} ds  "
               f"snr {SNR_MIN_DB}..{SNR_MAX_DB} dB  "
@@ -1323,7 +1351,10 @@ def main() -> None:
             snr_db   = int(rng.integers(SNR_MIN_DB, SNR_MAX_DB + 1))
             width_ms = int(rng.integers(WIDTH_MIN_MS, WIDTH_MAX_MS + 1))
 
-            msg = encode_ping_message(freq_khz, time_ds, snr_db, width_ms)
+            if args.callsigns:
+                msg = _CALLSIGN_MESSAGES[i % len(_CALLSIGN_MESSAGES)]
+            else:
+                msg = encode_ping_message(freq_khz, time_ds, snr_db, width_ms)
             print(f"  [{i+1:3d}/{args.count}] {msg}  "
                   f"freq={freq_khz:+d} kHz  t={time_ds/10:.1f} s  "
                   f"snr={snr_db:+d} dB  width={width_ms} ms", end='', flush=True)
@@ -1333,6 +1364,8 @@ def main() -> None:
                     # MSK-like burst so no embedded AWGN enters the signal chain.
                     samples, src_rate = generate_synthetic_ping(
                         width_ms, sample_rate=MSK144SIM_SAMPLE_RATE)
+                elif args.callsigns:
+                    samples, src_rate = generate_ping_wav(msg, width_ms=width_ms, snr_db=snr_db)
                 else:
                     samples, src_rate = generate_ping_wav(msg)
                 ping_bank.append((samples, src_rate, msg,

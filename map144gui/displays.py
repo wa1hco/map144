@@ -102,6 +102,9 @@ def update_displays(self):
     if abs(center_freq_mhz - self.display_center_freq_mhz) > 1e-9:
         self.display_center_freq_mhz = center_freq_mhz
         self.freq_axis = self.fft_bin_axis_mhz + center_freq_mhz
+        rpt = getattr(self, 'reporter', None)
+        if rpt is not None:
+            rpt.report_freq(int(round(center_freq_mhz * 1e6)))
 
     freq_min = self.freq_axis[0]
     freq_max = self.freq_axis[-1]
@@ -111,13 +114,6 @@ def update_displays(self):
     if self.spec_staging_filled:
         spec_array = self.spectrogram_data
 
-        if self._noise_floor_ctr % 10 == 1:   # recompute ~once per second
-            valid_acc_rows = np.any(spec_array > -129.5, axis=1)
-            if np.any(valid_acc_rows):
-                _a = spec_array[valid_acc_rows]
-                _k = max(0, int(len(_a) * 0.10))
-                self.accumulated_noise_floor = np.partition(_a, _k, axis=0)[_k]
-
         # Gate setImage to once per 15-second boundary — the accumulated
         # spectrogram only changes when processing.py flips spec_boundary,
         # so calling setImage every 100 ms burns GPU/CPU for no visual gain.
@@ -126,7 +122,7 @@ def update_displays(self):
             self._acc_boundary_rendered = self.spec_boundary
 
             self.spectrogram_img.setImage(
-                spec_array,
+                spec_array[:, ::4],
                 autoLevels=False,
                 levels=[self.min_level, self.max_level],
             )
@@ -146,8 +142,10 @@ def update_displays(self):
     if self.realtime_filled and getattr(self, '_realtime_dirty', False):
         self._realtime_dirty = False
 
+        # Subsample frequency axis by 4 before rendering — 4096 → 1024 bins
+        # is still far more than any screen pixel column, so no visual loss.
         self.realtime_img.setImage(
-            self.realtime_data,
+            self.realtime_data[:, ::4],
             autoLevels=False,
             levels=[self.min_level, self.max_level],
         )
@@ -271,9 +269,16 @@ def update_displays(self):
         self.setWindowTitle(f'map144 - {self.center_freq_mhz:.3f} MHz')
 
     if self.spec_staging_filled and len(self.spectrogram_data) > 0:
-        data_min = np.min(self.spectrogram_data)
-        data_max = np.max(self.spectrogram_data)
-        data_mean = np.mean(self.spectrogram_data)
+        # Recompute power stats only once per second (every 10 frames) and
+        # on a subsampled slice — full (900, 4096) array dominates _wrapreduction.
+        if self._noise_floor_ctr % 10 == 1 or not hasattr(self, '_stat_min'):
+            _s = self.spectrogram_data[::4, ::8]   # (225, 512) — representative sample
+            self._stat_min  = float(np.min(_s))
+            self._stat_max  = float(np.max(_s))
+            self._stat_mean = float(np.mean(_s))
+        data_min  = self._stat_min
+        data_max  = self._stat_max
+        data_mean = self._stat_mean
 
         packet_info = ''
         if hasattr(self, 'radio_client') and hasattr(self.radio_client, '_vita') and self.radio_client._vita:

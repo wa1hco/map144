@@ -285,12 +285,15 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         hist  = (self._metric_hist_buf[:self._metric_hist_cnt]
                  if self._metric_hist_cnt < _METRIC_HIST_DEPTH
                  else self._metric_hist_buf)
-        # Subsample history by _METRIC_HIST_STRIDE before partition — reduces the
-        # (300, 48) array to (100, 48) for a 3× speedup with negligible accuracy loss
-        # at the 25th-percentile noise baseline (21 ms → 63 ms effective resolution).
-        hist_s = hist[::_METRIC_HIST_STRIDE]
-        k      = max(0, int(len(hist_s) * 0.25))                       # 25th-pct index
-        pct25  = np.maximum(np.partition(hist_s, k, axis=0)[k], 1e-30) # (48,) O(N) vs O(N log N)
+        # Recompute 25th-percentile baseline only every 10 frames (~210 ms).
+        # Baseline tracks noise which changes slowly; recomputing every frame
+        # dominated the profiler (4.97s) with no accuracy benefit.
+        self._pct25_ctr = getattr(self, '_pct25_ctr', 0) + 1
+        if self._pct25_ctr % 10 == 1 or not hasattr(self, '_pct25'):
+            hist_s = hist[::_METRIC_HIST_STRIDE]
+            k      = max(0, int(len(hist_s) * 0.25))
+            self._pct25 = np.maximum(np.partition(hist_s, k, axis=0)[k], 1e-30)
+        pct25 = self._pct25
 
         pair_metric = np.maximum(
             10.0 * np.log10(np.maximum(raw_lin / pct25, 1e-30)), 0.0

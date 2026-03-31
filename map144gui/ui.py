@@ -40,9 +40,27 @@ Each panel window:
   - has its position, size, and visibility persisted in QSettings
 """
 
+import subprocess
+
 import numpy as np
 from PyQt5 import QtWidgets, QtCore
 import pyqtgraph as pg
+
+
+def _get_version_string():
+    """Return a version string from git: hash, date, and subject line."""
+    try:
+        commit = subprocess.check_output(
+            ["git", "log", "-1", "--format=%h  %cd  %s", "--date=short"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        return commit + ("  (modified)" if dirty else "")
+    except Exception:
+        return "unknown"
 
 
 class _PanelWindow(QtWidgets.QWidget):
@@ -132,6 +150,11 @@ def setup_ui(self):
     file_menu.addAction(self.source_wav_action)
 
     view_menu = menu_bar.addMenu("&View")
+
+    help_menu    = menu_bar.addMenu("&Help")
+    about_action = QtWidgets.QAction("About map144", self)
+    about_action.triggered.connect(self._on_about)
+    help_menu.addAction(about_action)
 
     fg_action        = QtWidgets.QAction("Fast Graph",          self)
     det_action       = QtWidgets.QAction("Detection Heatmap",   self)
@@ -480,3 +503,15 @@ def on_select_source_wav(self):
     self.source_wav_action.setChecked(True)
     show_source_window(self, "wav")   # hides all radio windows
     self.statusBar().showMessage(f"Source: WAV File ({_Path(file_path).name})")
+
+
+def _on_about(self):
+    version = _get_version_string()
+    QtWidgets.QMessageBox.about(
+        self,
+        "About map144",
+        f"<b>map144</b> — MSK144 Meteor Scatter Decoder<br><br>"
+        f"<b>Version:</b> {version}<br><br>"
+        f"Copyright &copy; 2026 Jeff Millar, WA1HCO<br>"
+        f"GNU General Public License v3",
+    )

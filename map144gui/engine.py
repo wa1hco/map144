@@ -147,7 +147,7 @@ class Engine:
             np.fft.fftfreq(self.fft_size, 1 / self.sample_rate)
         ) / 1e6
         self.freq_axis = self.fft_bin_axis_mhz + self.center_freq_mhz
-        self.display_center_freq_mhz = self.center_freq_mhz
+        self.display_center_freq_mhz = -1.0  # force report_freq() on first display update
 
     def setup_radio_client(self):
         """No-op in headless mode — overridden by MAP144Visualizer for Qt thread."""

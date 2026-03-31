@@ -15,21 +15,24 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """map144 — MSK144 meteor scatter decoder for FlexRadio 6000 series.
 
-map144 monitors a 6-metre (or 2-metre) calling frequency, detects MSK144
-meteor-scatter ping bursts in real time, and decodes them using the jt9
-engine from WSJT-X.  Decoded contacts are logged to ``launches.jsonl`` and
-the audio surrounding each detection is saved as a timestamped WAV file for
-offline review.
+map144 monitors the MSK144 calling frequency and 20 KHz either side.  
+If an MSK144 meteor-scatter ping occurs within 20 KHz of the calling 
+frequency map144 decodes it using the jt9 engine from WSJT-X.  
+Decoded contacts are logged to ``launches.jsonl`` and the audio surrounding 
+each detection is saved as a timestamped WAV file for offline review.
 
-IQ samples are streamed from a FlexRadio 6000 series transceiver over the
-DAX IQ interface at 48 kHz.  A 48-channel polyphase channelizer resolves
-the band into 1 kHz sub-channels; each sub-channel is monitored
-independently for the paired-tone signature of an MSK144 burst.
+IQ samples are streamed from a radio with at least 48 kHz sample rate IQ data.
+Radios include Flex, USRP, Airspy, and RTL-SDR. 
 
-A diagnostic GUI (PyQt5) provides a live spectrogram, detection heatmap,
-SNR history, and decode log.  Running with ``--headless`` skips the GUI and
-runs the decoder engine only, suitable for unattended overnight operation or
-integration with logging tools such as PSKreporter or N1MM.
+A 48-channel polyphase channelizer resolves the band into 1 kHz sub-channels; 
+each sub-channel is monitored independently for the paired-tone signature 
+of an MSK144 burst.
+
+A GUI (PyQt5) provides several options for viewing program status, including 
+a live spectrogram, detection heatmap, SNR history, and decode log.  Running 
+with ``--headless`` skips the GUI and runs the decoder engine only, suitable 
+for unattended overnight operation or integration with logging tools such as 
+PSKreporter or N1MM.
 
 Usage
 -----

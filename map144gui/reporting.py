@@ -51,24 +51,27 @@ import socket
 import struct
 import threading
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
 WSJTX_MAGIC   = 0xADBCCBDA
-WSJTX_SCHEMA  = 2
+WSJTX_SCHEMA  = 3
 WSJTX_ID      = "map144"
 
 MSG_HEARTBEAT = 0
+MSG_STATUS    = 1
 MSG_DECODE    = 2
 
 HEARTBEAT_INTERVAL_S    = 15
 PSKREPORTER_INTERVAL_S  = 300   # 5 minutes — pskreporter asks for ≥5 min
 
-PSKREPORTER_URL = "https://www.pskreporter.info/cgi-bin/pskr/upload.pl"
+PSKREPORTER_HOST = "report.pskreporter.info"
+PSKREPORTER_PORT = 4739
+PSKREPORTER_ENTERPRISE  = 30351
+PSKREPORTER_SENDER_TMPL = 0x50e3   # template ID for spot data sets
+PSKREPORTER_RECV_TMPL   = 0x50e2   # template ID for receiver options set
 
 
 # ── WSJT-X wire format helpers ───────────────────────────────────────────────
@@ -103,24 +106,78 @@ def _pack_f64(v: float) -> bytes:
     return struct.pack(">d", v)
 
 
-def _header(msg_type: int, seq: int) -> bytes:
+def _header(msg_type: int) -> bytes:
     return (struct.pack(">I", WSJTX_MAGIC)
             + struct.pack(">I", WSJTX_SCHEMA)
             + struct.pack(">I", msg_type)
-            + struct.pack(">I", seq)
             + _pack_utf8(WSJTX_ID))
 
 
-def build_heartbeat(seq: int, max_schema: int = 3, version: str = "2.7.0",
+def build_heartbeat(max_schema: int = 3, version: str = "2.7.0",
                     revision: str = "") -> bytes:
     """Build a WSJT-X Heartbeat (type 0) datagram."""
-    return (_header(MSG_HEARTBEAT, seq)
+    return (_header(MSG_HEARTBEAT)
             + _pack_u32(max_schema)
             + _pack_utf8(version)
             + _pack_utf8(revision))
 
 
-def build_decode(seq: int, decode: dict, my_call: str, dial_freq_hz: int) -> bytes:
+def build_status(dial_freq_hz: int, my_call: str, my_grid: str) -> bytes:
+    """Build a WSJT-X Status (type 1) datagram.
+
+    Sends the minimum fields GridTracker and N1MM need to place map144 on
+    the band map: dial frequency, mode, DE callsign, DE grid.
+
+    TX fields are all false/zero — map144 is receive-only.
+
+    Field order from WSJT-X NetworkMessage.hpp:
+        quint64  Dial Frequency (Hz)
+        utf8     Mode
+        utf8     DX Call
+        utf8     Report
+        utf8     TX Mode
+        bool     TX Enabled
+        bool     Transmitting
+        bool     Decoding
+        quint32  RX DF  (audio Hz offset)
+        quint32  TX DF
+        utf8     DE Call (my callsign)
+        utf8     DE Grid (my grid)
+        utf8     DX Grid
+        bool     TX Watchdog
+        utf8     Sub-mode
+        bool     Fast mode
+        quint8   Special operation mode
+        quint32  Frequency tolerance (Hz)
+        quint32  T/R period (s)
+        utf8     Configuration Name
+        utf8     TX message
+    """
+    return (_header(MSG_STATUS)
+            + _pack_u64(dial_freq_hz)     # Dial Frequency
+            + _pack_utf8("MSK144")        # Mode
+            + _pack_utf8("")              # DX Call
+            + _pack_utf8("")              # Report
+            + _pack_utf8("MSK144")        # TX Mode
+            + _pack_bool(False)           # TX Enabled
+            + _pack_bool(False)           # Transmitting
+            + _pack_bool(True)            # Decoding
+            + _pack_u32(1500)             # RX DF (audio centre Hz)
+            + _pack_u32(1500)             # TX DF
+            + _pack_utf8(my_call)         # DE Call
+            + _pack_utf8(my_grid)         # DE Grid
+            + _pack_utf8("")              # DX Grid
+            + _pack_bool(False)           # TX Watchdog
+            + _pack_utf8("")              # Sub-mode
+            + _pack_bool(True)            # Fast mode (MSK144 uses fast/short T/R)
+            + struct.pack(">B", 0)        # Special operation mode
+            + _pack_u32(100)              # Frequency tolerance (Hz)
+            + _pack_u32(15)               # T/R period (s)
+            + _pack_utf8("Default")       # Configuration Name
+            + _pack_utf8(""))             # TX message
+
+
+def build_decode(decode: dict, my_call: str, dial_freq_hz: int) -> bytes:
     """Build a WSJT-X Decode (type 2) datagram.
 
     decode dict keys (from detection.py decode_queue):
@@ -157,7 +214,7 @@ def build_decode(seq: int, decode: dict, my_call: str, dial_freq_hz: int) -> byt
 
     delta_freq = 1500   # MSK144 audio centre — matches JT9_BASE_ARGS -f 1500
 
-    return (_header(MSG_DECODE, seq)
+    return (_header(MSG_DECODE)
             + _pack_bool(True)           # is_new
             + _pack_u32(ms_since_midnight)
             + _pack_i32(int(snr))
@@ -205,39 +262,126 @@ def _parse_msk144(message: str):
 
 # ── PSKReporter XML builder ───────────────────────────────────────────────────
 
-def _build_pskreporter_xml(spots: list, my_call: str, my_grid: str,
-                            program: str = "map144") -> bytes:
-    """Build PSKReporter simple XML upload body.
+# ── PSKReporter IPFIX helpers ─────────────────────────────────────────────────
 
-    spots: list of dicts with keys:
-        de_call, de_grid, freq_hz, snr, mode, utc_epoch
+def _ipfix_varlen(data: bytes) -> bytes:
+    """IPFIX variable-length field: 1-byte length prefix (or 3-byte if ≥255)."""
+    n = len(data)
+    if n < 255:
+        return struct.pack('B', n) + data
+    return struct.pack('>BH', 255, n) + data
+
+
+def _ipfix_ef(ie_id: int, length: int) -> bytes:
+    """Enterprise field specifier: IE id with enterprise bit + length + enterprise number."""
+    return struct.pack('>HHI', ie_id | 0x8000, length, PSKREPORTER_ENTERPRISE)
+
+
+def _ipfix_sf(ie_id: int, length: int) -> bytes:
+    """Standard IANA field specifier: IE id + length (no enterprise number)."""
+    return struct.pack('>HH', ie_id, length)
+
+
+def _ipfix_header(total_len: int, export_time: int, seq: int, obs_id: int) -> bytes:
+    return struct.pack('>HHIII', 10, total_len, export_time, seq, obs_id)
+
+
+def _ipfix_pad(body: bytes) -> bytes:
+    """Pad body to 4-byte boundary."""
+    rem = len(body) % 4
+    return body + bytes((4 - rem) % 4)
+
+
+def _build_psk_datagram(spots: list, my_call: str, my_grid: str,
+                         obs_id: int, seq: int,
+                         send_templates: bool = True,
+                         software: str = "map144") -> bytes:
+    """Build a single IPFIX UDP datagram matching WSJT-X PSKReporter.cpp exactly.
+
+    Structure (all in one datagram):
+        IPFIX header
+        [optional] Sender template set   (set ID 2)
+        [optional] Receiver options template set (set ID 3)
+        Receiver data set                (template ID 0x50e2)
+        Sender data set                  (template ID 0x50e3)
+
+    Key details from WSJT-X source:
+        - informationSource = 1 (REPORTER_SOURCE_AUTOMATIC)
+        - Receiver options template scope field count = 0
+        - All sets in one datagram so PSKReporter can correlate templates/data
     """
-    lines = ['<?xml version="1.0" encoding="UTF-8"?>']
-    lines.append('<recvr>')
-    lines.append(f'  <recvrHeader>')
-    lines.append(f'    <appContact>{my_call}</appContact>')
-    lines.append(f'    <recvrCallsign>{my_call}</recvrCallsign>')
-    lines.append(f'    <recvrLocator>{my_grid}</recvrLocator>')
-    lines.append(f'    <programId>{program}</programId>')
-    lines.append(f'  </recvrHeader>')
-    lines.append(f'  <recvrs>')
-    lines.append(f'    <recvr>')
+    VARLEN = 0xFFFF
+    payload = b''
+
+    if send_templates:
+        # Sender template set (set ID 2)
+        sender_tmpl = (
+            struct.pack('>HH', PSKREPORTER_SENDER_TMPL, 7)  # link_id, field_count
+            + _ipfix_ef(0x0001, VARLEN)   # senderCallsign
+            + _ipfix_ef(0x0005, 5)        # frequency (5 bytes)
+            + _ipfix_ef(0x0006, 1)        # sNR (1 byte signed)
+            + _ipfix_ef(0x000a, VARLEN)   # mode
+            + _ipfix_ef(0x0003, VARLEN)   # senderLocator
+            + _ipfix_ef(0x000b, 1)        # informationSource
+            + _ipfix_sf(150, 4)           # dateTimeSeconds (IANA IE 150)
+        )
+        sender_set = struct.pack('>HH', 2, 0) + sender_tmpl
+        sender_set = _ipfix_pad(sender_set)
+        sender_set = struct.pack('>HH', 2, len(sender_set)) + sender_set[4:]
+
+        # Receiver options template set (set ID 3), scope field count = 0
+        recv_tmpl = (
+            struct.pack('>HHH', PSKREPORTER_RECV_TMPL, 5, 0)  # link_id, field_count, scope_count=0
+            + _ipfix_ef(0x0002, VARLEN)   # receiverCallsign
+            + _ipfix_ef(0x0004, VARLEN)   # receiverLocator
+            + _ipfix_ef(0x0008, VARLEN)   # decodingSoftware
+            + _ipfix_ef(0x0009, VARLEN)   # antennaInformation
+            + _ipfix_ef(0x000d, VARLEN)   # rigInformation
+        )
+        recv_tmpl_set = struct.pack('>HH', 3, 0) + recv_tmpl
+        recv_tmpl_set = _ipfix_pad(recv_tmpl_set)
+        recv_tmpl_set = struct.pack('>HH', 3, len(recv_tmpl_set)) + recv_tmpl_set[4:]
+
+        payload += sender_set + recv_tmpl_set
+
+    # Receiver data set (our station info)
+    recv_data = (
+        _ipfix_varlen(my_call.encode('ascii', errors='replace'))
+        + _ipfix_varlen(my_grid.encode('ascii', errors='replace'))
+        + _ipfix_varlen(software.encode('ascii'))
+        + _ipfix_varlen(b'')   # antennaInformation
+        + _ipfix_varlen(b'')   # rigInformation
+    )
+    recv_set = struct.pack('>HH', PSKREPORTER_RECV_TMPL, 0) + recv_data
+    recv_set = _ipfix_pad(recv_set)
+    recv_set = struct.pack('>HH', PSKREPORTER_RECV_TMPL, len(recv_set)) + recv_set[4:]
+    payload += recv_set
+
+    # Sender data set (spots)
+    records = b''
     for sp in spots:
-        utc_str = datetime.fromtimestamp(sp['utc_epoch'], tz=timezone.utc).strftime('%Y%m%d%H%M%S')
-        lines.append(f'      <spot>')
-        lines.append(f'        <senderCallsign>{sp["de_call"]}</senderCallsign>')
-        if sp.get('de_grid'):
-            lines.append(f'        <senderLocator>{sp["de_grid"]}</senderLocator>')
-        lines.append(f'        <frequency>{sp["freq_hz"]}</frequency>')
-        lines.append(f'        <mode>{sp["mode"]}</mode>')
-        if sp.get('snr') is not None:
-            lines.append(f'        <sNR>{sp["snr"]}</sNR>')
-        lines.append(f'        <flowStartSeconds>{utc_str}</flowStartSeconds>')
-        lines.append(f'      </spot>')
-    lines.append(f'    </recvr>')
-    lines.append(f'  </recvrs>')
-    lines.append(f'</recvr>')
-    return '\n'.join(lines).encode('utf-8')
+        call = sp['de_call'].encode('ascii', errors='replace')
+        freq = struct.pack('>Q', int(sp['freq_hz']))[-5:]   # high 5 bytes big-endian
+        snr  = max(-127, min(127, int(sp.get('snr') or 0)))
+        mode = sp.get('mode', 'MSK144').encode('ascii')
+        grid = (sp.get('de_grid') or '').encode('ascii', errors='replace')
+        utc  = int(sp['utc_epoch'])
+        records += (
+            _ipfix_varlen(call)
+            + freq
+            + struct.pack('b', snr)
+            + _ipfix_varlen(mode)
+            + _ipfix_varlen(grid)
+            + struct.pack('B', 1)        # informationSource = 1 (REPORTER_SOURCE_AUTOMATIC)
+            + struct.pack('>I', utc)
+        )
+    sender_set = struct.pack('>HH', PSKREPORTER_SENDER_TMPL, 0) + records
+    sender_set = _ipfix_pad(sender_set)
+    sender_set = struct.pack('>HH', PSKREPORTER_SENDER_TMPL, len(sender_set)) + sender_set[4:]
+    payload += sender_set
+
+    now = int(time.time())
+    return _ipfix_header(16 + len(payload), now, seq, obs_id) + payload
 
 
 # ── Reporter class ────────────────────────────────────────────────────────────
@@ -259,21 +403,38 @@ class Reporter:
         self.wsjtx_port    = 2237
 
         self.pskreporter_enabled = False
+        self.dial_freq_hz        = 0    # updated by report_freq()
+
+        self.dx_enabled = False
+        self.dx_host    = 'dxc.ve7cc.net'
+        self.dx_port    = 7373
+
+        # PSKReporter IPFIX state
+        import random
+        self._psk_obs_id  = random.randint(1, 0xFFFFFFFF)
+        self._psk_seq     = 0
+        self._psk_sock    = None
+
+        # DX cluster state
+        self._dx_sock     = None
+        self._dx_lock     = threading.Lock()
+        self._dx_logged_in = False
 
         # Runtime state
-        self._seq        = 0
         self._sock       = None
         self._running    = False
         self._decode_q   = queue.SimpleQueue()
         self._psk_spots  = []           # pending PSKReporter spots
         self._psk_lock   = threading.Lock()
-        self._last_psk_upload = 0.0
+        self._last_psk_upload = time.time()  # don't upload until first spots arrive
 
         # Stats (read by the UI)
         self.stat_udp_sent      = 0
         self.stat_psk_uploaded  = 0
         self.stat_psk_queued    = 0
         self.stat_last_psk_time = ''
+        self.stat_dx_status     = 'disabled'
+        self.stat_dx_sent       = 0
         self.stat_last_error    = ''
 
         self._hb_thread   = None
@@ -283,13 +444,30 @@ class Reporter:
 
     def apply_settings(self, my_call: str, my_grid: str,
                        wsjtx_enabled: bool, wsjtx_host: str, wsjtx_port: int,
-                       pskreporter_enabled: bool):
+                       pskreporter_enabled: bool,
+                       dx_enabled: bool = False, dx_host: str = 'dxc.ve7cc.net',
+                       dx_port: int = 7373):
         self.my_call   = my_call.strip().upper()
         self.my_grid   = my_grid.strip().upper()
         self.wsjtx_enabled = wsjtx_enabled
         self.wsjtx_host    = wsjtx_host.strip()
         self.wsjtx_port    = int(wsjtx_port)
         self.pskreporter_enabled = pskreporter_enabled
+
+        # Reconnect DX cluster if settings changed
+        dx_changed = (dx_enabled != self.dx_enabled or
+                      dx_host.strip() != self.dx_host or
+                      int(dx_port) != self.dx_port)
+        self.dx_enabled = dx_enabled
+        self.dx_host    = dx_host.strip()
+        self.dx_port    = int(dx_port)
+        if dx_changed:
+            self._dx_disconnect()
+        if self.dx_enabled and self.my_call:
+            self._dx_connect()
+
+        self._send_heartbeat()
+        self._send_status()
 
     def start(self):
         if self._running:
@@ -303,6 +481,9 @@ class Reporter:
         self._hb_thread = threading.Thread(target=self._heartbeat_loop,
                                            daemon=True, name='reporter-hb')
         self._hb_thread.start()
+        # Send heartbeat immediately so GridTracker registers this client
+        # before the first decode arrives (don't wait up to 15 s)
+        self._send_heartbeat()
 
         self._work_thread = threading.Thread(target=self._work_loop,
                                              daemon=True, name='reporter-work')
@@ -320,6 +501,7 @@ class Reporter:
             except Exception:
                 pass
             self._sock = None
+        self._dx_disconnect()
         # Final PSKReporter flush
         if self.pskreporter_enabled and self.my_call:
             self._upload_pskreporter()
@@ -328,17 +510,99 @@ class Reporter:
         """Called from the GUI decode-drain loop for every successful decode."""
         self._decode_q.put(decode)
 
+    def report_freq(self, freq_hz: int):
+        """Called when the tuned frequency changes — triggers a Status send."""
+        if freq_hz != self.dial_freq_hz:
+            self.dial_freq_hz = freq_hz
+            self._send_status()
+
     # ── Internal threads ──────────────────────────────────────────────────────
+
+    def _dx_connect(self):
+        """Open TCP connection to DX cluster and log in with callsign."""
+        with self._dx_lock:
+            if self._dx_sock is not None:
+                return  # already connected
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(10)
+                s.connect((self.dx_host, self.dx_port))
+                s.settimeout(None)
+                # Read banner (may include login prompt), then send callsign
+                s.recv(4096)
+                s.sendall((self.my_call + '\r\n').encode('ascii'))
+                # Read login response
+                s.recv(4096)
+                self._dx_sock = s
+                self._dx_logged_in = True
+                self.stat_dx_status = f"connected: {self.dx_host}:{self.dx_port}"
+                print(f"[reporter] DX cluster: connected to {self.dx_host}:{self.dx_port}", flush=True)
+            except Exception as e:
+                self.stat_dx_status = f"error: {e}"
+                self.stat_last_error = f"DX cluster: {e}"
+                self._dx_sock = None
+                self._dx_logged_in = False
+
+    def _dx_disconnect(self):
+        with self._dx_lock:
+            if self._dx_sock is not None:
+                try:
+                    self._dx_sock.close()
+                except Exception:
+                    pass
+                self._dx_sock = None
+                self._dx_logged_in = False
+                self.stat_dx_status = 'disabled'
+
+    def _dx_send_spot(self, freq_khz: float, dx_call: str, comment: str):
+        """Send one DX spot. Reconnects once if the connection has dropped."""
+        if not (self.dx_enabled and self.my_call):
+            return
+        cmd = f"DX {freq_khz:.1f} {dx_call} {comment}\r\n"
+        for attempt in range(2):
+            with self._dx_lock:
+                if self._dx_sock is None:
+                    break
+                try:
+                    self._dx_sock.sendall(cmd.encode('ascii'))
+                    self.stat_dx_sent += 1
+                    return
+                except OSError:
+                    try:
+                        self._dx_sock.close()
+                    except Exception:
+                        pass
+                    self._dx_sock = None
+                    self._dx_logged_in = False
+                    self.stat_dx_status = 'reconnecting...'
+            if attempt == 0:
+                self._dx_connect()
+
+    def _send_heartbeat(self):
+        if not (self.wsjtx_enabled and self.my_call and self._sock):
+            return
+        try:
+            pkt = build_heartbeat()
+            self._sock.sendto(pkt, (self.wsjtx_host, self.wsjtx_port))
+            self.stat_udp_sent += 1
+        except OSError as e:
+            self.stat_last_error = f"UDP send: {e}"
+
+    def _send_status(self):
+        """Send a WSJT-X Status (type 1) datagram if conditions are met."""
+        if not (self.wsjtx_enabled and self.my_call and self._sock):
+            return
+        try:
+            pkt = build_status(self.dial_freq_hz, self.my_call, self.my_grid)
+            self._sock.sendto(pkt, (self.wsjtx_host, self.wsjtx_port))
+            self.stat_udp_sent += 1
+        except OSError as e:
+            self.stat_last_error = f"UDP send: {e}"
 
     def _heartbeat_loop(self):
         while self._running:
-            if self.wsjtx_enabled and self.my_call and self._sock:
-                try:
-                    pkt = build_heartbeat(self._next_seq())
-                    self._sock.sendto(pkt, (self.wsjtx_host, self.wsjtx_port))
-                    self.stat_udp_sent += 1
-                except OSError as e:
-                    self.stat_last_error = f"UDP send: {e}"
+            self._send_heartbeat()
+            self._send_status()
             for _ in range(HEARTBEAT_INTERVAL_S * 10):
                 if not self._running:
                     return
@@ -372,17 +636,20 @@ class Reporter:
         # ── WSJT-X UDP ────────────────────────────────────────────────────────
         if self.wsjtx_enabled and self.my_call and self._sock:
             try:
-                pkt = build_decode(self._next_seq(), decode, self.my_call, freq_hz)
+                pkt = build_decode(decode, self.my_call, freq_hz)
                 self._sock.sendto(pkt, (self.wsjtx_host, self.wsjtx_port))
                 self.stat_udp_sent += 1
             except OSError as e:
                 self.stat_last_error = f"UDP send: {e}"
 
         # ── PSKReporter ───────────────────────────────────────────────────────
-        if self.pskreporter_enabled and self.my_call and de_call:
+        # Skip self-spots and spots without a grid (PSKReporter requires both)
+        if (self.pskreporter_enabled and self.my_call and de_call
+                and de_call.upper() != self.my_call.upper()
+                and grid):
             spot = {
                 'de_call':   de_call,
-                'de_grid':   grid or '',
+                'de_grid':   grid,
                 'freq_hz':   freq_hz,
                 'snr':       snr,
                 'mode':      'MSK144',
@@ -392,10 +659,23 @@ class Reporter:
                 self._psk_spots.append(spot)
                 self.stat_psk_queued = len(self._psk_spots)
 
+        # ── DX Cluster ────────────────────────────────────────────────────────
+        # Send immediately on each decode; skip self-spots
+        if (self.dx_enabled and self.my_call and de_call
+                and de_call.upper() != self.my_call.upper()):
+            freq_khz = radio_khz
+            snr_str  = f"{snr:+d}dB" if snr is not None else ""
+            grid_str = grid or ""
+            comment  = f"MSK144 {grid_str} {snr_str}".strip()
+            self._dx_send_spot(freq_khz, de_call, comment)
+
+    def _psk_next_seq(self) -> int:
+        self._psk_seq += 1
+        return self._psk_seq
+
     def _upload_pskreporter(self):
         with self._psk_lock:
             if not self._psk_spots:
-                self._last_psk_upload = time.time()
                 return
             spots = list(self._psk_spots)
             self._psk_spots.clear()
@@ -403,18 +683,28 @@ class Reporter:
 
         self._last_psk_upload = time.time()
         try:
-            body = _build_pskreporter_xml(spots, self.my_call, self.my_grid)
-            req  = urllib.request.Request(
-                PSKREPORTER_URL,
-                data=body,
-                headers={'Content-Type': 'application/xml'},
-                method='POST',
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                _ = resp.read()
+            if self._psk_sock is None:
+                self._psk_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+            host = socket.gethostbyname(PSKREPORTER_HOST)
+
+            # Always send templates in the same datagram as data — UDP has no
+            # ordering guarantee and we only upload every 5 min, so the overhead
+            # is negligible and PSKReporter always gets templates before data.
+            dgram = _build_psk_datagram(spots, self.my_call, self.my_grid,
+                                         self._psk_obs_id, self._psk_next_seq(),
+                                         send_templates=True)
+            self._psk_sock.sendto(dgram, (host, PSKREPORTER_PORT))
+
             self.stat_psk_uploaded += len(spots)
             self.stat_last_psk_time = datetime.now(timezone.utc).strftime('%H:%M:%S')
-            print(f"[reporter] PSKReporter: uploaded {len(spots)} spots", flush=True)
+            print(f"[reporter] PSKReporter: sent {len(spots)} spots via IPFIX UDP", flush=True)
+            for sp in spots:
+                print(f"  spot: {sp['de_call']:12s}  {sp['freq_hz']:12d} Hz  "
+                      f"{sp.get('mode','?'):8s}  SNR {sp.get('snr','?'):>4}  "
+                      f"grid {sp.get('de_grid') or '----'}  "
+                      f"t={datetime.fromtimestamp(sp['utc_epoch'], tz=timezone.utc).strftime('%H:%M:%S')}",
+                      flush=True)
         except Exception as e:
             self.stat_last_error = f"PSKReporter: {e}"
             print(f"[reporter] PSKReporter upload failed: {e}", flush=True)
@@ -423,6 +713,3 @@ class Reporter:
                 self._psk_spots = spots + self._psk_spots
                 self.stat_psk_queued = len(self._psk_spots)
 
-    def _next_seq(self) -> int:
-        self._seq += 1
-        return self._seq

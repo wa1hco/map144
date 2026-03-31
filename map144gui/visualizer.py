@@ -33,6 +33,7 @@ from .ui import (
     on_select_source_airspy,
     on_select_source_rtlsdr,
     on_select_source_usrp,
+    _on_about,
 )
 from .source_windows import on_usrp_gain_changed, on_usrp_antenna_changed
 from .runtime import setup_radio_client, _connect_radio_client, run_radio_source, _get_tuned_frequency_mhz, closeEvent
@@ -56,6 +57,7 @@ class MAP144Visualizer(Engine, QtWidgets.QMainWindow):
     on_select_source_airspy = on_select_source_airspy
     on_select_source_rtlsdr = on_select_source_rtlsdr
     on_select_source_usrp = on_select_source_usrp
+    _on_about = _on_about
     on_usrp_gain_changed = on_usrp_gain_changed
     on_usrp_antenna_changed = on_usrp_antenna_changed
     setup_radio_client = setup_radio_client
