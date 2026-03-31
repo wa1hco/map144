@@ -510,6 +510,10 @@ def update_source_windows(self):
     if iq_nb_win is not None and iq_nb_win.isVisible():
         _update_iq_nb_window(self)
 
+    # Reporting (always — stats update even when window hidden)
+    from .reporting_window import update_reporting_window
+    update_reporting_window(self)
+
     # Radio windows — only update if visible
     if getattr(self, '_flex_win',   None) is not None and self._flex_win.isVisible():
         _update_flex_window(self, sig_str, noise_str, rate_str, drops_str)

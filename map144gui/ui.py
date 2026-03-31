@@ -88,6 +88,7 @@ def setup_ui(self):
         setup_iq_nb_window, setup_flex_window, setup_usrp_window,
         setup_airspy_window, setup_rtlsdr_window,
     )
+    from .reporting_window import setup_reporting_window
 
     self.setWindowTitle(f'map144 - {self.center_freq_mhz:.3f} MHz')
     self.setGeometry(50, 50, 420, 800)
@@ -132,14 +133,15 @@ def setup_ui(self):
 
     view_menu = menu_bar.addMenu("&View")
 
-    fg_action      = QtWidgets.QAction("Fast Graph",          self)
-    det_action     = QtWidgets.QAction("Detection Heatmap",   self)
-    iq_nb_action   = QtWidgets.QAction("IQ / Noise Blanker",  self)
-    flex_action    = QtWidgets.QAction("Flex Radio",           self)
-    usrp_action    = QtWidgets.QAction("USRP B210",            self)
-    airspy_action  = QtWidgets.QAction("Airspy HF+",           self)
-    rtlsdr_action  = QtWidgets.QAction("RTL-SDR",              self)
-    for act in (fg_action, det_action, iq_nb_action,
+    fg_action        = QtWidgets.QAction("Fast Graph",          self)
+    det_action       = QtWidgets.QAction("Detection Heatmap",   self)
+    iq_nb_action     = QtWidgets.QAction("IQ / Noise Blanker",  self)
+    reporting_action = QtWidgets.QAction("Reporting",            self)
+    flex_action      = QtWidgets.QAction("Flex Radio",           self)
+    usrp_action      = QtWidgets.QAction("USRP B210",            self)
+    airspy_action    = QtWidgets.QAction("Airspy HF+",           self)
+    rtlsdr_action    = QtWidgets.QAction("RTL-SDR",              self)
+    for act in (fg_action, det_action, iq_nb_action, reporting_action,
                 flex_action, usrp_action, airspy_action, rtlsdr_action):
         act.setCheckable(True)
         act.setChecked(True)
@@ -290,11 +292,12 @@ def setup_ui(self):
     det_layout.addWidget(detect_sliders)
 
     # ── Panel windows: source-specific ───────────────────────────────────────
-    setup_iq_nb_window(self,  iq_nb_action)
-    setup_flex_window(self,   flex_action)
-    setup_usrp_window(self,   usrp_action)
-    setup_airspy_window(self, airspy_action)
-    setup_rtlsdr_window(self, rtlsdr_action)
+    setup_iq_nb_window(self,      iq_nb_action)
+    setup_reporting_window(self,  reporting_action)
+    setup_flex_window(self,       flex_action)
+    setup_usrp_window(self,       usrp_action)
+    setup_airspy_window(self,     airspy_action)
+    setup_rtlsdr_window(self,     rtlsdr_action)
 
     # ── Wire View menu actions ────────────────────────────────────────────────
     fg_action.triggered.connect(
@@ -305,6 +308,9 @@ def setup_ui(self):
     )
     iq_nb_action.triggered.connect(
         lambda checked: self._iq_nb_win.show() if checked else self._iq_nb_win.hide()
+    )
+    reporting_action.triggered.connect(
+        lambda checked: self._reporting_win.show() if checked else self._reporting_win.hide()
     )
     flex_action.triggered.connect(
         lambda checked: self._flex_win.show() if checked else self._flex_win.hide()
@@ -325,6 +331,7 @@ def setup_ui(self):
         (self._fast_graph_win, 'fast_graph_geometry', QtCore.QRect(480, 50,  850, 650)),
         (self._detect_win,     'detect_geometry',     QtCore.QRect(480, 710, 850, 350)),
         (self._iq_nb_win,      'iq_nb_geometry',      QtCore.QRect(50,  870, 380, 420)),
+        (self._reporting_win,  'reporting_geometry',  QtCore.QRect(820, 870, 380, 500)),
         (self._flex_win,       'flex_geometry',       QtCore.QRect(450, 870, 360, 500)),
         (self._usrp_win,       'usrp_geometry',       QtCore.QRect(450, 870, 360, 440)),
         (self._airspy_win,     'airspy_geometry',     QtCore.QRect(450, 870, 360, 340)),
@@ -342,13 +349,16 @@ def setup_ui(self):
     # when a source is selected.
     fg_visible  = _SETTINGS.value('fast_graph_visible', True,  type=bool)
     det_visible = _SETTINGS.value('detect_visible',     True,  type=bool)
-    iq_nb_visible = _SETTINGS.value('iq_nb_visible',    True,  type=bool)
+    iq_nb_visible      = _SETTINGS.value('iq_nb_visible',       True,  type=bool)
+    reporting_visible  = _SETTINGS.value('reporting_visible',    True,  type=bool)
     fg_action.setChecked(fg_visible)
     det_action.setChecked(det_visible)
     iq_nb_action.setChecked(iq_nb_visible)
-    if fg_visible:    self._fast_graph_win.show()
-    if det_visible:   self._detect_win.show()
-    if iq_nb_visible: self._iq_nb_win.show()
+    reporting_action.setChecked(reporting_visible)
+    if fg_visible:         self._fast_graph_win.show()
+    if det_visible:        self._detect_win.show()
+    if iq_nb_visible:      self._iq_nb_win.show()
+    if reporting_visible:  self._reporting_win.show()
 
     # Radio windows start hidden
     for win in (self._flex_win, self._usrp_win, self._airspy_win, self._rtlsdr_win):

@@ -191,6 +191,10 @@ def update_displays(self):
             rf_mhz    = radio_khz / 1000.0
             snr_str   = f"{snr:+d} dB" if snr is not None else "  ?"
             self.decode_panel.insertItem(0, f"{utc_time}  {rf_mhz:.3f}  {snr_str:>7}  {msg}")
+            # Forward to reporter (WSJT-X UDP + PSKReporter)
+            rpt = getattr(self, 'reporter', None)
+            if rpt is not None:
+                rpt.report_decode(result)
 
     # ── Detection heatmap + markers — skip when panel is hidden ──────────────
     _detect_win = getattr(self, '_detect_win', None)
