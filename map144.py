@@ -151,7 +151,13 @@ def main():
     app.setQuitOnLastWindowClosed(True)
 
     def _graceful_shutdown(_signum, _frame):
-        QtCore.QTimer.singleShot(0, app.quit)
+        # Close the main window rather than calling app.quit() directly.
+        # app.quit() exits the event loop without firing closeEvent, so the
+        # source-stop logic in closeEvent (UHD stop, FlexDAX stop, etc.) is
+        # skipped and UHD's C++ destructor calls std::terminate.
+        # window.close() fires closeEvent → sources stop → event.accept() →
+        # main window is destroyed → quitOnLastWindowClosed triggers app.quit.
+        QtCore.QTimer.singleShot(0, app._window.close)
 
     signal.signal(signal.SIGINT, _graceful_shutdown)
     signal.signal(signal.SIGTERM, _graceful_shutdown)

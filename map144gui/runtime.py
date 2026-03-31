@@ -1003,5 +1003,15 @@ def closeEvent(self, event):
             self.client_thread.terminate()
             self.client_thread.wait()
 
+    # Close all panel windows explicitly.  Since _PanelWindow is now a true
+    # top-level window (parent=None), quitOnLastWindowClosed will not fire
+    # until every top-level window is closed.  _app_closing=True above ensures
+    # their closeEvent accepts rather than ignoring the event.
+    for _attr in ('_fast_graph_win', '_detect_win', '_iq_nb_win',
+                  '_flex_win', '_usrp_win', '_airspy_win', '_rtlsdr_win'):
+        _w = getattr(self, _attr, None)
+        if _w is not None:
+            _w.close()
+
     print("Shutdown complete")
     event.accept()
