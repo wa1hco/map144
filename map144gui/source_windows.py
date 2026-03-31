@@ -68,6 +68,7 @@ def _add_stream_rows(form, parent, prefix):
     form.addRow("Signal:",       _stat_label(parent, f"{prefix}_sig_dbfs_val"))
     form.addRow("Noise Floor:",  _stat_label(parent, f"{prefix}_noise_dbfs_val"))
     form.addRow("Buffer Drops:", _stat_label(parent, f"{prefix}_drops_val", color="#c76000"))
+    form.addRow("Queue:",        _stat_label(parent, f"{prefix}_queue_val"))
 
 
 def _set_stream_vals(self, prefix, rate_str, sig_str, noise_str, drops_str):
@@ -75,6 +76,25 @@ def _set_stream_vals(self, prefix, rate_str, sig_str, noise_str, drops_str):
     _setlbl(self, f"{prefix}_sig_dbfs_val",   sig_str)
     _setlbl(self, f"{prefix}_noise_dbfs_val", noise_str)
     _setlbl(self, f"{prefix}_drops_val",      drops_str)
+
+
+def _set_queue_label(parent, attr, q):
+    """Update a queue-fullness label from a queue.Queue object."""
+    lbl = getattr(parent, attr, None)
+    if lbl is None or q is None:
+        return
+    used    = q.qsize()
+    maxsize = q.maxsize or 1
+    pct     = used / maxsize * 100
+    text    = f"{used} / {maxsize}  ({pct:.0f}%)"
+    if pct >= 90:
+        color = "#b71c1c"   # red — nearly full
+    elif pct >= 50:
+        color = "#c76000"   # orange — getting full
+    else:
+        color = "#1a6b1a"   # green — healthy
+    lbl.setText(text)
+    lbl.setStyleSheet(f"QLabel {{ color: {color}; font-family: monospace; }}")
 
 
 def _compute_dbfs(self):
@@ -289,6 +309,7 @@ def setup_flex_window(self, view_action):
     dax_form.addRow("UDP Port:",    _stat_label(self, "_flex_udp_port_val"))
     dax_form.addRow("Mode:",        _stat_label(self, "_flex_mode_val"))
     dax_form.addRow("Pkt Rate:",    _stat_label(self, "_flex_pkt_rate_val"))
+    dax_form.addRow("Queue:",       _stat_label(self, "_flex_vita_queue_val"))
     dax_form.addRow("Loss:",        _stat_label(self, "_flex_loss_val"))
     layout.addWidget(dax_grp)
     layout.addStretch()
@@ -633,9 +654,15 @@ def _update_flex_window(self, sig_str, noise_str, rate_str, drops_str):
         self._flex_prev_pkt_count = total
         _setlbl(self, '_flex_pkt_rate_val', f"{rate:,} /s")
         _setlbl(self, '_flex_loss_val',     f"{loss_pct:.3f}%")
+        _set_queue_label(self, '_flex_vita_queue_val', vita.out_q)
     else:
-        _setlbl(self, '_flex_pkt_rate_val', "—")
-        _setlbl(self, '_flex_loss_val',     "—")
+        _setlbl(self, '_flex_pkt_rate_val',   "—")
+        _setlbl(self, '_flex_vita_queue_val', "—")
+        _setlbl(self, '_flex_loss_val',       "—")
+
+    # IF Stream queue (same underlying queue)
+    q = rc.sample_queue if rc is not None else None
+    _set_queue_label(self, '_flex_queue_val', q)
 
 
 def _update_usrp_window(self, sig_str, noise_str, rate_str, drops_str):
@@ -644,6 +671,7 @@ def _update_usrp_window(self, sig_str, noise_str, rate_str, drops_str):
         freq = uc.center_freq_mhz_actual if uc is not None else self.center_freq_mhz
         self._usrp_freq_val.setText(f"{freq:.6f} MHz")
     _set_stream_vals(self, "_usrp", rate_str, sig_str, noise_str, drops_str)
+    _set_queue_label(self, '_usrp_queue_val', uc.sample_queue if uc is not None else None)
     # Query serial once after hardware opens
     if (uc is not None and getattr(uc, '_usrp', None) is not None
             and not getattr(self, '_usrp_serial_queried', False)):
@@ -662,6 +690,7 @@ def _update_airspy_window(self, sig_str, noise_str, rate_str, drops_str):
         freq = ac.center_freq_mhz_actual if ac is not None else self.center_freq_mhz
         self._airspy_freq_val.setText(f"{freq:.6f} MHz")
     _set_stream_vals(self, "_airspy", rate_str, sig_str, noise_str, drops_str)
+    _set_queue_label(self, '_airspy_queue_val', ac.sample_queue if ac is not None else None)
     if ac is not None:
         hw_rate = getattr(ac, '_hw_rate', None)
         _setlbl(self, '_airspy_hw_rate_val', f"{hw_rate/1000:.0f} kHz" if hw_rate else "—")
@@ -679,6 +708,7 @@ def _update_rtlsdr_window(self, sig_str, noise_str, rate_str, drops_str):
         freq = rc.center_freq_mhz_actual if rc is not None else self.center_freq_mhz
         self._rtlsdr_freq_val.setText(f"{freq:.6f} MHz")
     _set_stream_vals(self, "_rtlsdr", rate_str, sig_str, noise_str, drops_str)
+    _set_queue_label(self, '_rtlsdr_queue_val', rc.sample_queue if rc is not None else None)
     if rc is not None:
         from .rtlsdr_source import _HW_RATE, _DECIMATE
         _setlbl(self, '_rtlsdr_index_val',   str(getattr(rc, 'device_index', 0)))
