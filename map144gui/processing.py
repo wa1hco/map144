@@ -94,10 +94,11 @@ _METRIC_HIST_DEPTH = 300        # frames of rolling linear-peak history for perc
                                  # mirroring the xmed normalisation in WSJT-X msk144spd.f90.
 _METRIC_HIST_STRIDE = 3         # subsample history for partition — evaluate every 3rd frame
                                  # (63 ms effective resolution) at 1/3 the compute cost.
-_COINCIDENCE_MAX_CH = 8         # max channels that may trigger simultaneously.
-                                 # MSK144 signal ≈ 2 kHz wide → triggers ≤ 3 adjacent channels.
-                                 # If ≥ _COINCIDENCE_MAX_CH channels fire in one hop it is
-                                 # broadband noise that slipped past the blanker — suppress all.
+_COINCIDENCE_MAX_CH  = 8        # count gate: if ≥ this many channels fire it is broadband noise.
+_COINCIDENCE_SPAN_CH = 5        # spread gate: if triggered channels span > this many kHz AND
+                                 # ≥ 3 channels triggered, it is noise (real MSK144 ping is
+                                 # ≈2–2.5 kHz wide in the linear channel domain → spans ≤ 3–4
+                                 # adjacent 1-kHz channels even when strong).
 _CH_DETECT_HOP     = CH_DETECT_SIZE // 2   # 50 % overlap hop
 # Enough slots to cover one full 15-second window at the channeliser hop rate
 N_SNR_HIST = int(15 * CH_SAMPLE_RATE / _CH_DETECT_HOP) + 2   # ≈ 705
@@ -326,13 +327,18 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
 
         _triggered = np.where(pair_metric > DETECT_THRESH_DB)[0]
 
-        # Coincidence gate — if too many channels fire simultaneously it is
-        # broadband noise that slipped past the FFT blanker (e.g. a semi-broadband
-        # impulse that elevated fewer than NB_BROADBAND_FRAC bins per block but
-        # still spread energy across the full channelised band).
-        # A real MSK144 signal is ≈2 kHz wide and triggers at most 3 adjacent
-        # channels; anything above _COINCIDENCE_MAX_CH is suppressed entirely.
-        if len(_triggered) >= _COINCIDENCE_MAX_CH:
+        # Coincidence gate — suppress if channels are too numerous OR too spread out.
+        # Noise (lightning, static crash) elevates many channels, often non-contiguous,
+        # spanning >10 kHz.  A real MSK144 ping is ≈2–2.5 kHz wide in the linear channel
+        # domain and triggers ≤ 3–4 adjacent channels in a tight cluster.
+        # Two independent criteria, either one triggers suppression:
+        #   count  — ≥ _COINCIDENCE_MAX_CH channels fired (same as before)
+        #   spread — triggered channels span > _COINCIDENCE_SPAN_CH kHz with ≥ 3 triggers
+        #            (catches scattered noise with fewer than 8 total triggers)
+        _freq_span = (int(_triggered[-1]) - int(_triggered[0])) if len(_triggered) >= 2 else 0
+        _too_many   = len(_triggered) >= _COINCIDENCE_MAX_CH
+        _too_spread = _freq_span > _COINCIDENCE_SPAN_CH and len(_triggered) >= 3
+        if _too_many or _too_spread:
             for _ck in _triggered:
                 self._detect_cooldowns[_ck] = cooldown_hops
             self._ch_buf[:, :len(self._ch_buf[0])] = 0  # flush buffer — samples are contaminated
