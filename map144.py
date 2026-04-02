@@ -15,38 +15,31 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """map144 — MSK144 meteor scatter decoder for FlexRadio 6000 series.
 
-map144 monitors the MSK144 calling frequency and 20 KHz either side.  
-If an MSK144 meteor-scatter ping occurs within 20 KHz of the calling 
-frequency map144 decodes it using the jt9 engine from WSJT-X.  
-Decoded contacts are logged to ``launches.jsonl`` and the audio surrounding 
+map144 monitors the MSK144 calling frequency and 20 KHz either side.
+If an MSK144 meteor-scatter ping occurs within 20 KHz of the calling
+frequency map144 decodes it using the jt9 engine from WSJT-X.
+Decoded contacts are logged to ``launches.jsonl`` and the audio surrounding
 each detection is saved as a timestamped WAV file for offline review.
 
 IQ samples are streamed from a radio with at least 48 kHz sample rate IQ data.
-Radios include Flex, USRP, Airspy, and RTL-SDR. 
+Radios include Flex, USRP, Airspy, and RTL-SDR.
 
-A 48-channel polyphase channelizer resolves the band into 1 kHz sub-channels; 
-each sub-channel is monitored independently for the paired-tone signature 
-of an MSK144 burst.
+A 48-channel polyphase channelizer resolves the band into 1 kHz sub-channels;
+each sub-channel is monitored independently for the paired-tone signature
+of an MSK144 burst. The assumption is that operators will choose 1 KHz increments
+for their operation +/- tolerance.
 
-A GUI (PyQt5) provides several options for viewing program status, including 
-a live spectrogram, detection heatmap, SNR history, and decode log.  Running 
-with ``--headless`` skips the GUI and runs the decoder engine only, suitable 
-for unattended overnight operation or integration with logging tools such as 
-PSKreporter or N1MM.
+A GUI (PyQt5) provides several options for viewing program status, including
+a live spectrogram, detection heatmap, SNR history, and decode log.
 
 Usage
 -----
 ::
 
-    python map144.py [--rate RATE] [--bind-client-id UUID] [--log-level LEVEL]
-    python map144.py --headless [--source radio|wav] [--wav PATH]
+    python map144.py [--bind-client-id UUID] [--log-level LEVEL]
 
 Command-line arguments
 ----------------------
---rate RATE
-    IQ sample rate in Hz forwarded to the radio client.  Must match the DAX
-    IQ rate configured on the radio.  Default: 48000.
-
 --bind-client-id UUID
     Client UUID string used for the FlexRadio ``client bind client_id=<uuid>``
     command, required when the radio firmware enforces client binding.  When
@@ -59,13 +52,6 @@ Command-line arguments
 --log-level LEVEL
     Verbosity for the root logger and the ``flexclient`` logger.
     Choices: DEBUG, INFO, WARNING, ERROR, CRITICAL.  Default: INFO.
-
---headless
-    Run without a GUI.  Starts the decoder engine and processes IQ data until
-    SIGINT or SIGTERM.
-
---source {radio,wav}
-    Source mode for headless operation.  Default: radio.
 
 Bootstrap sequence
 ------------------
@@ -110,8 +96,6 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='map144 MSK144 meteor scatter decoder')
-    parser.add_argument('--rate', type=int, default=48000,
-                        help='Sample rate in Hz (default: 48000)')
     parser.add_argument('--bind-client-id', type=str, default=None,
                         help='GUI client UUID for `client bind client_id=<uuid>`')
     parser.add_argument('--bind-client', type=str, default=None,
@@ -119,29 +103,9 @@ def main():
     parser.add_argument('--log-level', type=str, default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help='Logging verbosity (default: INFO)')
-    parser.add_argument('--headless', action='store_true',
-                        help='Run without a GUI (headless DSP engine mode)')
-    parser.add_argument('--source', type=str, default='radio',
-                        choices=['radio', 'wav'],
-                        help='Source mode for headless operation (default: radio)')
-    parser.add_argument('--wav', type=str, default=None,
-                        help='Path to WAV file for headless wav source mode')
     args = parser.parse_args()
 
     _configure_logging(args.log_level)
-
-    if args.headless:
-        from map144gui.engine import Engine
-        engine = Engine(
-            sample_rate=getattr(args, 'rate', 48000),
-            bind_client_id=getattr(args, 'bind_client_id', None) or getattr(args, 'bind_client', None),
-        )
-        engine.source_mode = getattr(args, 'source', 'radio')
-        if hasattr(args, 'wav') and args.wav:
-            engine.selected_wav_path = args.wav
-            engine.source_mode = 'wav'
-        engine.run_headless()
-        sys.exit(0)
 
     import shutil
     if shutil.which('jt9') is None:
@@ -166,7 +130,6 @@ def main():
     signal.signal(signal.SIGTERM, _graceful_shutdown)
 
     window = MAP144Visualizer(
-        sample_rate=args.rate,
         bind_client_id=args.bind_client_id or args.bind_client,
     )
     window.show()

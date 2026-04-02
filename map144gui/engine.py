@@ -12,15 +12,10 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Headless DSP engine — no Qt imports.
-
-Can be used standalone (headless mode) or as a base class for
-MAP144Visualizer(Engine, QMainWindow).
-"""
+"""DSP engine — no Qt imports.  Base class for MAP144Visualizer(Engine, QMainWindow)."""
 
 import datetime
 import queue
-import signal
 
 import numpy as np
 
@@ -150,22 +145,5 @@ class Engine:
         self.display_center_freq_mhz = -1.0  # force report_freq() on first display update
 
     def setup_radio_client(self):
-        """No-op in headless mode — overridden by MAP144Visualizer for Qt thread."""
+        """No-op base implementation — overridden by MAP144Visualizer for Qt thread."""
         self.radio_client = None
-
-    def run_headless(self):
-        """Block and process IQ data with no GUI.  SIGINT/SIGTERM trigger clean shutdown."""
-        from .runtime import _connect_radio_client, run_radio_source, _stop_radio_source
-
-        def _shutdown(_sig, _frame):
-            print("[map144] headless shutdown requested", flush=True)
-            self.running = False
-            _stop_radio_source(self)
-
-        signal.signal(signal.SIGINT,  _shutdown)
-        signal.signal(signal.SIGTERM, _shutdown)
-
-        if self.source_mode == 'radio':
-            _connect_radio_client(self)
-
-        run_radio_source(self)
