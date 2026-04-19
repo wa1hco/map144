@@ -60,6 +60,7 @@ def setup_reporting_window(self, view_action):
 
     self._rpt_wsjtx_cb = QtWidgets.QCheckBox("Enable")
     self._rpt_wsjtx_cb.setChecked(_SETTINGS.value('reporting_wsjtx_enabled', False, type=bool))
+    self._rpt_wsjtx_cb.stateChanged.connect(lambda: _on_enable_changed(self))
     udp_form.addRow("", self._rpt_wsjtx_cb)
 
     self._rpt_wsjtx_host = QtWidgets.QLineEdit(
@@ -85,6 +86,7 @@ def setup_reporting_window(self, view_action):
 
     self._rpt_dx_cb = QtWidgets.QCheckBox("Enable")
     self._rpt_dx_cb.setChecked(_SETTINGS.value('reporting_dx_enabled', False, type=bool))
+    self._rpt_dx_cb.stateChanged.connect(lambda: _on_enable_changed(self))
     dx_form.addRow("", self._rpt_dx_cb)
 
     self._rpt_dx_host = QtWidgets.QLineEdit(
@@ -110,6 +112,7 @@ def setup_reporting_window(self, view_action):
 
     self._rpt_psk_cb = QtWidgets.QCheckBox("Enable")
     self._rpt_psk_cb.setChecked(_SETTINGS.value('reporting_psk_enabled', False, type=bool))
+    self._rpt_psk_cb.stateChanged.connect(lambda: _on_enable_changed(self))
     psk_form.addRow("", self._rpt_psk_cb)
     psk_form.addRow("Protocol:", QtWidgets.QLabel("IPFIX UDP → report.pskreporter.info:4739"))
 
@@ -147,6 +150,24 @@ def setup_reporting_window(self, view_action):
     self.reporter = Reporter()
     _on_reporting_apply(self)
     self.reporter.start()
+
+
+def _on_enable_changed(self):
+    """Save enable checkboxes immediately and push to Reporter — no Apply needed."""
+    from .visualizer import _SETTINGS
+    wsjtx_en = self._rpt_wsjtx_cb.isChecked()
+    psk_en   = self._rpt_psk_cb.isChecked()
+    dx_en    = self._rpt_dx_cb.isChecked()
+    _SETTINGS.setValue('reporting_wsjtx_enabled', wsjtx_en)
+    _SETTINGS.setValue('reporting_psk_enabled',   psk_en)
+    _SETTINGS.setValue('reporting_dx_enabled',    dx_en)
+    rpt = getattr(self, 'reporter', None)
+    if rpt is not None:
+        rpt.apply_settings(
+            rpt.my_call, rpt.my_grid,
+            wsjtx_en, rpt.wsjtx_host, rpt.wsjtx_port,
+            psk_en, dx_en, rpt.dx_host, rpt.dx_port,
+        )
 
 
 def _on_reporting_apply(self):

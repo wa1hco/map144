@@ -84,6 +84,7 @@ class _USRPPacket:
     __slots__ = ('samples', 'timestamp_int', 'timestamp_frac')
 
     def __init__(self, samples, timestamp_int, timestamp_frac):
+        # samples: complex64 shape (N, num_channels)
         self.samples        = samples
         self.timestamp_int  = timestamp_int
         self.timestamp_frac = timestamp_frac
@@ -155,7 +156,8 @@ class USRPSource:
                  gain_db: float = 30.0,
                  antenna: str = "RX2",
                  lo_offset_hz: float = 40_000.0,
-                 device_args: str = ""):
+                 device_args: str = "",
+                 dual_channel: bool = False):
         if not _UHD_AVAILABLE:
             raise RuntimeError(
                 "UHD Python package not found — install with: sudo apt install python3-uhd"
@@ -167,40 +169,49 @@ class USRPSource:
         self.antenna                = antenna
         self.lo_offset_hz           = lo_offset_hz
         self.device_args            = device_args
+        self.dual_channel           = dual_channel   # True → enable RX channel 1 (RX2 port)
         self.sample_queue           = queue.Queue(maxsize=4000)
         self.center_freq_mhz_actual = center_freq_mhz
 
-        self._usrp      = None
-        self._streamer  = None
-        self._thread    = None
-        self._running   = False
-        self._decimator = None
-        self._nco_phase = 0.0   # running NCO phase accumulator (radians)
+        self._usrp       = None
+        self._streamer   = None
+        self._thread     = None
+        self._running    = False
+        self._decimator  = None   # ch0 decimator
+        self._decimator1 = None   # ch1 decimator (dual_channel only)
+        self._nco_phase  = 0.0   # running NCO phase accumulator (radians)
+        self._nco_phase1 = 0.0   # ch1 NCO phase
+        self.ch0_rms     = None  # rolling RMS amplitude for display (ch0)
+        self.ch1_rms     = None  # rolling RMS amplitude for display (ch1)
+        self.recv_count  = 0    # total recv() calls that returned n > 0 (monotonic)
 
     # ── Public API ────────────────────────────────────────────────────────
 
     def start(self):
         self._usrp = _uhd.usrp.MultiUSRP(self.device_args)
 
-        self._usrp.set_rx_rate(_HW_RATE, 0)
-        actual_rate = self._usrp.get_rx_rate(0)
+        channels = [0, 1] if self.dual_channel else [0]
 
-        # Tune LO below the target so the signal arrives at +lo_offset_hz in
-        # the IF.  The NCO in _recv_loop then shifts it to DC while pushing
-        # the LO leakage artifact to -lo_offset_hz (stopband of the FIR).
-        lo_tune_hz = self.center_freq_mhz * 1e6 - self.lo_offset_hz
-        tune_result = self._usrp.set_rx_freq(
-            _uhd.libpyuhd.types.tune_request(lo_tune_hz), 0
-        )
+        for ch in channels:
+            self._usrp.set_rx_rate(_HW_RATE, ch)
+            lo_tune_hz = self.center_freq_mhz * 1e6 - self.lo_offset_hz
+            tune_result = self._usrp.set_rx_freq(
+                _uhd.libpyuhd.types.tune_request(lo_tune_hz), ch
+            )
+            # Ch0 uses the user-configured gain; ch1 uses _gain_ch1 if set
+            gain = self.gain_db if ch == 0 else getattr(self, '_gain_ch1', self.gain_db)
+            self._usrp.set_rx_gain(gain, ch)
+            # Ch0 uses the user-selected antenna; ch1 uses _antenna_ch1 if set
+            ant = self.antenna if ch == 0 else getattr(self, '_antenna_ch1', 'RX2')
+            self._usrp.set_rx_antenna(ant, ch)
+
+        actual_rate = self._usrp.get_rx_rate(0)
         # Report the target RF frequency, not the raw LO position.
         self.center_freq_mhz_actual = (tune_result.actual_rf_freq + self.lo_offset_hz) / 1e6
 
-        self._usrp.set_rx_gain(self.gain_db, 0)
-        self._usrp.set_rx_antenna(self.antenna, 0)
-
         # Create RX streamer — fc32 (complex float32) from host, sc16 over wire.
         st_args = _uhd.usrp.StreamArgs("fc32", "sc16")
-        st_args.channels = [0]
+        st_args.channels = channels
         self._streamer = self._usrp.get_rx_stream(st_args)
 
         # Synchronise USRP internal clock to system wall time so that
@@ -208,15 +219,26 @@ class USRPSource:
         self._usrp.set_time_now(_uhd.types.TimeSpec(time.time()), 0)
 
         # Start continuous streaming.
+        # Multi-channel streamers require a timed start — stream_now=True causes
+        # "will fail to time align" on UHD ≥4.x with >1 channel.  A future
+        # time_spec aligns both channels.  UHD pads with zeros until the command
+        # fires, so we record the wall-clock equivalent and skip those packets.
         stream_cmd = _uhd.types.StreamCMD(_uhd.types.StreamMode.start_cont)
-        stream_cmd.stream_now = True
+        if self.dual_channel:
+            _delay = 0.25   # seconds — enough for USB scheduling + UHD machinery
+            stream_cmd.stream_now = False
+            stream_cmd.time_spec  = self._usrp.get_time_now(0) + _uhd.types.TimeSpec(_delay)
+            self._stream_start_wall = time.time() + _delay
+        else:
+            stream_cmd.stream_now = True
+            self._stream_start_wall = 0.0
         self._streamer.issue_stream_cmd(stream_cmd)
 
-        self._decimator = _make_decimator()
-        self._nco_phase = 0.0
+        self._decimator  = _make_decimator()
+        self._decimator1 = _make_decimator() if self.dual_channel else None
+        self._nco_phase  = 0.0
+        self._nco_phase1 = 0.0
         # Precompute NCO rotation table for one full recv buffer.
-        # _recv_loop multiplies chunk by (scalar_rot * table[:ns]) which is
-        # two cheap ops instead of np.arange + np.exp per chunk.
         if self.lo_offset_hz != 0.0:
             _nco_step = -2.0 * np.pi * self.lo_offset_hz / _HW_RATE
             self._nco_table = np.exp(
@@ -231,11 +253,16 @@ class USRPSource:
                                         name='usrp-recv')
         self._thread.start()
 
+        ch1_info = (f"  RF1: gain={getattr(self, '_gain_ch1', self.gain_db):.0f} dB  "
+                    f"antenna={getattr(self, '_antenna_ch1', 'RX2')}"
+                    if self.dual_channel else "")
         print(f"[usrp] started: {self.center_freq_mhz_actual:.4f} MHz  "
               f"LO offset={self.lo_offset_hz/1e3:+.1f} kHz  "
               f"hw={actual_rate:.0f} Hz  decimation={_DECIMATE}x  "
               f"out={_TARGET_RATE} Hz  "
-              f"gain={self.gain_db} dB  antenna={self.antenna}", flush=True)
+              f"RF0: gain={self.gain_db:.0f} dB  antenna={self.antenna}  "
+              f"channels={'dual' if self.dual_channel else 'single'}"
+              f"{ch1_info}", flush=True)
 
     def stop(self):
         self._running = False
@@ -253,13 +280,39 @@ class USRPSource:
 
     # ── Internal receive loop (runs in daemon thread) ─────────────────────
 
+    def _nco_apply(self, chunk, phase_attr):
+        """Apply NCO shift to chunk; update running phase. Returns shifted chunk."""
+        if self._nco_table is None:
+            return chunk
+        ns  = len(chunk)
+        rot = np.exp(1j * getattr(self, phase_attr)).astype(np.complex64)
+        out = chunk * (rot * self._nco_table[:ns])
+        setattr(self, phase_attr,
+                float((getattr(self, phase_attr) + self._nco_step * ns) % (2.0 * np.pi)))
+        return out
+
     def _recv_loop(self):
-        recv_buffer = np.zeros(_RECV_SIZE, dtype=np.complex64)
-        metadata    = _uhd.types.RXMetadata()
+        # For a timed start (dual_channel), sleep until the commanded time arrives
+        # before calling recv().  UHD over USB pads with zeros until the time_spec
+        # fires; calling recv() too early also risks the streamer delivering an
+        # internal burst of garbage.  Sleeping past the start time is safe because
+        # UHD buffers samples internally.
+        start_wall = getattr(self, '_stream_start_wall', 0.0)
+        if start_wall > 0.0:
+            remaining = start_wall - time.time()
+            if remaining > 0:
+                time.sleep(remaining + 0.05)   # +50 ms margin
+
+        # UHD Python recv() writes in-place into a 2D numpy array (channels × samples).
+        # A Python list of 1D arrays does NOT work — the binding copies list elements
+        # rather than writing back, leaving the originals at zero.
+        num_ch = 2 if self.dual_channel else 1
+        recv_bufs = np.zeros((num_ch, _RECV_SIZE), dtype=np.complex64)
+        metadata = _uhd.types.RXMetadata()
 
         while self._running:
             try:
-                n = self._streamer.recv(recv_buffer, metadata, timeout=1.0)
+                n = self._streamer.recv(recv_bufs, metadata, timeout=1.0)
             except Exception as exc:
                 print(f"[usrp] recv error: {exc}", flush=True)
                 time.sleep(0.1)
@@ -275,30 +328,39 @@ class USRPSource:
             if n <= 0:
                 continue
 
-            chunk = recv_buffer[:n].copy()
-
-            # NCO: shift signal from +lo_offset_hz to DC at the hardware rate
-            # (192 kHz) BEFORE the decimation FIR.  The FIR then rejects the
-            # LO artifact at -lo_offset_hz.  The NCO must run at _HW_RATE, not
-            # the decimated target_rate — shifting by 40 kHz after decimation
-            # to 48 kHz would exceed the 24 kHz Nyquist and alias.
-            # The precomputed table holds one full buffer of exp(j*step*n); a single
-            # scalar rotation factor advances the phase across chunks — avoiding the
-            # per-chunk np.arange + np.exp that profiled at ~15% of recv_loop.
-            if self._nco_table is not None:
-                ns  = len(chunk)
-                rot = np.exp(1j * self._nco_phase).astype(np.complex64)
-                chunk = chunk * (rot * self._nco_table[:ns])
-                self._nco_phase = float(
-                    (self._nco_phase + self._nco_step * ns) % (2.0 * np.pi)
-                )
-
-            chunk = self._decimator(chunk)
-
+            self.recv_count += 1
             ts_int  = metadata.time_spec.get_full_secs()
             ts_frac = int(metadata.time_spec.get_frac_secs() * 1e12)
 
-            pkt = _USRPPacket(chunk, ts_int, ts_frac)
+            if self.dual_channel:
+                # Apply NCO and decimate each channel independently.
+                # NCO must run at _HW_RATE before decimation FIR.
+                ch0 = self._nco_apply(recv_bufs[0, :n].copy(), '_nco_phase')
+                ch1 = self._nco_apply(recv_bufs[1, :n].copy(), '_nco_phase1')
+                ch0 = self._decimator(ch0)
+                ch1 = self._decimator1(ch1)
+                # Update rolling RMS for display (exponential moving average).
+                _alpha = 0.05
+                _rms0 = float(np.sqrt(np.mean(np.abs(ch0) ** 2)))
+                _rms1 = float(np.sqrt(np.mean(np.abs(ch1) ** 2)))
+                self.ch0_rms = _rms0 if self.ch0_rms is None else (1 - _alpha) * self.ch0_rms + _alpha * _rms0
+                self.ch1_rms = _rms1 if self.ch1_rms is None else (1 - _alpha) * self.ch1_rms + _alpha * _rms1
+                # Stack into (N, 2) — zero-copy column view from np.column_stack
+                samples = np.column_stack((ch0, ch1))
+            else:
+                # NCO: shift signal from +lo_offset_hz to DC at the hardware rate
+                # (192 kHz) BEFORE the decimation FIR.  The FIR then rejects the
+                # LO artifact at -lo_offset_hz.  The NCO must run at _HW_RATE, not
+                # the decimated target_rate — shifting by 40 kHz after decimation
+                # to 48 kHz would exceed the 24 kHz Nyquist and alias.
+                chunk = self._nco_apply(recv_bufs[0, :n].copy(), '_nco_phase')
+                chunk = self._decimator(chunk)
+                _alpha = 0.05
+                _rms0 = float(np.sqrt(np.mean(np.abs(chunk) ** 2)))
+                self.ch0_rms = _rms0 if self.ch0_rms is None else (1 - _alpha) * self.ch0_rms + _alpha * _rms0
+                samples = chunk.reshape(-1, 1)
+
+            pkt = _USRPPacket(samples, ts_int, ts_frac)
             try:
                 self.sample_queue.put_nowait(pkt)
             except queue.Full:

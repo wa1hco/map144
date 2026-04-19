@@ -1,72 +1,100 @@
-#!/usr/bin/env python3
-"""Generate a combined 48 kHz complex MSK144 test stream from WAV burst files.
+#!/home/jeff/ham/map144/.venv/bin/python3
+"""Generate a combined 48 kHz complex MSK144 test stream for pipeline testing.
 
 This tool produces a synthetic complex IQ test vector that exercises the full
-detection and decode pipeline of the radio IQ visualiser and ``analyze_msk144.py``.
+detection and decode pipeline of map144 (processing.py → detection.py → jt9).
 It supports two source modes and a rich set of signal-conditioning steps.
 
 Operating modes (selected by ``--count``)
 -----------------------------------------
-Mode 1 — msk144sim ping generation (``--count N``, default)
-    ``N`` pings are generated on-the-fly by calling the ``msk144sim`` binary
-    (from the WSJT-X build tree).  Each ping's frequency, time offset, SNR,
-    and duration are chosen randomly within configurable ranges and encoded
-    into a self-describing 13-character MSK144 free-text message of the form
-    ``A[P/N][ff][ttt][P/N][dd][www]``:
+Mode 1 — msk144code ping generation (``--count N``, default)
+    ``N`` pings are generated using the ``msk144code`` binary (from the WSJT-X
+    build tree) to obtain exact 144-chip symbol sequences.  Each ping's
+    frequency, time offset, SNR, and duration are chosen randomly within
+    configurable ranges and encoded into a self-describing 10-character MSK144
+    free-text message of the form ``A[P/N][ff][ttt][P/N][dd]``:
 
-    ======= ========= ============
-    Field   Width     Range
-    ======= ========= ============
+    ======= ========= =============================================
+    Field   Width     Meaning
+    ======= ========= =============================================
     A       1 char    literal prefix
-    ±freq   3 chars   ±00–24 kHz from band center
-    time    3 chars   0.5–15.0 s (deciseconds)
-    ±snr    3 chars   −10 to +3 dB
-    width   3 chars   50–300 ms
-    ======= ========= ============
+    [P/N]   1 char    sign of freq (P=positive/zero, N=negative)
+    [ff]    2 chars   |freq| in kHz, 00–17
+    [ttt]   3 chars   time in deciseconds, 005–145
+    [P/N]   1 char    sign of SNR (P=positive/zero, N=negative)
+    [dd]    2 chars   |SNR| in dB, 03–10
+    ======= ========= =============================================
 
-    ``P`` / ``N`` encodes sign. ``msk144sim`` is called at SNR = 55 dB (close to
-    int16 clipping) so that the extracted ping segment is essentially noise-free
-    before the caller adds its own AWGN.  The msk144sim envelope is re-applied
-    to the extracted window to suppress the constant background noise that
-    ``msk144sim`` adds across the whole file.
+    The chips are modulated with phase-continuous MSK at 2000 baud (±500 Hz
+    tones), wrapped in a Gamma meteor-trail envelope, and placed at the exact
+    channelizer channel frequency so the squared-spectrum detector (±1 kHz
+    tone windows) sees the signal at DC in the correct channel row.
 
 Mode 2 — existing WAV files (``--count 0``)
     WAV files are loaded from ``--input-dir`` (default ``./MSK144``), placed at
     random centre frequencies within ±``--freq-range-hz`` and random time
     offsets up to ``--max-delay-s``.
 
-Signal conditioning pipeline (applied to every source in both modes)
----------------------------------------------------------------------
-1. **Read** — ``read_wav_mono`` / ``read_wav_mono`` normalises to ±1 float32.
-   Supports 8-bit unsigned, 16-bit signed, 32-bit IEEE float, and 32-bit int.
-2. **Resample** — ``resample_linear`` upsamples from 12 kHz (msk144sim native)
-   to the output rate (default 48 kHz) using linear interpolation.  Fast and
-   allocation-light; good enough for the 48 kHz display pipeline.
-3. **Bandpass** — ``_bandpass_real_fft`` applies an FFT-domain bandpass filter
-   (default 300–2700 Hz, 10 % cosine tapers) to strip the wideband Gaussian
-   noise embedded in ``msk144sim`` output before IQ conversion.
-4. **Real → analytic** — ``_real_to_analytic`` zeroes the negative-frequency
-   bins via FFT to produce a single-sideband complex signal.  Without this
-   step, frequency-shifting a real signal creates a mirror image at the
-   reflected frequency that would pollute the passband.
-5. **Frequency shift** — ``freq_shift_real_to_complex`` multiplies by a complex
-   LO ``exp(j·2π·Δf·t)`` to place the signal at the target centre frequency.
-6. **SNR scaling** (Mode 1 only) — amplitude is scaled by
-   ``10^(snr_db/20)`` relative to the reference attenuation so that each ping
-   arrives at the receiver at the SNR encoded in its message.
-7. **AWGN** — complex Gaussian noise is added at the level requested by
-   ``--noise-floor-dbfs`` (dBFS, where 0 dBFS = ±1.0).  The per-sample noise
-   RMS per I/Q component is ``σ = √N × 10^(noise_floor_dbfs/20)`` where N is
-   the display FFT size (4096), so the noise floor seen in the spectrogram
-   matches the requested value directly.
-8. **Normalise** — the signal array is scaled to 0.95 peak *before* adding
-   noise so that ``write_iq_wav``'s internal renormalisation does not disturb
-   the calibrated noise floor.
+
+Frequency placement and the channelizer
+----------------------------------------
+Channel k captures signals from stations whose USB dial is at
+``calling_freq + k × 1000 Hz``.
+
+In USB radio the dial is the suppressed carrier; signal energy is 1500 Hz above
+the dial.  A station with dial at ``calling_freq + k × 1000 Hz`` transmits energy
+at ``calling_freq + k × 1000 + 1500 Hz``.  In the IQ stream centred at
+``calling_freq``, that energy appears at ``k × 1000 + 1500 Hz`` from DC.
+Channel k's NCO is placed exactly there (see channelizer.py).
+
+For the squaring detector to find the MSK144 tone pair at ±1000 Hz, the signal
+must land at DC in the channel output.  This tool therefore places each test
+signal at::
+
+    target_hz = freq_khz × 1000 + 1500   [Hz from IQ DC, pan = calling_freq]
+
+which matches channel ``freq_khz``'s NCO exactly.
+
+After detection, ``extract_and_decode`` (detection.py) mixes the carrier from
+``fc_hz`` to 1500 Hz so jt9 receives audio centred at 1500 Hz::
+
+    shift_hz = fc_hz − 1500
+
+For an on-channel signal: ``fc_hz = freq_khz × 1000 + 1500``, so
+``shift_hz = freq_khz × 1000`` and the carrier lands at 1500 Hz in the audio.
+
+The frequency logged for the operator::
+
+    radio_khz = pan_center_khz + (fc_hz − 1500) / 1000 = pan_center_khz + freq_khz
+
+This is the station's USB dial offset from ``calling_freq`` in kHz — the number
+on the operator's radio.
+
+Nyquist edge guard
+~~~~~~~~~~~~~~~~~~
+Signals at ±18–24 kHz alias through the polyphase filter bank edges into ch0/ch47,
+producing spurious triggers.  ``FREQ_MIN/MAX_KHZ`` is clamped to ±17 kHz.
+
+Signal conditioning pipeline (Mode 1)
+--------------------------------------
+1. **msk144code** — get 144 BPSK chips for the message text.
+2. **Tile + modulate** — tile chips to cover the echo duration and modulate once
+   with phase-continuous MSK (2000 baud, ±500 Hz) so burst boundaries are
+   seamless.  Tiling the *waveform* instead would create phase jumps at every
+   72 ms burst boundary that corrupt jt9 correlation.
+3. **Gamma envelope** — multiply by ``e·(t/τ)·exp(−t/τ)`` to simulate a
+   meteor trail with decay constant τ = width_ms / 1000 s.
+4. **Frequency shift** — mix to ``freq_khz × 1000 + 1500 Hz`` via complex LO,
+   matching the channelizer NCO for channel ``freq_khz``.
+5. **SNR scaling** — amplitude calibrated so peak SNR matches the encoded value
+   (WSJT-X 2500 Hz reference bandwidth convention).
+6. **AWGN** — complex Gaussian noise added at ``--noise-floor-dbfs``.
 
 Outputs
 -------
-``--output-iq-wav``  Stereo int16 WAV, left = I, right = Q (auto-named by timestamp and count)
-``--plot-output``    PNG spectrogram of the combined stream with signal placement markers
+Stereo (or 4-channel) IEEE float32 WAV, left=I, right=Q, auto-named by
+timestamp and signal count (e.g. ``msk144_20260411_103800_10sig.wav``).
+A JSON manifest records each signal's parameters for use by ``compare_msk144.py``.
 
 Diagnostic display (``plot_wav_diagnostics``)
 ---------------------------------------------
@@ -91,10 +119,11 @@ via ``_median_update_mask``.
 
 Key constants
 -------------
-SOURCE_CENTER_HZ            : 1500 Hz — audio centre of all source WAV / msk144sim files
-MSK144SIM_GENERATE_SNR_DB   : 55 dB   — msk144sim SNR for clean ping generation
+FREQ_MIN/MAX_KHZ            : ±17 kHz — signal placement range (within monitored band)
+MSK144SIM_GENERATE_SNR_DB   : 55 dB   — msk144sim SNR for reference ping generation
 PING_EXTRACT_START_S        : 1.0 s   — where first ping lands in msk144sim output
 PING_EXTRACT_DURATION_S     : 1.0 s   — window extracted per ping
+MSK144_SNR_BW_HZ            : 2500 Hz — WSJT-X SNR reference bandwidth
 DIAGNOSTIC_NFFT             : 512     — FFT size used for all diagnostic spectrograms
 DIAGNOSTIC_CHUNK_SAMPLES    : 504     — chunk size emulating real-time receive cadence
 """
@@ -136,13 +165,17 @@ MSK144SIM_SAMPLE_RATE = 12000
 PING_EXTRACT_START_S = 1.0       # first ping lands at t=1 s in msk144sim output
 PING_EXTRACT_DURATION_S = 1.0    # one second of ping audio to extract
 
-# Parameter encoding ranges (match message format "A[±][ff][ttt][±][dd][www]")
-FREQ_MIN_KHZ = -22
-FREQ_MAX_KHZ = +22
+# Parameter encoding ranges (match message format "A[P/N][ff][ttt][P/N][dd]")
+# ±17 kHz keeps signals within the reliably monitored channelizer band.
+# Channels within 4 of the Nyquist bin (ch 24 = ±24 kHz) are edge-skipped by
+# the detector.  Signals at ±18–24 kHz can also alias through the polyphase
+# filter bank edges into ch0/ch47, causing spurious triggers at DC.
+FREQ_MIN_KHZ = -17
+FREQ_MAX_KHZ = +17
 TIME_MIN_DS  =   5               # deciseconds ( 0.5 s)
 TIME_MAX_DS  = 145               # deciseconds (14.5 s)
-SNR_MIN_DB   =  +2
-SNR_MAX_DB   =  +10
+SNR_MIN_DB   =   0
+SNR_MAX_DB   =  +6
 WIDTH_MIN_MS = 200
 WIDTH_MAX_MS = 500
 WIDTH_CLAMP_MIN_MS = 10          # avoid division-by-zero inside msk144sim
@@ -237,34 +270,72 @@ def freq_shift_real_to_complex(samples: np.ndarray, shift_hz: float, sample_rate
 
 
 def write_iq_wav(path: Path, iq: np.ndarray, sample_rate: int,
-                 scale: float | None = None) -> None:
-    """Write complex IQ as stereo float32 WAV (left=I, right=Q).
+                 scale: float | None = None,
+                 iq_ch1: np.ndarray | None = None) -> None:
+    """Write complex IQ as float32 WAV.
+
+    Single-channel (iq_ch1=None): stereo WAV, left=I, right=Q.
+    Dual-channel (iq_ch1 provided): 4-channel WAV, ch0_I, ch0_Q, ch1_I, ch1_Q.
+
+    The 4-channel format is backward-compatible in the sense that single-channel
+    readers will still open the file; only readers that check n_channels==4 will
+    decode ch1 (runtime._load_wav_complex does this automatically).
 
     If *scale* is None (default) the array is peak-normalised to 0.95 full
-    scale.  Pass an explicit scale (e.g. 1.0) to write with a fixed gain so
-    that calibrated noise floors are preserved across the write/read round-trip.
+    scale across all channels.  Pass an explicit scale (e.g. 1.0) to write
+    with a fixed gain so that calibrated noise floors are preserved.
 
     Float32 format eliminates the int16 quantization noise floor (~−134 dBFS)
     that otherwise appears as wideband noise across the full ±24 kHz spectrum
     when signal amplitudes are small relative to ±1.0 full scale.  The reader
     in runtime._load_wav_complex detects float32 samples automatically.
     """
-    i = np.real(iq)
-    q = np.imag(iq)
-    interleaved = np.empty(iq.size * 2, dtype=np.float32)
-    interleaved[0::2] = i
-    interleaved[1::2] = q
+    if iq_ch1 is not None:
+        # 4-channel interleave: ch0_I, ch0_Q, ch1_I, ch1_Q per frame
+        n = min(len(iq), len(iq_ch1))
+        interleaved = np.empty(n * 4, dtype=np.float32)
+        interleaved[0::4] = np.real(iq[:n])
+        interleaved[1::4] = np.imag(iq[:n])
+        interleaved[2::4] = np.real(iq_ch1[:n])
+        interleaved[3::4] = np.imag(iq_ch1[:n])
+        n_channels = 4
+    else:
+        interleaved = np.empty(iq.size * 2, dtype=np.float32)
+        interleaved[0::2] = np.real(iq)
+        interleaved[1::2] = np.imag(iq)
+        n_channels = 2
 
     if scale is None:
         peak = float(np.max(np.abs(interleaved))) if interleaved.size else 1.0
         scale = 0.95 / peak if peak > 0 else 1.0
     pcm = np.clip(interleaved * scale, -1.0, 1.0).astype(np.float32)
 
-    with wave.open(str(path), 'wb') as wf:
-        wf.setnchannels(2)
-        wf.setsampwidth(4)  # 4 bytes = float32; reader detects via finite-value heuristic
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm.tobytes())
+    # Write RIFF/WAVE with format code 3 (IEEE float32) using manual packing.
+    # Python's wave module always writes format code 1 (PCM) — using it here
+    # would cause _load_wav_complex to reinterpret float32 bits as int32.
+    import struct as _struct
+    data_bytes  = pcm.tobytes()
+    sampwidth   = 4                  # float32 = 4 bytes
+    fmt_code    = 3                  # WAVE_FORMAT_IEEE_FLOAT
+    byte_rate   = sample_rate * n_channels * sampwidth
+    block_align = n_channels * sampwidth
+    with open(str(path), 'wb') as f:
+        data_size  = len(data_bytes)
+        chunk_size = 36 + data_size
+        f.write(b'RIFF')
+        f.write(_struct.pack('<I', chunk_size))
+        f.write(b'WAVE')
+        f.write(b'fmt ')
+        f.write(_struct.pack('<I', 16))
+        f.write(_struct.pack('<H', fmt_code))
+        f.write(_struct.pack('<H', n_channels))
+        f.write(_struct.pack('<I', sample_rate))
+        f.write(_struct.pack('<I', byte_rate))
+        f.write(_struct.pack('<H', block_align))
+        f.write(_struct.pack('<H', sampwidth * 8))
+        f.write(b'data')
+        f.write(_struct.pack('<I', data_size))
+        f.write(data_bytes)
 
 
 def parse_float_list(text: str) -> list[float]:
@@ -273,131 +344,188 @@ def parse_float_list(text: str) -> list[float]:
 
 # ── Ping message encoding / decoding ──────────────────────────────────────
 
-def encode_ping_message(freq_khz: int, time_ds: int, snr_db: int, width_ms: int) -> str:
-    """Encode ping parameters into a 13-character MSK144 free-text message.
+def encode_ping_message(freq_khz: int, time_ds: int, snr_db: int, width_ms: int = 0) -> str:
+    """Encode ping parameters into a 10-character MSK144 free-text message.
 
-    Format: A[P/N][ff][ttt][P/N][dd][www]
+    Format: A[P/N][ff][ttt][P/N][dd]
       A        – literal prefix character
       [P/N]    – sign of freq_khz  ('P' = positive/zero, 'N' = negative)
       [ff]     – abs(freq_khz) as 2 digits, 00–24
       [ttt]    – time in deciseconds as 3 digits, 005–150
       [P/N]    – sign of snr_db   ('P' = positive/zero, 'N' = negative)
       [dd]     – abs(snr_db) as 2 digits, 00–10
-      [www]    – width in milliseconds as 3 digits, 000–999
-    Total: 1+1+2+3+1+2+3 = 13 characters.
+    Total: 1+1+2+3+1+2 = 10 characters.
     P/N are used instead of +/- because '+' is not reliably preserved by the
-    MSK144 message encoder (it maps to '0' in some positions).
+    MSK144 message encoder.  width_ms is accepted but ignored (MSK144 burst
+    is always 60 ms when generated via msk144code).
     """
     freq_sign = 'P' if freq_khz >= 0 else 'N'
     snr_sign  = 'P' if snr_db  >= 0 else 'N'
-    return f"A{freq_sign}{abs(freq_khz):02d}{time_ds:03d}{snr_sign}{abs(snr_db):02d}{width_ms:03d}"
+    return f"A{freq_sign}{abs(freq_khz):02d}{time_ds:03d}{snr_sign}{abs(snr_db):02d}"
 
 
 def decode_ping_message(msg: str) -> dict:
-    """Decode a 13-character ping message back to its parameters."""
+    """Decode a ping message back to its parameters."""
     freq_khz = (1 if msg[1] == 'P' else -1) * int(msg[2:4])
     time_ds  = int(msg[4:7])
     snr_db   = (1 if msg[7] == 'P' else -1) * int(msg[8:10])
-    width_ms = int(msg[10:13])
-    return {'freq_khz': freq_khz, 'time_ds': time_ds, 'snr_db': snr_db, 'width_ms': width_ms}
+    return {'freq_khz': freq_khz, 'time_ds': time_ds, 'snr_db': snr_db, 'width_ms': 60}
 
 
-def generate_synthetic_ping(width_ms: int, sample_rate: int = 12000) -> tuple[np.ndarray, int]:
-    """Generate a zero-noise synthetic MSK-like ping at SOURCE_CENTER_HZ.
+def _modulate_msk144(chips: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Modulate BPSK chips as MSK with half-sine pulse shaping.
 
-    Produces a clean two-tone FSK burst (tones at SOURCE_CENTER_HZ ± 500 Hz)
-    with the same Gamma envelope that msk144sim uses.  No AWGN is added at any
-    stage, so the output is numerically exact to float64 precision.
-
-    The tone alternates between +500 Hz and −500 Hz every symbol period
-    (2400 baud) with phase-continuous transitions, mimicking MSK modulation.
-    Unlike msk144sim output, there is absolutely no embedded noise.
-
-    Returns (samples_float32, sample_rate) matching the shape expected by the
-    caller (same as generate_ping_wav).
+    MSK144: 2000 baud, ±500 Hz tones, 72 ms per 144-chip burst.
+    Returns unit-amplitude complex64 of length ceil(len(chips) * sample_rate / 2000).
+    Phase is continuous across all chips — pass tiled chips for phase-continuous repeats.
     """
-    width_s = max(width_ms, WIDTH_CLAMP_MIN_MS) / 1000.0
-    n = int(PING_EXTRACT_DURATION_S * sample_rate)
-    t = np.arange(n, dtype=np.float64) / sample_rate
+    sps     = sample_rate / 2000.0
+    n_burst = int(np.ceil(len(chips) * sps))
+    phase   = np.zeros(n_burst, dtype=np.float64)
 
-    # Gamma envelope (same formula as msk144sim)
-    t_norm = t / width_s
-    env = np.where(
-        (t_norm >= 0.0) & (t_norm <= 10.0),
-        np.e * t_norm * np.exp(-t_norm),
-        0.0,
-    )
+    running_phase = 0.0
+    for i, chip in enumerate(chips):
+        sym_start = int(round(i * sps))
+        sym_end   = min(int(round((i + 1) * sps)), n_burst)
+        n_sym = sym_end - sym_start
+        if n_sym <= 0:
+            continue
+        k     = np.arange(n_sym, dtype=np.float64)
+        pulse = np.sin(np.pi * k / sps)
+        norm  = np.sum(pulse)
+        steps = chip * (np.pi / 2.0) * pulse / norm if norm > 0 else np.zeros(n_sym)
+        phase[sym_start:sym_end] = running_phase + np.cumsum(steps)
+        running_phase = float(phase[sym_end - 1])
 
-    # Phase-continuous MSK: alternate ±500 Hz tones every symbol period
-    symbol_period = sample_rate // 2400  # samples per symbol (integer approx)
-    symbol_period = max(symbol_period, 1)
-    deviation_hz = 500.0
-    phase = np.zeros(n, dtype=np.float64)
-    for i in range(1, n):
-        symbol_idx = i // symbol_period
-        freq = SOURCE_CENTER_HZ + deviation_hz * (1 - 2 * (symbol_idx % 2))
-        phase[i] = phase[i - 1] + 2.0 * np.pi * freq / sample_rate
-    samples = (np.cos(phase) * env).astype(np.float32)
-    return samples, sample_rate
+    return np.exp(1j * phase).astype(np.complex64)
 
 
-def generate_ping_wav(msg: str, width_ms: int = None, snr_db: int = None) -> tuple[np.ndarray, int]:
-    """Call msk144sim to generate a ping, extract the first ping at t=1 s.
+def generate_ping_msk144code(msg: str, center_hz: float, delay_s: float,
+                             snr_db: float, noise_sigma: float,
+                             width_ms: int = 300,
+                             pol_scenario: str = 'pure-H',
+                             rng=None,
+                             sample_rate: int = 48000,
+                             flat_frame: bool = False) -> tuple:
+    """Generate a realistic MSK144 meteor-scatter echo from msk144code symbols.
 
-    Returns (samples, sample_rate) where samples covers PING_EXTRACT_DURATION_S
-    seconds of 12 kHz mono audio starting at t=PING_EXTRACT_START_S.
+    Physical model
+    --------------
+    The transmitter is H-polarized.  On reflection from the meteor trail, the
+    polarization plane is rotated by angle θ (Faraday rotation through the
+    ionosphere plus the trail geometry contribution).  θ is effectively frozen
+    across a single 72 ms ping but is random from ping to ping.  The receiver
+    sees two orthogonal components:
 
-    width_ms and snr_db may be supplied explicitly (for callsign messages) or
-    left as None to decode them from the diagnostic "A..." message format.
+        rH(t) = cos θ(t) · s(t) · g_H
+        rV(t) = sin θ(t) · s(t) · g_V · exp(j·Δφ(t))
+
+    where s(t) is the Gamma-enveloped, frequency-shifted, amplitude-scaled
+    baseband burst.  Independent AWGN per antenna is added by the caller.
+
+    Phase continuity across burst boundaries is preserved by tiling the 144
+    chips and modulating the full sequence in one pass — tiling the
+    already-modulated waveform would introduce a phase jump at every 72 ms
+    boundary that jt9 cannot correlate through.
+
+    SNR definition
+    --------------
+    snr_db is defined as the peak SNR a perfectly-aligned H receiver would see
+    at θ=0° (equivalently, the SNR of an MRC-combined H+V receiver for any θ):
+
+        peak² / (2·σ²·BW/fs) = 10^(snr_db/10)     BW = 2500 Hz
+
+    After polarization splitting:
+        SNR_H   = snr_db + 20·log₁₀(|cos θ|)      (−∞ at θ=90°)
+        SNR_V   = snr_db + 20·log₁₀(|sin θ|)      (−∞ at θ=0°)
+        SNR_MRC = snr_db                           (MRC H+V, independent of θ)
+
+    Parameters
+    ----------
+    msg          : MSK144 message string (passed to msk144code)
+    center_hz    : signal carrier in the IQ stream (Hz from DC).
+                   Must equal freq_khz × 1000 + 1500 to land at DC in the channel.
+    delay_s      : time of echo onset (t=0 of Gamma envelope) in seconds
+    snr_db       : peak SNR at θ=0° (WSJT-X definition, 2500 Hz bandwidth)
+    noise_sigma  : per-sample AWGN sigma used for SNR calibration
+    width_ms     : trail decay time constant τ in ms; echo duration ≈ 10τ s
+                   (ignored when flat_frame=True)
+    flat_frame   : if True, emit exactly one 72 ms frame at constant amplitude
+                   (no Gamma envelope) — use this to match QEX-style sensitivity tests
+    pol_scenario : polarization scenario — see _apply_pol_split for names
+    rng          : numpy Generator; created internally if None
+    sample_rate  : output sample rate in Hz
+
+    Returns
+    -------
+    (ping_h, ping_v, pol_meta)
+        ping_h   : complex64 array — H-antenna signal (no noise)
+        ping_v   : complex64 array — V-antenna signal (no noise), same shape
+        pol_meta : dict — pol_scenario, theta0_deg, delta_phi0_deg, w_h, w_v
     """
-    if width_ms is None or snr_db is None:
-        params   = decode_ping_message(msg)
-        width_ms = width_ms if width_ms is not None else params['width_ms']
-        snr_db   = snr_db   if snr_db   is not None else params['snr_db']
+    if rng is None:
+        rng = np.random.default_rng()
 
-    width_s = max(width_ms, WIDTH_CLAMP_MIN_MS) / 1000.0
+    # ── 1. Get 144 channel symbols from msk144code ────────────────────────
+    result = subprocess.run(['msk144code', msg], capture_output=True, text=True, check=True)
+    lines = result.stdout.strip().splitlines()
+    sym_lines = [l for l in lines if set(l.strip()) <= {'0', '1'} and len(l.strip()) >= 60]
+    if len(sym_lines) < 2:
+        raise RuntimeError(f"msk144code output unexpected for {msg!r}:\n{result.stdout}")
+    bits = [int(b) for line in sym_lines[:2] for b in line.strip()]
+    if len(bits) != 144:
+        raise RuntimeError(f"Expected 144 symbols, got {len(bits)}")
 
-    work_dir = Path(tempfile.mkdtemp(prefix='msk144sim_'))
-    try:
-        cmd = [
-            'msk144sim',
-            msg,
-            str(MSK144SIM_TR_PERIOD),
-            str(MSK144SIM_AUDIO_CENTER_HZ),
-            f"{width_s:.3f}",
-            str(MSK144SIM_GENERATE_SNR_DB),   # always high → clean ping, no embedded noise
-            "1",
-        ]
-        subprocess.run(cmd, cwd=str(work_dir), check=True,
-                       capture_output=True, text=True)
+    chips = np.array([1 if b else -1 for b in bits], dtype=np.float64)
 
-        wav_path = work_dir / "000000_000001.wav"
-        samples, sample_rate = read_wav_mono(wav_path)
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+    # ── 2. Build burst stream ─────────────────────────────────────────────
+    sps     = sample_rate / 2000.0
+    n_burst = int(np.ceil(144 * sps))
 
-    start = int(PING_EXTRACT_START_S * sample_rate)
-    end   = start + int(PING_EXTRACT_DURATION_S * sample_rate)
-    ping  = samples[start:end].copy()
+    if flat_frame:
+        # Single frame, constant amplitude — no meteor propagation model.
+        # Matches the QEX / WSJT-X sensitivity test: one 72 ms frame at
+        # uniform power.
+        echo_n = n_burst
+        stream = _modulate_msk144(chips, sample_rate)[:echo_n]
+        stream = stream.astype(np.complex64)
+    else:
+        width_s  = max(width_ms, 10) / 1000.0
+        echo_dur = 10.0 * width_s
+        echo_n   = int(np.ceil(echo_dur * sample_rate))
+        n_reps   = int(np.ceil(echo_n / n_burst))
+        chips_tiled = np.tile(chips, n_reps)
+        stream = _modulate_msk144(chips_tiled, sample_rate)[:echo_n]
 
-    # msk144sim adds constant AWGN across the whole file regardless of the ping
-    # envelope, so the extracted window is mostly pure noise at the start (where
-    # the envelope rises from 0) and in the long decay tail.  Multiply by the
-    # same Gamma envelope msk144sim uses to drive the noise to zero wherever the
-    # signal is near-silent.  Combined with MSK144SIM_GENERATE_SNR_DB=55 this
-    # makes the embedded noise ~60 dB below the peak signal — invisible.
-    width_s_eff = max(width_ms, WIDTH_CLAMP_MIN_MS) / 1000.0
-    n = ping.size
-    t_norm = np.arange(n, dtype=np.float64) / sample_rate / width_s_eff
-    # Exact msk144sim envelope: e·t·exp(−t) for t∈[0,10], else 0
-    env = np.where(
-        (t_norm >= 0.0) & (t_norm <= 10.0),
-        np.e * t_norm * np.exp(-t_norm),
-        0.0,
-    ).astype(np.float32)
-    ping = ping * env
+        # ── 3. Gamma envelope A(t) = e·(t/τ)·exp(−t/τ) ──────────────────
+        t_norm = np.arange(echo_n, dtype=np.float64) / sample_rate / width_s
+        env    = np.where(t_norm > 0, np.e * t_norm * np.exp(-t_norm), 0.0).astype(np.float32)
+        stream = (stream * env).astype(np.complex64)
 
-    return ping, sample_rate
+    # t is needed for the frequency shift in step 4
+    t = np.arange(echo_n, dtype=np.float64) / sample_rate
+
+    # ── 4. Frequency shift to IF centre ───────────────────────────────────
+    stream = (stream * np.exp(1j * 2.0 * np.pi * center_hz * t)).astype(np.complex64)
+
+    # ── 5. SNR-calibrated amplitude ────────────────────────────────────────
+    # Scale so that at θ=0° the H channel reaches the target peak SNR.
+    # The cos/sin polarization split preserves total power: SNR_H + SNR_V = snr_db.
+    BW  = 2500.0
+    amp = noise_sigma * np.sqrt(2.0 * (10.0 ** (snr_db / 10.0)) * BW / sample_rate)
+    stream = (stream * amp).astype(np.complex64)
+
+    # ── 6. Polarization split ─────────────────────────────────────────────
+    rH, rV, pol_meta = _apply_pol_split(stream, pol_scenario, rng, sample_rate)
+
+    # ── 7. Place echo at delay in output arrays ────────────────────────────
+    delay_n = int(round(delay_s * sample_rate))
+    out_h   = np.zeros(delay_n + echo_n, dtype=np.complex64)
+    out_v   = np.zeros(delay_n + echo_n, dtype=np.complex64)
+    out_h[delay_n:] = rH
+    out_v[delay_n:] = rV
+
+    return out_h, out_v, pol_meta
 
 
 def _gui_like_colormap() -> LinearSegmentedColormap:
@@ -1199,7 +1327,7 @@ def _plot_output_spectrogram(
     combined: np.ndarray,
     sample_rate: int,
     output_path: Path,
-    placements: list[tuple[str, float, float]],
+    placements: list[dict],
 ) -> None:
     """Save a spectrogram of the combined IQ output with signal placement markers."""
     t_s, freq_hz, spec_db = _compute_spectrogram_db(combined, sample_rate)
@@ -1221,16 +1349,132 @@ def _plot_output_spectrogram(
     ax.set_title('Combined IQ Test Signal – Spectrogram')
 
     # Mark each signal's center frequency and start time
-    for name, center_hz, delay_s in placements:
-        ax.axhline(center_hz / 1000.0, color='red', lw=0.7, ls='--', alpha=0.6)
-        ax.axvline(delay_s, color='yellow', lw=0.7, ls=':', alpha=0.6)
-        ax.text(delay_s + 0.05, center_hz / 1000.0 + 0.2,
-                f'{center_hz/1000:+.1f}kHz', color='red', fontsize=7)
+    for p in placements:
+        ax.axhline(p['center_hz'] / 1000.0, color='red', lw=0.7, ls='--', alpha=0.6)
+        ax.axvline(p['delay_s'], color='yellow', lw=0.7, ls=':', alpha=0.6)
+        ax.text(p['delay_s'] + 0.05, p['center_hz'] / 1000.0 + 0.2,
+                f"{p['center_hz']/1000:+.1f}kHz", color='red', fontsize=7)
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=140)
     plt.close(fig)
     print(f"Wrote spectrogram: {output_path}")
+
+
+def _apply_pol_split(signal: np.ndarray, pol_scenario: str, rng,
+                     sample_rate: int = 48000) -> tuple:
+    """Split a complex baseband signal into H and V receive channels.
+
+    Models an H-polarized transmitter reflected by a meteor trail.  The
+    received polarization angle θ is set by the scenario.  Faraday rotation
+    and trail geometry together determine θ; it is frozen across a single ping
+    (~72 ms) but random from ping to ping.  Within-ping drift models trail
+    aspect-angle evolution as the trail expands — not Faraday rotation, which
+    changes on timescales of minutes.
+
+    Channel model:
+        rH(t) = g_H · cos θ(t) · s(t)
+        rV(t) = g_V · sin θ(t) · s(t) · exp(j·Δφ)
+
+    Parameters
+    ----------
+    signal       : complex64 array — pre-scaled baseband signal s(t)
+    pol_scenario : scenario name or numeric angle in degrees (see below)
+    rng          : numpy Generator
+    sample_rate  : samples per second (used for within-ping drift rate)
+
+    Returns
+    -------
+    (rH, rV, pol_meta)
+        rH       : complex64 array — H-antenna signal
+        rV       : complex64 array — V-antenna signal
+        pol_meta : dict — pol_scenario, theta0_deg, delta_phi0_deg, w_h, w_v
+
+    Scenarios
+    ---------
+    pure-H          θ=0°            all power in H; V sees nothing
+    pure-V          θ=90°           all power in V; H sees nothing
+    linear-30/45/60 θ=30/45/60°    fixed linear angle
+    near-cross      θ=85°           deep fade on H-only receiver
+    random          θ~U[0°,90°]    realistic default; new draw each call
+    trail-drift     θ0 random, +30°/s drift  — slow trail aspect evolution
+    trail-fast      θ0 random, +180°/s drift — rapid trail aspect evolution
+    elliptical      θ=45°, Δφ=90°  circular polarization
+    cal-error       θ=45°, ±3 dB gain imbalance, Δφ=15° systematic offset
+    faraday-slow    alias for trail-drift (legacy)
+    faraday-fast    alias for trail-fast  (legacy)
+    <number>        θ=<number>° fixed, Δφ=0°
+    """
+    n = len(signal)
+    t = np.arange(n, dtype=np.float64) / sample_rate
+    pol = pol_scenario.strip().lower()
+
+    theta0_deg     = 0.0
+    drift_deg_s    = 0.0
+    delta_phi0_deg = 0.0
+    g_h_db         = 0.0
+    g_v_db         = 0.0
+
+    if pol == 'pure-h':
+        theta0_deg = 0.0
+    elif pol == 'pure-v':
+        theta0_deg = 90.0
+    elif pol in ('linear-30', 'linear30'):
+        theta0_deg = 30.0
+    elif pol in ('linear-45', 'linear45'):
+        theta0_deg = 45.0
+    elif pol in ('linear-60', 'linear60'):
+        theta0_deg = 60.0
+    elif pol == 'near-cross':
+        theta0_deg = 85.0
+    elif pol == 'random':
+        theta0_deg = float(rng.uniform(0.0, 90.0))
+    elif pol in ('trail-drift', 'faraday-slow'):
+        theta0_deg  = float(rng.uniform(0.0, 90.0))
+        drift_deg_s = 30.0
+    elif pol in ('trail-fast', 'faraday-fast'):
+        theta0_deg  = float(rng.uniform(0.0, 90.0))
+        drift_deg_s = 180.0
+    elif pol == 'elliptical':
+        theta0_deg     = 45.0
+        delta_phi0_deg = 90.0
+    elif pol == 'cal-error':
+        theta0_deg     = 45.0
+        g_h_db         = float(rng.uniform(-3.0, 3.0))
+        g_v_db         = -g_h_db
+        delta_phi0_deg = 15.0
+    else:
+        try:
+            theta0_deg = float(pol_scenario)
+        except ValueError:
+            raise SystemExit(
+                f"Unknown pol_scenario {pol_scenario!r}. "
+                "Use: pure-H, pure-V, linear-30/45/60, near-cross, random, "
+                "trail-drift, trail-fast, elliptical, cal-error, "
+                "or a numeric angle in degrees."
+            )
+
+    theta_rad     = np.deg2rad(theta0_deg + drift_deg_s * t)
+    delta_phi_rad = np.deg2rad(delta_phi0_deg)
+    g_h           = 10.0 ** (g_h_db / 20.0)
+    g_v           = 10.0 ** (g_v_db / 20.0)
+
+    rH = (g_h * np.cos(theta_rad) * signal).astype(np.complex64)
+    rV = (g_v * np.sin(theta_rad) * np.exp(1j * delta_phi_rad) * signal).astype(np.complex64)
+
+    # MRC combiner weights at mid-ping
+    mid = n // 2
+    w_h = float(np.cos(theta_rad[mid]))
+    w_v = complex(np.sin(theta_rad[mid]) * np.exp(-1j * delta_phi_rad))
+
+    pol_meta = {
+        'pol_scenario':   pol_scenario,
+        'theta0_deg':     round(theta0_deg, 1),
+        'delta_phi0_deg': round(delta_phi0_deg, 1),
+        'w_h':            round(w_h, 4),
+        'w_v':            str(round(w_v.real, 4) + round(w_v.imag, 4) * 1j),
+    }
+    return rH, rV, pol_meta
 
 
 def main() -> None:
@@ -1240,47 +1484,67 @@ def main() -> None:
             "bursts placed at random frequencies and time offsets.\n\n"
             "With --count N, pings are generated via msk144sim with randomly chosen\n"
             "parameters encoded into self-describing 13-char messages."
-        )
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument('--count', type=int, default=10,
-                        help='Number of random pings to generate via msk144sim (default: 10; 0 = use --input-dir)')
+                        help='Number of random pings to generate via msk144sim; 0 = use --input-dir')
     parser.add_argument('--input-dir', default='MSK144',
-                        help='Folder containing 15-sec 12 kHz mono WAV files (default: MSK144)')
+                        help='Folder containing 15-sec 12 kHz mono WAV files')
     parser.add_argument('--pattern', default='*.wav',
-                        help='Glob pattern for source WAV files (default: *.wav)')
+                        help='Glob pattern for source WAV files')
     parser.add_argument('--duration', type=float, default=15.0,
-                        help='Output duration in seconds (default: 15.0)')
+                        help='Output duration in seconds')
     parser.add_argument('--output-rate', type=int, default=48000,
-                        help='Output sample rate in Hz (default: 48000)')
+                        help='Output sample rate in Hz')
     parser.add_argument('--freq-range-hz', type=float, default=12000.0,
-                        help='Place each signal at a random centre in ±freq-range-hz (default: 12000); '
+                        help='Place each signal at a random centre in ±freq-range-hz; '
                              'ignored when --count is used (frequency is encoded in message)')
     parser.add_argument('--max-delay-s', type=float, default=1.0,
-                        help='Maximum random start-time delay in seconds (default: 1.0); '
+                        help='Maximum random start-time delay in seconds; '
                              'ignored when --count is used (time is encoded in message)')
     parser.add_argument('--atten-db', type=float, default=10.0,
-                        help='Attenuation applied to each signal before mixing, dB (default: 10.0)')
+                        help='Attenuation applied to each signal before mixing, dB')
+    parser.add_argument('--snr-min', type=int, default=SNR_MIN_DB,
+                        help=f'Minimum SNR in dB for generated pings (default: {SNR_MIN_DB})')
+    parser.add_argument('--snr-max', type=int, default=SNR_MAX_DB,
+                        help=f'Maximum SNR in dB for generated pings (default: {SNR_MAX_DB})')
+    parser.add_argument('--width-min-ms', type=int, default=WIDTH_MIN_MS,
+                        help=f'Minimum Gamma envelope τ in ms (default: {WIDTH_MIN_MS})')
+    parser.add_argument('--width-max-ms', type=int, default=WIDTH_MAX_MS,
+                        help=f'Maximum Gamma envelope τ in ms (default: {WIDTH_MAX_MS})')
     parser.add_argument('--noise-floor-dbfs', type=float, default=-96.0,
                         help='Target noise floor in dBFS (0 dBFS = ±1.0); '
-                             'per-sample σ = √4096 × 10^(noise_floor_dbfs/20) (default: -96.0)')
+                             'per-sample σ = √4096 × 10^(noise_floor_dbfs/20)')
     parser.add_argument('--no-noise', action='store_true',
                         help='Omit AWGN entirely; write pure signal at the calibrated amplitude')
     parser.add_argument('--seed', type=int, default=None,
-                        help='Random seed for reproducible placement (default: random)')
-    parser.add_argument('--output-iq-wav', default=None,
-                        help='Output stereo IQ WAV (I=L, Q=R); empty string to skip')
+                        help='Random seed for reproducible placement; None = random')
+    parser.add_argument('-o', '--output-iq-wav', default=None,
+                        help='Output IQ WAV path (I=L, Q=R for single-channel; 4-ch for dual); '
+                             'None = auto-name in --output-dir')
+    parser.add_argument('--dual-channel', action='store_true',
+                        help='Generate a second polarization channel (ch1=V antenna); '
+                             'writes a 4-channel WAV (ch0_I, ch0_Q, ch1_I, ch1_Q)')
+    parser.add_argument('--pol-scenario', default='pure-H',
+                        help='Polarization scenario applied to every ping: '
+                             'pure-H (default, no polarization loss), pure-V, '
+                             'linear-30/45/60, near-cross, random (uniform θ per ping), '
+                             'trail-drift, trail-fast, elliptical, cal-error, '
+                             'or a numeric angle in degrees. '
+                             'Use random with --dual-channel for realistic dual-pol testing.')
     parser.add_argument('--plot-output', default=None,
-                        help='Output PNG spectrogram path (default: msk144_wav_diagnostics.png)')
+                        help='Output PNG spectrogram path; None = auto-name in --output-dir')
     parser.add_argument('--source-bp-lo', type=float, default=300.0,
-                        help='Source bandpass lower edge Hz – strip out-of-band noise (default: 300)')
+                        help='Source bandpass lower edge Hz – strip out-of-band noise')
     parser.add_argument('--source-bp-hi', type=float, default=2700.0,
-                        help='Source bandpass upper edge Hz (default: 2700)')
+                        help='Source bandpass upper edge Hz')
     parser.add_argument('--callsigns', action='store_true',
                         help='Use real callsign messages (CQ/QSO format) instead of diagnostic A... messages')
     parser.add_argument('--skip-plots', action='store_true',
                         help='Skip output spectrogram plot')
     parser.add_argument('--output-dir', default='MSK144/simulations',
-                        help='Directory for output files (default: MSK144/simulations)')
+                        help='Directory for output files')
     args = parser.parse_args()
 
     from datetime import datetime as _dt
@@ -1308,8 +1572,9 @@ def main() -> None:
     print(f"Noise floor: {args.noise_floor_dbfs:.1f} dBFS  "
           f"(σ={noise_sigma:.6f}  bin floor={20*np.log10(noise_floor_amp):.1f} dBFS)\n")
 
-    sig_buf = np.zeros(n_total, dtype=np.complex64)
-    placements: list[tuple[str, float, float]] = []
+    sig_buf  = np.zeros(n_total, dtype=np.complex64)
+    sig_buf1 = np.zeros(n_total, dtype=np.complex64) if args.dual_channel else None
+    placements: list[dict] = []   # keys: msg, center_hz, delay_s, snr_db, width_ms
 
     # Pool of real callsign messages for --callsigns mode
     _CALLSIGN_MESSAGES = [
@@ -1328,90 +1593,116 @@ def main() -> None:
     ]
 
     if args.count > 0:
-        # ── Generate pings via msk144sim ───────────────────────────────────────
-        if shutil.which('msk144sim') is None:
-            print("error: msk144sim not found on PATH", file=sys.stderr)
+        # ── Generate pings via msk144code (pure MSK, no embedded noise) ────────
+        if shutil.which('msk144code') is None:
+            print("error: msk144code not found on PATH", file=sys.stderr)
             sys.exit(1)
 
         if args.callsigns:
-            print(f"Generating {args.count} pings via msk144sim (callsign messages):")
+            print(f"Generating {args.count} pings via msk144code (callsign messages):")
         else:
-            print(f"Generating {args.count} pings via msk144sim:")
-            print(f"  Message format: A[±][ff][ttt][±][dd][www]")
+            print(f"Generating {args.count} pings via msk144code:")
+            print(f"  Message format: A[P/N][ff][ttt][P/N][dd]")
         print(f"  freq {FREQ_MIN_KHZ}..{FREQ_MAX_KHZ} kHz  "
               f"time {TIME_MIN_DS}..{TIME_MAX_DS} ds  "
-              f"snr {SNR_MIN_DB}..{SNR_MAX_DB} dB  "
-              f"width {WIDTH_MIN_MS}..{WIDTH_MAX_MS} ms\n")
+              f"snr {args.snr_min}..{args.snr_max} dB  "
+              f"width {args.width_min_ms}..{args.width_max_ms} ms\n")
 
-        # Phase 1: generate all pings and store (samples, message, params)
-        ping_bank: list[tuple[np.ndarray, int, str, dict]] = []
-        for i in range(args.count):
+        def _ping_conflicts(placements, freq_khz, delay_s, width_ms):
+            """Return True if candidate ping conflicts with already-placed pings.
+
+            Guards against two detector failure modes:
+            1. Same-channel cooldown: two pings on the same 1-kHz channel within
+               the detector's DETECT_MERGE_GAP_S=1.0 s cooldown window — the second
+               will be suppressed.  Guard conservatively at 1.5 s.
+            2. Coincidence-gate over-trigger: too many channels firing simultaneously
+               trips _COINCIDENCE_MAX_CH=8.  Each ping spans ~2 detector channels, so
+               cap simultaneous overlapping pings at 3 (3×2=6 channels, safely < 8).
+            """
+            new_start = delay_s
+            new_end   = delay_s + width_ms / 1000.0 * 1.5   # rough gamma tail bound
+
+            n_overlap = 0
+            for p in placements:
+                p_freq_khz = round((p['center_hz'] - 1500.0) / 1000.0)
+                p_start    = p['delay_s']
+                p_end      = p_start + p['width_ms'] / 1000.0 * 1.5
+
+                # Temporal overlap — needed for simultaneous count
+                if new_start < p_end and new_end > p_start:
+                    n_overlap += 1
+
+                # Same-channel conflict: within 1.5 kHz in frequency AND 1.5 s in time
+                if abs(freq_khz - p_freq_khz) < 1.5 and abs(delay_s - p['delay_s']) < 1.5:
+                    return True
+
+            # Too many simultaneous pings would trip the coincidence gate
+            if n_overlap >= 3:
+                return True
+
+            return False
+
+        placed   = 0
+        retries  = 0
+        _MAX_RETRIES = args.count * 50
+
+        while placed < args.count:
+            if retries >= _MAX_RETRIES:
+                print(f"  [warning] only placed {placed}/{args.count} pings after "
+                      f"{_MAX_RETRIES} retry attempts — time window too dense or "
+                      f"count too high for the available spread")
+                break
+
             freq_khz = int(rng.integers(FREQ_MIN_KHZ, FREQ_MAX_KHZ + 1))
-            time_ds  = int(rng.integers(TIME_MIN_DS, TIME_MAX_DS + 1))
-            snr_db   = int(rng.integers(SNR_MIN_DB, SNR_MAX_DB + 1))
-            width_ms = int(rng.integers(WIDTH_MIN_MS, WIDTH_MAX_MS + 1))
+            time_ds  = int(rng.integers(TIME_MIN_DS,  TIME_MAX_DS  + 1))
+            snr_db   = int(rng.integers(args.snr_min,  args.snr_max  + 1))
+            width_ms = int(rng.integers(args.width_min_ms, args.width_max_ms + 1))
+            delay_s  = time_ds * 0.1
+
+            if _ping_conflicts(placements, freq_khz, delay_s, width_ms):
+                retries += 1
+                continue
 
             if args.callsigns:
-                msg = _CALLSIGN_MESSAGES[i % len(_CALLSIGN_MESSAGES)]
+                msg = _CALLSIGN_MESSAGES[placed % len(_CALLSIGN_MESSAGES)]
             else:
-                msg = encode_ping_message(freq_khz, time_ds, snr_db, width_ms)
-            print(f"  [{i+1:3d}/{args.count}] {msg}  "
-                  f"freq={freq_khz:+d} kHz  t={time_ds/10:.1f} s  "
-                  f"snr={snr_db:+d} dB  width={width_ms} ms", end='', flush=True)
+                msg = encode_ping_message(freq_khz, time_ds, snr_db)
+
+            # Place signal at the channelizer NCO for channel freq_khz.
+            # NCO(k) = k*1000 + channel_offset_hz, and channel_offset_hz
+            # includes +1500 Hz (USB audio offset).  Signal at k*1000+1500 Hz
+            # in the IF lands at DC in channel k, which the squaring detector
+            # requires.  extract_and_decode later mixes fc_hz → 1500 Hz for jt9.
+            target_hz = float(freq_khz) * 1000.0 + 1500.0
+
             try:
-                if args.no_noise:
-                    # Bypass msk144sim entirely: generate a zero-noise synthetic
-                    # MSK-like burst so no embedded AWGN enters the signal chain.
-                    samples, src_rate = generate_synthetic_ping(
-                        width_ms, sample_rate=MSK144SIM_SAMPLE_RATE)
-                elif args.callsigns:
-                    samples, src_rate = generate_ping_wav(msg, width_ms=width_ms, snr_db=snr_db)
-                else:
-                    samples, src_rate = generate_ping_wav(msg)
-                ping_bank.append((samples, src_rate, msg,
-                                  {'freq_khz': freq_khz, 'time_ds': time_ds,
-                                   'snr_db': snr_db, 'width_ms': width_ms}))
-                print(f"  → {samples.size} samples @ {src_rate} Hz")
-            except subprocess.CalledProcessError as exc:
-                print(f"  FAILED (msk144sim returned {exc.returncode}), skipping")
+                ping_h, ping_v, pol_meta = generate_ping_msk144code(
+                    msg, center_hz=target_hz, delay_s=delay_s,
+                    snr_db=snr_db, noise_sigma=noise_sigma,
+                    width_ms=width_ms, pol_scenario=args.pol_scenario,
+                    rng=rng, sample_rate=args.output_rate)
+            except (subprocess.CalledProcessError, RuntimeError) as exc:
+                print(f"  [{placed+1:3d}/{args.count}] {msg}  FAILED ({exc}), skipping")
+                retries += 1
+                continue
 
-        # Phase 2: assemble into output buffer using message-encoded freq and time
-        print(f"\nAssembling {len(ping_bank)} pings into {args.duration:.0f} s × "
-              f"{args.output_rate/1000:.0f} kHz buffer:")
-        for samples, src_rate, msg, params in ping_bank:
-            # Upsample 12 kHz → output rate
-            up = resample_linear(samples, src_rate, args.output_rate)
+            n_copy = min(len(ping_h), n_total)
+            sig_buf[:n_copy] += ping_h[:n_copy]
+            if sig_buf1 is not None:
+                sig_buf1[:n_copy] += ping_v[:n_copy]
+            _dphi = pol_meta['delta_phi0_deg']
+            _dphi_str = f"  Δφ={_dphi:.1f}°" if _dphi != 0.0 else ""
+            pol_str = (f"  θ₀={pol_meta['theta0_deg']:.1f}°{_dphi_str}"
+                       f"  scenario={pol_meta['pol_scenario']}")
 
-            # Bandpass to MSK144 signal band before IQ conversion
-            up = _bandpass_real_fft(up, args.output_rate, args.source_bp_lo, args.source_bp_hi)
-
-            # Frequency shift: audio at MSK144SIM_AUDIO_CENTER_HZ → params['freq_khz']*1000 Hz
-            target_hz = params['freq_khz'] * 1000.0
-            shift_hz  = target_hz - MSK144SIM_AUDIO_CENTER_HZ
-            shifted   = freq_shift_real_to_complex(up, shift_hz, args.output_rate)
-
-            # Time placement from encoded time_ds (deciseconds)
-            delay_n = int(params['time_ds'] * 0.1 * args.output_rate)
-            delay_n = min(delay_n, n_total - 1)
-
-            # Scale ping to match the WSJT-X SNR definition (power ratio in
-            # MSK144_SNR_BW_HZ bandwidth).  For complex AWGN with per-component
-            # sigma and a constant-amplitude signal of amplitude A:
-            #   SNR_wsjt = A² / (2·σ²·BW/fs)  →  A = σ·√(2·10^(snr/10)·BW/fs)
-            ping_peak = float(np.max(np.abs(shifted))) if shifted.size else 0.0
-            snr_linear = 10.0 ** (params['snr_db'] / 10.0)   # power ratio
-            target_amp = noise_sigma * np.sqrt(2.0 * snr_linear * MSK144_SNR_BW_HZ / args.output_rate)
-            amp_scale = target_amp / ping_peak if ping_peak > 0 else 0.0
-            n_copy = min(shifted.size, n_total - delay_n)
-            if n_copy > 0:
-                sig_buf[delay_n:delay_n + n_copy] += (
-                    shifted[:n_copy] * amp_scale
-                ).astype(np.complex64)
-
-            delay_s = delay_n / args.output_rate
-            print(f"  {msg}: centre={target_hz:+.0f} Hz, t={delay_s:.1f} s, "
-                  f"snr={params['snr_db']:+d} dB → amp={target_amp:.2e}")
-            placements.append((msg, target_hz, delay_s))
+            print(f"  [{placed+1:3d}/{args.count}] {msg}  "
+                  f"freq={freq_khz:+d} kHz  t={delay_s:.1f} s  "
+                  f"snr={snr_db:+d} dB  width={width_ms} ms{pol_str}")
+            placements.append({'msg': msg, 'center_hz': target_hz, 'delay_s': delay_s,
+                                'snr_db': snr_db, 'width_ms': width_ms,
+                                **pol_meta})
+            placed  += 1
+            retries  = 0
 
     else:
         # ── Original mode: read WAV files from --input-dir ────────────────────
@@ -1435,7 +1726,11 @@ def main() -> None:
 
             n_copy = min(shifted.size, n_total - delay_n)
             if n_copy > 0:
-                sig_buf[delay_n:delay_n + n_copy] += (shifted[:n_copy] * atten).astype(np.complex64)
+                scaled = (shifted[:n_copy] * atten).astype(np.complex64)
+                rH, rV, _ = _apply_pol_split(scaled, args.pol_scenario, rng, args.output_rate)
+                sig_buf[delay_n:delay_n + n_copy] += rH
+                if sig_buf1 is not None:
+                    sig_buf1[delay_n:delay_n + n_copy] += rV
 
             delay_s = delay_n / args.output_rate
             print(
@@ -1443,7 +1738,8 @@ def main() -> None:
                 f"centre={target_center_hz:+.0f} Hz, "
                 f"delay={delay_s:.3f} s"
             )
-            placements.append((path.name, target_center_hz, delay_s))
+            placements.append({'msg': path.name, 'center_hz': target_center_hz,
+                                'delay_s': delay_s, 'snr_db': None, 'width_ms': None})
 
     # ── Pass 2: optionally add calibrated AWGN, write with fixed scale ────────
     # Pings are scaled to WSJT-X SNR in MSK144_SNR_BW_HZ bandwidth relative to
@@ -1451,7 +1747,8 @@ def main() -> None:
     # well within ±1.0, so writing with scale=1.0 preserves the noise floor at
     # exactly noise_floor_dbfs dBFS after the int16 round-trip.
     if args.no_noise:
-        combined = sig_buf.copy()
+        combined  = sig_buf.copy()
+        combined1 = sig_buf1.copy() if sig_buf1 is not None else None
         comb_peak = float(np.max(np.abs(combined)))
         sig_peak  = float(np.max(np.abs(sig_buf))) if sig_buf.size else 0.0
         print(f"\nNo-noise mode.  Signal peak: {sig_peak:.2e} "
@@ -1460,6 +1757,13 @@ def main() -> None:
         noise_i = rng.standard_normal(n_total).astype(np.float32) * noise_sigma
         noise_q = rng.standard_normal(n_total).astype(np.float32) * noise_sigma
         combined = sig_buf + (noise_i + 1j * noise_q).astype(np.complex64)
+        if sig_buf1 is not None:
+            # Independent noise on ch1
+            noise_i1 = rng.standard_normal(n_total).astype(np.float32) * noise_sigma
+            noise_q1 = rng.standard_normal(n_total).astype(np.float32) * noise_sigma
+            combined1 = sig_buf1 + (noise_i1 + 1j * noise_q1).astype(np.complex64)
+        else:
+            combined1 = None
         comb_peak = float(np.max(np.abs(combined)))
         sig_peak  = float(np.max(np.abs(sig_buf))) if sig_buf.size else 0.0
         print(f"\nSignal peak: {sig_peak:.2e} ({20*np.log10(sig_peak+1e-30):.1f} dBFS)  "
@@ -1472,8 +1776,10 @@ def main() -> None:
         # causing ~25–30 dB quantization distortion.  Auto peak-normalize instead so
         # the full 16-bit range is used and quantization artifacts are negligible.
         write_iq_wav(out_wav, combined, args.output_rate,
-                     scale=None if args.no_noise else 1.0)
-        print(f"Wrote: {out_wav}")
+                     scale=None if args.no_noise else 1.0,
+                     iq_ch1=combined1)
+        ch_str = "dual-channel 4-ch" if combined1 is not None else "single-channel stereo"
+        print(f"Wrote ({ch_str}): {out_wav}")
 
     # ── Write manifest JSON ────────────────────────────────────────────────────
     # Each placement entry includes decoded-message parameters so that
@@ -1482,19 +1788,20 @@ def main() -> None:
     manifest = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "output_wav": str(Path(args.output_iq_wav)),
+        "callsigns": args.callsigns,
+        "channels": 2 if args.dual_channel else 1,
+        "channel_format": "dual (ch0_I, ch0_Q, ch1_I, ch1_Q)" if args.dual_channel else "single (I=L, Q=R)",
+        "ch0_antenna": "H",
+        "ch1_antenna": "V" if args.dual_channel else None,
+        "pol_scenario": args.pol_scenario if args.dual_channel else None,
         "output_rate": args.output_rate,
         "duration_s": args.duration,
         "noise_floor_dbfs": args.noise_floor_dbfs,
         "no_noise": args.no_noise,
         "atten_db": args.atten_db,
         "placements": [
-            {
-                "msg": msg,
-                "center_hz": center_hz,
-                "delay_s": delay_s,
-                **(decode_ping_message(msg) if msg.startswith('A') and len(msg) == 13 else {}),
-            }
-            for msg, center_hz, delay_s in placements
+            {k: v for k, v in p.items() if v is not None}
+            for p in placements
         ],
     }
     manifest_path.write_text(json.dumps(manifest, indent=2))

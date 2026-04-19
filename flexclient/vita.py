@@ -112,11 +112,12 @@ class VITAReceiver:
         self._sock        = None
         self._running     = False
         self._thread      = None
-        self.packet_count  = 0
-        self.drop_count    = 0
-        self.missed_count  = 0
-        self._last_seq     = {}   # stream_id -> last 4-bit sequence number
+        self.packet_count   = 0
+        self.drop_count     = 0
+        self.missed_count   = 0
+        self._last_seq      = {}   # stream_id -> last 4-bit sequence number
         self._last_drop_log = 0.0  # monotonic time of last drop log message
+        self._last_pkt_time = time.monotonic()  # updated on every received packet
 
     def start(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -143,7 +144,8 @@ class VITAReceiver:
                 if self.filter_sid and pkt.stream_id != self.filter_sid:
                     continue
                 self.packet_count += 1
-                
+                self._last_pkt_time = time.monotonic()
+
                 # Check for dropped packets via 4-bit sequence number
                 sid = pkt.stream_id
                 if sid in self._last_seq:
@@ -252,7 +254,8 @@ class VITAReceiver:
         # FlexRadio DAXIQ interleaves I then Q.  Standard orientation: a signal
         # at RF = LO + f produces I+jQ = exp(+j2πft), positive baseband frequency.
         n_samples = n_words // 2
-        samples = (raw[0::2] + 1j * raw[1::2]).astype(np.complex64)
+        # Shape (N, 1): uniform multi-channel layout; channel 0 = primary.
+        samples = (raw[0::2] + 1j * raw[1::2]).astype(np.complex64).reshape(-1, 1)
 
         return VitaPacket(
             stream_id=stream_id,

@@ -58,7 +58,7 @@ Accepted log levels: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`.
 Generate the combined MSK144 test IQ stream and diagnostics plot:
 
 ```bash
-.venv/bin/python generate_msk144_test_signal.py
+.venv/bin/python generate_msk144.py
 ```
 
 All source bursts are aligned at `t=0` in the combined output stream.
@@ -74,19 +74,19 @@ Diagnostics spectrum flattening (based on median noise floor vs frequency) is **
 To run without opening the live interactive diagnostics window (Qt/Matplotlib), pass:
 
 ```bash
-.venv/bin/python generate_msk144_test_signal.py --no-show-plots
+.venv/bin/python generate_msk144.py --no-show-plots
 ```
 
 To disable frequency flattening for diagnostics (use raw spectrum), pass:
 
 ```bash
-.venv/bin/python generate_msk144_test_signal.py --no-flatten-spectrum
+.venv/bin/python generate_msk144.py --no-flatten-spectrum
 ```
 
 Example (headless + raw spectrum):
 
 ```bash
-.venv/bin/python generate_msk144_test_signal.py --no-show-plots --no-flatten-spectrum
+.venv/bin/python generate_msk144.py --no-show-plots --no-flatten-spectrum
 ```
 
 ## Before Running

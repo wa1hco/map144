@@ -1,4 +1,7 @@
 numpy==2.4.2
+# PyQtGraph imports bottleneck; with system-site-packages venvs, apt’s bottleneck
+# (NumPy 1.x ABI) must be shadowed by a wheel built for NumPy 2.
+bottleneck>=1.4.0
 matplotlib==3.10.6
 PyQt5==5.15.11
 pyqtgraph==0.14.0

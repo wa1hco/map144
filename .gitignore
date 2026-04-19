@@ -84,5 +84,6 @@ venv.bak/
 .DS_Store
 Thumbs.db
 
-
+# Local working copy of DSP / decode reliability plan (canonical: docs/dsp-reliability-plan.example.md)
+docs/dsp-reliability-plan.md
 

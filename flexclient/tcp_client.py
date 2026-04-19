@@ -84,7 +84,7 @@ import socket
 import threading
 from typing import Callable
 
-from .common import _maybe_log_unmapped_status_code, log
+from .common import _format_status_detail, _maybe_log_unmapped_status_code, log
 from .models import FlexRadio
 
 class FlexTCPClient:
@@ -194,9 +194,10 @@ class FlexTCPClient:
         if status != 0:
             detail = response.strip()
             _maybe_log_unmapped_status_code(status)
+            status_str = _format_status_detail(status)
             if detail:
-                raise RuntimeError(f"Radio rejected command: {cmd} -> {detail}")
-            raise RuntimeError(f"Radio rejected command: {cmd}")
+                raise RuntimeError(f"Radio rejected command: {cmd} -> {detail} [{status_str}]")
+            raise RuntimeError(f"Radio rejected command: {cmd} [{status_str}]")
         
         return response
 
@@ -235,10 +236,11 @@ class FlexTCPClient:
                     cmd = self._pending_cmds.get(seq, "<unknown command>")
                     detail = response.strip()
                     _maybe_log_unmapped_status_code(status)
+                    status_str = _format_status_detail(status)
                     if detail:
-                        log.warning(f"Radio rejected command: {cmd} -> {detail}")
+                        log.warning(f"Radio rejected command: {cmd} -> {detail} [{status_str}]")
                     else:
-                        log.warning(f"Radio rejected command: {cmd}")
+                        log.warning(f"Radio rejected command: {cmd} [{status_str}]")
                 
                 with self._lock:
                     if seq in self._responses:

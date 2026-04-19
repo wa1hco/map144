@@ -1,6 +1,13 @@
 {
+    "workbench.editor.enablePreview": false,
+    "workbench.editor.enablePreviewFromQuickOpen": false,
     "python-envs.pythonProjects": [],
     "chat.tools.terminal.autoApprove": {
-        "/home/jeff/ham/mapmsk144/.venv/bin/python": true
+        "/home/jeff/ham/map144/.venv/bin/python": true
+    },
+    "[markdown]": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "editor.wordWrap": "on",
+        "editor.formatOnSave": true
     }
 }

@@ -12,26 +12,24 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""map144gui — MSK144 meteor scatter decoder package.
+"""map144_app — MSK144 meteor scatter decoder application package.
 
 map144 detects and decodes MSK144 meteor-scatter bursts from a FlexRadio
 6000 series transceiver.  IQ samples are streamed via DAX IQ, channelized
-into 1 kHz sub-bands, and each sub-band is monitored for the paired-tone
+into 1 kHz-spaced channels, and each channel is monitored for the paired-tone
 signature of an MSK144 ping.  Detections are passed to the jt9 decoder from
 WSJT-X; results are logged to launches.jsonl and saved as WAV files.
 
 Package structure
 -----------------
-engine.py       ``Engine`` — Qt-free base class containing all DSP state and
-                the headless run loop.  Can be instantiated directly for
-                unattended operation without a display.
+engine.py       ``Engine`` — Qt-free base class holding DSP state and
+                ``process_iq_data``; subclassed by ``MAP144Visualizer``.
 
 visualizer.py   ``MAP144Visualizer`` — PyQt5 QMainWindow that inherits Engine
                 and adds the diagnostic GUI panels.
 
-processing.py   ``process_iq_data`` — per-chunk DSP pipeline: channelizer,
-                SNR normalization, MSK144 tone-pair detection trigger, and
-                spectrogram buffer management.
+processing.py   ``process_iq_data`` — per-chunk DSP: wideband FFT blanker,
+                channeliser, MSK144 detection, spectrogram / heatmap buffers.
 
 detection.py    ``extract_and_decode`` — ring-buffer readout, carrier
                 recovery, decimation, jt9 invocation, result parsing, WAV

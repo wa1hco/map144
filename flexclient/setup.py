@@ -106,23 +106,25 @@ class DAXIQSetup:
     def __init__(self, tcp: FlexTCPClient, sample_rate: int = 96000,
                  dax_channel: int = 1, listen_port: int = VITA_UDP_PORT,
                  preferred_pan_id: Optional[int] = None):
-        self.tcp         = tcp
-        self.sample_rate = sample_rate
-        self.dax_channel = dax_channel
-        self.listen_port = listen_port
-        self.pan_id      = None
-        self.slice_id    = None
-        self.stream_id   = None
+        self.tcp            = tcp
+        self.sample_rate    = sample_rate
+        self.dax_channel    = dax_channel
+        self.listen_port    = listen_port
+        self.pan_id         = None
+        self.slice_id       = None
+        self.stream_id      = None
+        self._vita_ref      = None   # set by client.py after VITAReceiver is created
         self._old_status_cb = None
         self.slice_frequency_mhz = None  # Track actual slice frequency
         self.pan_frequency_mhz = None    # Track actual panadapter frequency
         self.pan_bandwidth_hz = None     # Track actual panadapter bandwidth
         self.known_pans = {}             # pan_id(int) -> dict of known settings
+        self.known_slices = {}           # slice_num(int) -> {RF_frequency_mhz, mode, pan_id}
         self._known_pans_signature = None
         self._last_pan_report_ts = 0.0
         self._pan_discovery_phase = False
         self.preferred_pan_id = preferred_pan_id
-        
+
         # Set up persistent status callback
         self._old_status_cb = self.tcp._status_cb
         self.tcp._status_cb = self._status_monitor
@@ -133,15 +135,12 @@ class DAXIQSetup:
         Uses existing GUI-owned panadapters/slices (if available) and starts DAXIQ.
         If center_freq_mhz is provided, attempts slice tuning only when a slice is assigned.
         """
-        import time
-
         self._pan_discovery_phase = True
         self._subscribe_pan_status()
         time.sleep(0.25)
         self._maybe_report_known_panadapters(force=True)
         self._pan_discovery_phase = False
 
-        # Do not attempt panadapter creation as a non-GUI client.
         # Use already-observed GUI-owned panadapters when present.
         if self.pan_id is None and self.preferred_pan_id not in (None, 0):
             self.pan_id = int(self.preferred_pan_id)
@@ -151,39 +150,36 @@ class DAXIQSetup:
             if valid_pans:
                 self.pan_id = valid_pans[0]
                 log.info(f"Using existing panadapter 0x{self.pan_id:08x}")
-        
+
         # Create DAXIQ stream - radio needs client IP to send UDP stream to
-        # DAXIQ uses configured local UDP port for I/Q data streaming
         client_ip = self.tcp.get_local_ip()
         log.debug(f"Creating DAXIQ stream to {client_ip}:{self.listen_port}")
-        
+
         # If we have a panadapter, try to assign DAXIQ channel to it.
         # In bound/non-GUI contexts this is often required for UDP IQ packets to flow.
         if self.pan_id:
-            # Try to assign DAXIQ channel to our panadapter
             try:
                 resp = self.tcp.send_command(
                     f"dax iq set {self.dax_channel} pan=0x{self.pan_id:08x}"
                 )
                 log.debug(f"DAXIQ channel {self.dax_channel} on panadapter 0x{self.pan_id:08x}: {resp}")
-                log.debug(f"DAXIQ assignment response: {resp}")
                 time.sleep(0.1)
             except RuntimeError as e:
                 log.warning(f"Could not assign DAXIQ channel {self.dax_channel} to panadapter 0x{self.pan_id:08x} (may be controlled by SmartSDR): {e}")
-        
+
         resp = self.tcp.send_command(
             f"stream create daxiq={self.dax_channel} ip={client_ip} port={self.listen_port}"
         )
         log.debug(f"DAXIQ stream create response: {resp}")
         self.stream_id = int(resp.strip(), 16) if resp.strip() else None
         if not self.stream_id:
-            raise RuntimeError(f"Failed to create DAXIQ stream")
+            raise RuntimeError("Failed to create DAXIQ stream")
         log.debug(f"DAXIQ stream created: 0x{self.stream_id:08x}")
 
-        # Wait briefly for status message with slice/pan info
-        time.sleep(0.2)  # Give radio time to send status
+        # Wait briefly for stream status message with slice/pan assignment.
+        time.sleep(0.2)
 
-        # Subscribe to panadapter updates if we're in panadapter mode
+        # Subscribe to panadapter updates.
         if self.pan_id:
             try:
                 resp = self.tcp.send_command(f"sub pan 0x{self.pan_id:08x}")
@@ -191,13 +187,19 @@ class DAXIQSetup:
             except RuntimeError as e:
                 log.warning(f"Could not subscribe to panadapter: {e}")
 
-        # Do not force DAXIQ rate from this client; GUI/SmartSDR ownership typically controls it.
+        # Subscribe to slice status updates.
+        try:
+            self.tcp.send_command("sub slice all")
+            log.debug("Subscribed to slice status updates")
+        except RuntimeError:
+            pass
+
         log.debug("Using SmartSDR-configured DAXIQ rate")
-        
-        # Set frequency based on mode (slice or panadapter)
+
+        # Set slice frequency if a slice is assigned; otherwise the pan center
+        # is controlled by SmartSDR and we leave it alone.
         if center_freq_mhz is not None:
             if self.slice_id is not None and self.slice_id != 0:
-                # Slice mode - set slice frequency
                 try:
                     freq_hz = int(center_freq_mhz * 1e6)
                     resp = self.tcp.send_command(
@@ -212,26 +214,23 @@ class DAXIQSetup:
                     "using current GUI-selected center/bandwidth"
                 )
             else:
-                log.warning(f"DAXIQ channel {self.dax_channel} mode unknown (no slice or panadapter). Set frequency in SmartSDR.")
+                log.warning(
+                    f"DAXIQ channel {self.dax_channel} mode unknown "
+                    "(no slice or panadapter). Set frequency in SmartSDR."
+                )
 
         log.debug(f"DAXIQ ready: stream_id=0x{self.stream_id:08x}")
         return self.stream_id
 
     def _subscribe_pan_status(self):
         """Ask radio to emit status for existing panadapters (firmware dependent)."""
-        subscribe_cmds = [
-            "sub pan all",
-            "sub pan",
-        ]
-
-        for cmd in subscribe_cmds:
+        for cmd in ("sub pan all", "sub pan"):
             try:
                 self.tcp.send_command(cmd)
                 log.debug(f"Subscribed for pan status with command: {cmd}")
                 return
             except RuntimeError:
                 continue
-
         log.debug("Pan status subscription command not accepted by radio")
 
     def _report_known_panadapters(self):
@@ -244,7 +243,6 @@ class DAXIQSetup:
         for pan_id in sorted(self.known_pans.keys()):
             info = self.known_pans[pan_id]
             parts = [f"pan=0x{pan_id:08x}"]
-
             center = info.get("center")
             if center is not None:
                 parts.append(f"center={center:.6f} MHz")
@@ -257,7 +255,6 @@ class DAXIQSetup:
             stream_id = info.get("stream_id")
             if stream_id:
                 parts.append(f"stream_id={stream_id}")
-
             log.debug("  " + " ".join(parts))
 
     def _maybe_report_known_panadapters(self, force: bool = False):
@@ -270,15 +267,13 @@ class DAXIQSetup:
         signature_items = []
         for pan_id in sorted(self.known_pans.keys()):
             info = self.known_pans[pan_id]
-            signature_items.append(
-                (
-                    pan_id,
-                    info.get("center"),
-                    info.get("bandwidth"),
-                    info.get("ant"),
-                    info.get("rxant"),
-                )
-            )
+            signature_items.append((
+                pan_id,
+                info.get("center"),
+                info.get("bandwidth"),
+                info.get("ant"),
+                info.get("rxant"),
+            ))
 
         signature = tuple(signature_items)
         if not force and signature == self._known_pans_signature:
@@ -291,38 +286,47 @@ class DAXIQSetup:
         self._known_pans_signature = signature
         self._last_pan_report_ts = now
         self._report_known_panadapters()
-    
+
     def _status_monitor(self, line: str):
         """Monitor all status messages for stream and slice updates."""
-        # Call old callback if it exists
         if self._old_status_cb:
             self._old_status_cb(line)
-        
+
         # Monitor stream status for slice assignment
         if "|stream " in line and "dax_iq" in line:
             log.debug(f"Stream status: {line}")
-            
-            # Parse the stream ID from the status message itself
             try:
                 parts = line.split("|", 1)
                 if len(parts) >= 2:
                     tokens = parts[1].split()
                     if len(tokens) >= 2 and tokens[0] == "stream":
                         msg_stream_id = int(tokens[1], 16)
-                        
-                        # If this is our stream (or we haven't set stream_id yet)
+
+                        # Detect stream_id reassignment (e.g. after ADC overload).
+                        # Update filter_sid on the VITA receiver so packets aren't
+                        # silently discarded.
+                        if (self.stream_id is not None
+                                and msg_stream_id != self.stream_id
+                                and self._vita_ref is not None):
+                            log.warning(
+                                f"DAXIQ stream_id changed: "
+                                f"0x{self.stream_id:08x} → 0x{msg_stream_id:08x} — updating filter"
+                            )
+                            self.stream_id = msg_stream_id
+                            self._vita_ref.filter_sid = msg_stream_id
+                            self._vita_ref._last_seq = {}
+
                         if self.stream_id is None or msg_stream_id == self.stream_id:
-                            # Extract slice ID and panadapter ID
                             slice_id_str = _extract_key(parts[1], "slice")
                             pan_id_str = _extract_key(parts[1], "pan")
-                            
+
                             if slice_id_str:
                                 self.slice_id = int(slice_id_str, 16)
                                 status = "ASSIGNED" if self.slice_id != 0 else "NOT ASSIGNED"
                                 log.debug(
                                     f"DAXIQ stream 0x{msg_stream_id:08x} slice status: 0x{self.slice_id:x} ({status})"
                                 )
-                            
+
                             if pan_id_str:
                                 parsed_pan_id = int(pan_id_str, 16)
                                 if parsed_pan_id == 0:
@@ -337,25 +341,58 @@ class DAXIQSetup:
                                     log.debug(f"DAXIQ stream 0x{msg_stream_id:08x} panadapter: 0x{self.pan_id:08x}")
             except (ValueError, TypeError, IndexError) as e:
                 log.debug(f"Error parsing stream status: {e}")
-        
-        # Monitor slice frequency updates
-        if self.slice_id and self.slice_id != 0 and "|slice " in line:
+
+        # Monitor slice status updates — track all slices for radio state display
+        if "|slice " in line:
             try:
                 parts = line.split("|", 1)
                 if len(parts) >= 2:
                     tokens = parts[1].split()
                     if len(tokens) >= 2 and tokens[0] == "slice":
                         slice_num = int(tokens[1])
-                        if slice_num == self.slice_id:
-                            # Extract RF_frequency
-                            freq_str = _extract_key(parts[1], "RF_frequency")
-                            if freq_str:
-                                freq_hz = int(freq_str)
-                                self.slice_frequency_mhz = freq_hz / 1e6
+                        payload = parts[1]
+                        entry = self.known_slices.setdefault(slice_num, {})
+
+                        freq_str = _extract_key(payload, "RF_frequency")
+                        if freq_str:
+                            freq_val = float(freq_str)
+                            entry["RF_frequency_mhz"] = freq_val if freq_val < 1e6 else freq_val / 1e6
+
+                        mode_str = _extract_key(payload, "mode")
+                        if mode_str:
+                            entry["mode"] = mode_str
+
+                        pan_str = _extract_key(payload, "pan")
+                        if pan_str:
+                            entry["pan_id"] = int(pan_str, 16)
+
+                        daxiq_str = _extract_key(payload, "dax_iq_channel")
+                        if daxiq_str is not None:
+                            entry["dax_iq_channel"] = int(daxiq_str)
+
+                        dax_str = _extract_key(payload, "dax")
+                        if dax_str is not None:
+                            entry["dax"] = int(dax_str)
+
+                        client_handle_str = _extract_key(payload, "client_handle")
+                        if client_handle_str:
+                            entry["client_handle"] = client_handle_str
+
+                        in_use_str = _extract_key(payload, "in_use")
+                        if in_use_str == "0":
+                            self.known_slices.pop(slice_num, None)
+                            log.debug(f"Slice {slice_num} removed (in_use=0)")
+                            return
+                        elif in_use_str is not None:
+                            entry["in_use"] = True
+
+                        if slice_num == self.slice_id and self.slice_id != 0:
+                            if "RF_frequency_mhz" in entry:
+                                self.slice_frequency_mhz = entry["RF_frequency_mhz"]
                                 log.debug(f"Slice {self.slice_id} frequency: {self.slice_frequency_mhz:.6f} MHz")
             except (ValueError, TypeError, IndexError) as e:
                 log.debug(f"Error parsing slice status: {e}")
-        
+
         # Monitor panadapter frequency updates
         if "|display pan " in line:
             try:
@@ -365,6 +402,13 @@ class DAXIQSetup:
                     if len(tokens) >= 3 and tokens[0] == "display" and tokens[1] == "pan":
                         pan_id = int(tokens[2], 16)
                         if pan_id == 0:
+                            return
+                        removed_str = _extract_key(parts[1], "removed")
+                        if removed_str == "1" or (len(tokens) == 3 and removed_str is None and
+                                                   _extract_key(parts[1], "center") is None):
+                            if pan_id in self.known_pans:
+                                self.known_pans.pop(pan_id)
+                                log.debug(f"Panadapter 0x{pan_id:08x} removed")
                             return
                         pan_info = self.known_pans.setdefault(pan_id, {})
 
@@ -376,7 +420,7 @@ class DAXIQSetup:
 
                         bandwidth = _extract_key(parts[1], "bandwidth")
                         if bandwidth:
-                            pan_info["bandwidth"] = bandwidth
+                            pan_info["bandwidth"] = _parse_bandwidth_to_hz(bandwidth)
 
                         ant = _extract_key(parts[1], "ant")
                         if ant:
@@ -390,17 +434,17 @@ class DAXIQSetup:
                         if stream_id:
                             pan_info["stream_id"] = stream_id
 
+                        daxiq_ch = _extract_key(parts[1], "daxiq_channel")
+                        if daxiq_ch:
+                            pan_info["daxiq_channel"] = daxiq_ch
+
                         self._maybe_report_known_panadapters()
-                        
-                        # If we don't have a pan_id yet, capture it
+
                         if self.pan_id is None:
                             self.pan_id = pan_id
                             log.debug(f"Captured panadapter ID: 0x{self.pan_id:08x}")
-                        
-                        # Monitor frequency updates for our panadapter
+
                         if self.pan_id and pan_id == self.pan_id:
-                            # Extract center frequency
-                            center_str = _extract_key(parts[1], "center")
                             if center_str:
                                 center_mhz = _parse_freq_to_mhz(center_str)
                                 if center_mhz is not None:
@@ -421,7 +465,6 @@ class DAXIQSetup:
         """Clean up DAXIQ resources. Doesn't raise on errors during cleanup."""
         stream_result = "n/a"
 
-        # Remove the stream
         if self.stream_id:
             try:
                 self.tcp.send_command(f"stream remove 0x{self.stream_id:08x}")
@@ -432,7 +475,8 @@ class DAXIQSetup:
         else:
             stream_result = "none"
 
-        log.info(f"Shutdown cleanup: stream_remove={stream_result}")
+        log.info(f"Shutdown cleanup: stream={stream_result}")
+
 
 def _extract_key(response: str, key: str) -> Optional[str]:
     """Extract a value from a key=value response string."""
@@ -447,7 +491,6 @@ def _parse_freq_to_mhz(freq_value: str) -> Optional[float]:
         value = float(freq_value)
     except (TypeError, ValueError):
         return None
-
     return value / 1e6 if value >= 1e6 else value
 
 
@@ -457,14 +500,9 @@ def _parse_bandwidth_to_hz(bw_value: str) -> Optional[float]:
         value = float(bw_value)
     except (TypeError, ValueError):
         return None
-
     if value <= 0:
         return None
-
     # Flex status commonly reports pan bandwidth as fractional MHz (e.g. 0.063298).
     if value < 1000:
         return value * 1e6
-
-    # Values >= 1000 are treated as Hz.
     return value
-

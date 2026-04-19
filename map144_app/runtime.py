@@ -116,7 +116,6 @@ closeEvent(self, event)
 
 import queue
 import time
-import wave
 import importlib
 
 import numpy as np
@@ -137,7 +136,10 @@ FLEX_DAXIQ_FULL_SCALE = 32768.0
 def setup_radio_client(self):
     """Start the runtime thread.  The DAXIQ connection is deferred until
     the user selects 'Flex Radio' from the File menu."""
-    self.radio_client = None
+    # Do not overwrite radio_client if setup_ui() already created it
+    # (e.g. when restoring a saved radio source mode at startup).
+    if not hasattr(self, 'radio_client'):
+        self.radio_client = None
 
     self.client_thread = QtCore.QThread()
     self.client_thread.run = self.run_radio_source
@@ -161,12 +163,34 @@ def _connect_airspy_client(self):
         self.airspy_client = None
 
 
+def _set_dual_pol(self, enabled: bool):
+    """Switch dual_pol mode and reset all pol-dependent buffers.
+
+    Call before the first IQ chunk of a new source arrives so there is no
+    stale H/V data in the channeliser or waterfall buffers.
+    """
+    if getattr(self, 'dual_pol', False) == enabled:
+        return
+    self.dual_pol = enabled
+    # Reset channeliser buffers for both polarizations.
+    self._rebuild_channelizer_state()
+    # Reset V-channel waterfall buffer.
+    self._sbuf_v_end = 0
+    # Reset V-channel spectrograms to blank so stale H data doesn't show.
+    if not enabled:
+        self.realtime_data_v   = np.full((self.max_history, self.fft_size), -130.0)
+        self.spectrogram_data_v = np.full((self.max_history, self.fft_size), -130.0)
+        self.spec_staging_v     = np.full((self.max_history, self.fft_size), -130.0)
+    print(f"[source] dual_pol={'ON' if enabled else 'OFF'}", flush=True)
+
+
 def _start_airspy_source(self) -> bool:
     if getattr(self, '_airspy_started', False):
         return True
     if getattr(self, 'airspy_client', None) is None:
         return False
     try:
+        _set_dual_pol(self, False)
         self.airspy_client.start()
         self._airspy_started = True
         if hasattr(self, '_jt9_markers'):
@@ -212,6 +236,7 @@ def _start_rtlsdr_source(self) -> bool:
     if getattr(self, 'rtlsdr_client', None) is None:
         return False
     try:
+        _set_dual_pol(self, False)
         self.rtlsdr_client.start()
         self._rtlsdr_started = True
         if hasattr(self, '_jt9_markers'):
@@ -247,13 +272,21 @@ def _connect_usrp_client(self):
             _gain = float(_S.value('usrp_gain_db', 50.0))
         except (ValueError, TypeError):
             _gain = 50.0
-        _ant = str(_S.value('usrp_antenna', 'RX2'))
+        _ant  = str(_S.value('usrp_antenna',      'RX2'))
+        _ant1 = str(_S.value('usrp_antenna_ch1', 'RX2'))
+        try:
+            _gain1 = float(_S.value('usrp_gain_db_ch1', _gain))
+        except (ValueError, TypeError):
+            _gain1 = _gain
         self.usrp_client = USRPSource(
             center_freq_mhz=50.260,   # MSK144 6m calling frequency
             target_rate=self.sample_rate,
             gain_db=_gain,
             antenna=_ant,
+            dual_channel=True,        # RX 1 always enabled for polarization diversity
         )
+        self.usrp_client._gain_ch1    = _gain1
+        self.usrp_client._antenna_ch1 = _ant1
         print("[usrp] USRPSource created", flush=True)
     except Exception as exc:
         print(f"[usrp] USRPSource creation failed: {exc}", flush=True)
@@ -266,6 +299,7 @@ def _start_usrp_source(self) -> bool:
     if getattr(self, 'usrp_client', None) is None:
         return False
     try:
+        _set_dual_pol(self, getattr(self.usrp_client, 'dual_channel', False))
         self.usrp_client.start()
         self._usrp_started = True
         if hasattr(self, '_jt9_markers'):
@@ -325,44 +359,90 @@ def _resample_linear(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.nd
 
 
 def _load_wav_complex(path: str, target_rate: int) -> tuple[np.ndarray, int]:
-    with wave.open(path, 'rb') as wf:
-        src_rate = wf.getframerate()
-        channels = wf.getnchannels()
-        sample_width = wf.getsampwidth()
-        n_frames = wf.getnframes()
-        raw = wf.readframes(n_frames)
+    """Load a WAV file and return complex IQ samples resampled to target_rate.
 
-    if sample_width == 1:
-        data = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
-        data = (data - 128.0) / 128.0
-    elif sample_width == 2:
-        data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    elif sample_width == 4:
-        float_try = np.frombuffer(raw, dtype=np.float32)
-        if np.all(np.isfinite(float_try)) and np.max(np.abs(float_try)) <= 10:
-            data = float_try.astype(np.float32)
-            max_abs = float(np.max(np.abs(data))) if data.size else 0.0
-            if max_abs > 1.0:
-                data /= max_abs
+    Supports both PCM (fmt_code=1) and IEEE float32 (fmt_code=3) WAV files,
+    including capture files written by capture.save_capture().
+    """
+    import struct as _struct
+
+    with open(path, 'rb') as f:
+        file_data = f.read()
+
+    if file_data[:4] != b'RIFF' or file_data[8:12] != b'WAVE':
+        raise ValueError(f"Not a RIFF/WAVE file: {path}")
+
+    pos = 12
+    fmt_code = channels = src_rate = sample_width = None
+    audio_bytes = None
+    while pos < len(file_data) - 8:
+        chunk_id   = file_data[pos:pos+4]
+        chunk_size = _struct.unpack_from('<I', file_data, pos+4)[0]
+        pos += 8
+        if chunk_id == b'fmt ':
+            fmt_code    = _struct.unpack_from('<H', file_data, pos)[0]
+            channels    = _struct.unpack_from('<H', file_data, pos+2)[0]
+            src_rate    = _struct.unpack_from('<I', file_data, pos+4)[0]
+            sample_width = _struct.unpack_from('<H', file_data, pos+14)[0] // 8
+        elif chunk_id == b'data':
+            audio_bytes = file_data[pos:pos+chunk_size]
+        pos += chunk_size
+
+    if audio_bytes is None or fmt_code is None:
+        raise ValueError(f"Malformed WAV file: {path}")
+
+    if fmt_code == 3:
+        # IEEE float32 — capture files written by capture.save_capture()
+        raw = np.frombuffer(audio_bytes, dtype=np.float32)
+        data = raw.astype(np.float32)
+    elif fmt_code == 1:
+        # PCM integer
+        if sample_width == 1:
+            data = np.frombuffer(audio_bytes, dtype=np.uint8).astype(np.float32)
+            data = (data - 128.0) / 128.0
+        elif sample_width == 2:
+            data = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sample_width == 4:
+            data = np.frombuffer(audio_bytes, dtype=np.int32).astype(np.float32) / 2147483648.0
         else:
-            data = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+            raise ValueError(f"Unsupported PCM sample width {sample_width}: {path}")
     else:
-        raise ValueError(f"Unsupported WAV sample width {sample_width}")
+        raise ValueError(f"Unsupported WAV format code {fmt_code}: {path}")
 
     if channels == 1:
         # Convert real mono to analytic (single-sideband) IQ.
         # Setting Q=0 leaves a symmetric spectrum whose squared version produces
         # mirror-image tone pairs at negative frequencies, causing the detector to
         # recover a negative fc and mix the signal to the wrong frequency.
-        iq = hilbert(data.astype(np.float64)).astype(np.complex64)
+        iq0 = hilbert(data.astype(np.float64)).astype(np.complex64)
+        iq0 = _resample_linear(iq0, src_rate, target_rate)
+        return iq0.reshape(-1, 1).astype(np.complex64), target_rate
+    elif channels == 2:
+        # Standard single-channel IQ WAV: left=I, right=Q.
+        frames = data.reshape(-1, 2)
+        iq0 = (frames[:, 0] + 1j * frames[:, 1]).astype(np.complex64)
+        iq0 = _resample_linear(iq0, src_rate, target_rate)
+        return iq0.reshape(-1, 1).astype(np.complex64), target_rate
+    elif channels == 4:
+        # Dual-channel IQ WAV: ch0_I, ch0_Q, ch1_I, ch1_Q interleaved per frame.
+        frames = data.reshape(-1, 4)
+        iq0 = (frames[:, 0] + 1j * frames[:, 1]).astype(np.complex64)
+        iq1 = (frames[:, 2] + 1j * frames[:, 3]).astype(np.complex64)
+        iq0 = _resample_linear(iq0, src_rate, target_rate)
+        iq1 = _resample_linear(iq1, src_rate, target_rate)
+        return np.column_stack((iq0, iq1)).astype(np.complex64), target_rate
     else:
-        frames = data.reshape(-1, channels)
-        i = frames[:, 0]
-        q = frames[:, 1]
-        iq = (i + 1j * q).astype(np.complex64)
+        raise ValueError(f"Unsupported WAV channel count {channels} (expected 1, 2, or 4): {path}")
 
-    iq = _resample_linear(iq, src_rate, target_rate)
-    return iq.astype(np.complex64), target_rate
+
+def _polarization_combine(samples: np.ndarray) -> np.ndarray:
+    """Pass IQ samples to process_iq_data.
+
+    For dual-pol sources, ``samples`` is shape ``(N, 2)`` complex64 (col 0 = H,
+    col 1 = V).  process_iq_data detects the shape and handles both channels.
+    For single-pol sources, ``samples`` is ``(N, 1)`` or ``(N,)``.
+    """
+    return samples
 
 
 def _start_radio_source(self) -> bool:
@@ -371,6 +451,7 @@ def _start_radio_source(self) -> bool:
     if self.radio_client is None:
         return False
     try:
+        _set_dual_pol(self, False)
         self.radio_client.start()
         self._radio_started = True
         if hasattr(self, '_jt9_markers'):
@@ -386,6 +467,7 @@ def _start_radio_source(self) -> bool:
             self.radio_client.stop()
         except Exception:
             pass
+        self.radio_client = None  # prevent thread from retrying with broken client
         return False
 
 
@@ -401,30 +483,43 @@ def _stop_radio_source(self):
 
 def _reset_wav_timeline(self):
     self._wav_time_cursor = 0.0
-    self._sbuf_end = 0
+    self._sbuf_end   = 0
+    self._sbuf_v_end = 0
     self._ch_buf_end = 0
     self._metric_hist_idx = 0
     self._metric_hist_cnt = 0
     self.raw_buffer    = np.array([], dtype=np.complex64)
 
-    self.spectrogram_data = np.full((self.max_history, self.fft_size), -130.0)
-    self.spec_staging = np.full((self.max_history, self.fft_size), -130.0)
-    self.realtime_data = np.full((self.max_history, self.fft_size), -130.0)
+    # Fill in-place rather than replacing array objects.  pyqtgraph ImageItem
+    # may hold a zero-copy raw C pointer into the numpy buffer for deferred
+    # QImage rendering; replacing the Python object frees the old buffer while
+    # Qt may still be reading it (dangling pointer → segfault on paint event).
+    self.spectrogram_data[:]   = -130.0
+    self.spec_staging[:]       = -130.0
+    self.realtime_data[:]      = -130.0
+    # Always clear V spectrograms too — on single-pol WAVs this ensures
+    # stale V data from a previous dual-pol run doesn't linger in the panes.
+    self.spectrogram_data_v[:] = -130.0
+    self.spec_staging_v[:]     = -130.0
+    self.realtime_data_v[:]    = -130.0
 
     self.spec_staging_filled = False
     self.realtime_filled = False
-    self.accumulated_noise_floor = np.full(self.fft_size, -125.0)
-    self.realtime_noise_floor = np.full(self.fft_size, -125.0)
+    self.accumulated_noise_floor[:] = -125.0
+    self.realtime_noise_floor[:]    = -125.0
 
     self.spec_boundary = 0
     self._realtime_boundary = 0
     self._sbuf_t0 = 0.0
+    self._prev_staging_idx = None
+    self._prev_rt_idx      = None
 
     self.time_in_window = 0.0
     self.next_boundary = self.history_secs
 
     # Reset ring buffer, detection state, and SNR heatmap history
-    self._ch_snr_history[:] = 0.0
+    self._ch_snr_history_h[:] = 0.0
+    self._ch_snr_history_v[:] = 0.0
     self._ch_snr_write_idx  = 0
     self._ch_snr_boundary   = 0
     self._iq_ring[:] = 0
@@ -436,6 +531,25 @@ def _reset_wav_timeline(self):
         self._jt9_markers.clear()
     if hasattr(self, 'decode_panel'):
         self.decode_panel.clear()
+    # Drain any queued decode results from the previous WAV so stale marker
+    # updates don't arrive after _jt9_markers has been cleared.
+    dq = getattr(self, '_decode_queue', None)
+    if dq is not None:
+        import queue as _q
+        while True:
+            try:
+                dq.get_nowait()
+            except _q.Empty:
+                break
+
+    # Reset percentile baseline so the first frames of a new WAV are not
+    # compared against a stale noise floor from the previous run.
+    # _pct25_ctr drives the gated recompute; resetting to 0 forces an
+    # immediate recompute on the very first detection frame.
+    self._pct25_ctr = 0
+    if hasattr(self, '_pct25'):
+        del self._pct25
+    self._nb_spec_avg = None   # reset blanker per-bin averages too
 
 
 def _process_wav_source_step(self):
@@ -456,8 +570,12 @@ def _process_wav_source_step(self):
             self._wav_done = False
             self._wav_nonce_loaded = nonce
             self._wav_run_start_time = datetime.now(timezone.utc)
+            _set_dual_pol(self, samples.ndim == 2 and samples.shape[1] == 2)
+            # _set_dual_pol already calls _rebuild_channelizer_state which
+            # resets _ch_buf_end, _ch_buf_v_end, _sbuf_end, _sbuf_v_end.
             _reset_wav_timeline(self)
-            print(f"Loaded WAV source: {wav_path} ({len(samples)} samples @ {self.sample_rate} Hz)", flush=True)
+            print(f"Loaded WAV source: {wav_path} ({len(samples)} samples @ {self.sample_rate} Hz)"
+                  f"{' [dual-pol]' if self.dual_pol else ''}", flush=True)
         except Exception as exc:
             print(f"WAV load error: {exc}", flush=True)
             time.sleep(0.5)
@@ -481,12 +599,11 @@ def _process_wav_source_step(self):
         chunk = self._wav_samples[start:]
         self._wav_index = len(self._wav_samples)
         if chunk.size > 0:
-            chunk = chunk.astype(np.complex64)
+            chunk = _polarization_combine(chunk.astype(np.complex64))
             wav_seconds = float(self._wav_time_cursor)
             ts_int = int(wav_seconds)
             ts_frac = int((wav_seconds - ts_int) * 1e12)
             self.process_iq_data(chunk, ts_int, ts_frac)
-            time.sleep(chunk.size / self.sample_rate)
         # Mark done and trigger comparison
         self._wav_done = True
         print(f"WAV playback complete: {wav_path}", flush=True)
@@ -498,7 +615,7 @@ def _process_wav_source_step(self):
         ).start()
         return
 
-    chunk = self._wav_samples[start:end].astype(np.complex64)
+    chunk = _polarization_combine(self._wav_samples[start:end].astype(np.complex64))
     self._wav_index = end
 
     # WAV samples are already in [-1, 1] from _load_wav_complex — no ingress scaling needed.
@@ -506,7 +623,6 @@ def _process_wav_source_step(self):
     ts_int = int(wav_seconds)
     ts_frac = int((wav_seconds - ts_int) * 1e12)
     self.process_iq_data(chunk, ts_int, ts_frac)
-    time.sleep(chunk_size / self.sample_rate)
 
 
 def _run_wav_comparison(wav_path: str, run_start: datetime | None,
@@ -597,6 +713,20 @@ def _run_wav_comparison(wav_path: str, run_start: datetime | None,
                     best_dist, best = dist, dec
         return best
 
+    def _launch_theta(pl):
+        """Return theta_deg from the launch log entry nearest to placement pl."""
+        centre_khz = pl.get("center_hz", 0.0) / 1000.0
+        delay_s    = pl.get("delay_s", 0.0)
+        best, best_dist = None, float("inf")
+        for lch in launches:
+            df = abs(lch.get("radio_khz", float("inf")) - centre_khz)
+            dt = abs(lch.get("t_sec",     float("inf")) - delay_s)
+            if df <= freq_tol_khz and dt <= time_tol_s:
+                dist = (df / freq_tol_khz) ** 2 + (dt / time_tol_s) ** 2
+                if dist < best_dist:
+                    best_dist, best = dist, lch
+        return best.get("theta_deg") if best else None
+
     lines = []
     lines.append(f"MSK144 Comparison Report")
     lines.append(f"Simulation : {wav_p.name}")
@@ -619,16 +749,27 @@ def _run_wav_comparison(wav_path: str, run_start: datetime | None,
     lines.append("Message: A [P/N] ff ttt [P/N] dd www  — freq±kHz  time-ds  SNR±dB  width-ms")
     lines.append("")
 
-    col_w = 13
-    lines.append(f"{'#':>3}  {'Message':<{col_w}}  {'t (s)':>6}  {'fc (kHz)':>8}  "
-                 f"{'gen SNR':>7}  {'wid ms':>7}  Status")
-    lines.append("-" * 70)
+    # Detect whether manifest has polarization data (dual-pol WAV)
+    _has_pol = any('theta0_deg' in pl for pl in placements)
 
-    n_decoded = n_missed = n_garbled = 0
+    col_w = 13
+    _pol_hdr = "  θ_gen  θ_meas" if _has_pol else ""
+    lines.append(f"{'#':>3}  {'Message':<{col_w}}  {'t (s)':>6}  {'fc (kHz)':>8}  "
+                 f"{'gen SNR':>7}  {'wid ms':>7}{_pol_hdr}  Status")
+    lines.append("-" * (70 + (16 if _has_pol else 0)))
+
+    n_decoded = n_no_decode = n_missed = 0
     matched_ids: set[int] = set()
 
     def _snr_str(v):
         return f"{v:>+4d} dB" if v is not None else "      ?"
+
+    def _pol_str(theta_gen, theta_meas):
+        if not _has_pol:
+            return ""
+        g = f"{theta_gen:>5.0f}°" if theta_gen is not None else "    ?"
+        m = f"{theta_meas:>5.0f}°" if theta_meas is not None else "    ?"
+        return f"  {g}  {m}"
 
     placements = sorted(placements, key=lambda p: p.get("delay_s", 0.0))
 
@@ -638,6 +779,7 @@ def _run_wav_comparison(wav_path: str, run_start: datetime | None,
         delay_s   = pl.get("delay_s", 0.0)
         snr_db    = pl.get("snr_db")
         width_ms  = pl.get("width_ms")
+        theta_gen = pl.get("theta0_deg")
         gen_snr   = _snr_str(snr_db)
         width_str = f"{width_ms:>4d} ms" if width_ms is not None else "     ?"
         prefix    = f"{i+1:>3}  {msg:<{col_w}}  {delay_s:>6.2f}  {c_khz:>8.2f}  {gen_snr}  {width_str}"
@@ -649,22 +791,29 @@ def _run_wav_comparison(wav_path: str, run_start: datetime | None,
             # of the same signal don't appear as false alarms.
             for h in hits:
                 matched_ids.add(id(h))
-            det_t = dec.get('t_sec')
-            extra = f"  ×{len(hits)}" if len(hits) > 1 else ""
-            lines.append(f"{prefix}  DECODED{extra}   "
-                         f"(t={det_t:.2f}s  fc={dec.get('fc_khz',float('nan')):.2f} kHz)")
+            det_t      = dec.get('t_sec')
+            theta_meas = dec.get('theta_deg')
+            extra      = f"  ×{len(hits)}" if len(hits) > 1 else ""
+            lines.append(f"{prefix}{_pol_str(theta_gen, theta_meas)}  DECODED{extra}   "
+                         f"(t={det_t:.2f}s  fc={dec.get('radio_khz', dec.get('fc_khz', float('nan'))):.2f} kHz)")
             n_decoded += 1
         else:
-            near = _pos_match(pl)
-            if near and id(near) not in matched_ids:
-                matched_ids.add(id(near))
-                det_t = near.get('t_sec')
-                lines.append(f"{prefix}  GARBLED   "
-                             f"(jt9: '{near.get('message','')}'"
-                             f"  t={det_t:.2f}s  fc={near.get('fc_khz',float('nan')):.2f} kHz)")
-                n_garbled += 1
+            theta_meas_lch = _launch_theta(pl)
+            if theta_meas_lch is not None:
+                # Detected (jt9 launched) but jt9 did not return the correct message.
+                # Check for a wrong-message decode near this placement (position match).
+                near = _pos_match(pl)
+                if near and id(near) not in matched_ids:
+                    matched_ids.add(id(near))
+                    det_t = near.get('t_sec')
+                    note  = f"  (wrong msg: '{near.get('message','')}'  t={det_t:.2f}s)"
+                else:
+                    note  = ""
+                lines.append(f"{prefix}{_pol_str(theta_gen, theta_meas_lch)}  NO DECODE{note}")
+                n_no_decode += 1
             else:
-                lines.append(f"{prefix}  MISSED")
+                # No launch found near this placement — signal never reached the detector.
+                lines.append(f"{prefix}{_pol_str(theta_gen, None)}  MISSED")
                 n_missed += 1
 
     false_alarms = [d for d in decodes if id(d) not in matched_ids]
@@ -675,11 +824,10 @@ def _run_wav_comparison(wav_path: str, run_start: datetime | None,
     pct   = 100 * n_decoded / total if total else 0
     lines.append(f"Total signals  : {total}")
     lines.append(f"Decoded        : {n_decoded:>3}  ({pct:.0f}%)")
-    lines.append(f"Missed         : {n_missed:>3}")
-    if n_garbled:
-        lines.append(f"Garbled        : {n_garbled:>3}  (detected but message wrong)")
+    lines.append(f"No decode      : {n_no_decode:>3}  (detected, jt9 launched, no correct message)")
+    lines.append(f"Missed         : {n_missed:>3}  (never detected — below threshold)")
     lines.append(f"jt9 launches   : {n_launched:>3}  "
-                 f"({len(decodes)} decoded  {n_no_decode} stray  {n_timeout} timeout)")
+                 f"({len(decodes)} decoded  {n_no_decode} no_decode  {n_timeout} timeout)")
     if false_alarms:
         lines.append(f"False alarms   : {len(false_alarms):>3}  (decoded with no matching signal)")
         for dec in false_alarms:
@@ -749,7 +897,7 @@ def run_radio_source(self):
                             else:
                                 break
                         # RTL-SDR outputs ±1.0 float32 after uint8 conversion — no scaling.
-                        chunk = np.asarray(packet.samples, dtype=np.complex64)
+                        chunk = _polarization_combine(np.asarray(packet.samples, dtype=np.complex64))
                         self.process_iq_data(chunk, packet.timestamp_int, packet.timestamp_frac)
                         drained += 1
                 except Exception as exc:
@@ -779,7 +927,7 @@ def run_radio_source(self):
                             else:
                                 break
                         # Airspy HF+ outputs ±1.0 float32 — no scaling needed.
-                        chunk = np.asarray(packet.samples, dtype=np.complex64)
+                        chunk = _polarization_combine(np.asarray(packet.samples, dtype=np.complex64))
                         self.process_iq_data(chunk, packet.timestamp_int, packet.timestamp_frac)
                         drained += 1
                 except Exception as exc:
@@ -811,7 +959,7 @@ def run_radio_source(self):
                             else:
                                 break
                         # UHD fc32 stream outputs ±1.0 float32 — no scaling needed.
-                        chunk = np.asarray(packet.samples, dtype=np.complex64)
+                        chunk = _polarization_combine(np.asarray(packet.samples, dtype=np.complex64))
                         self.process_iq_data(chunk, packet.timestamp_int, packet.timestamp_frac)
                         drained += 1
                 except Exception as exc:
@@ -822,6 +970,7 @@ def run_radio_source(self):
             if not _start_radio_source(self):
                 time.sleep(1.0)
                 continue
+
 
             # Drain packets and batch them before calling process_iq_data.
             #
@@ -834,6 +983,7 @@ def run_radio_source(self):
             # Accumulate packets until the batch reaches _FLEX_BATCH_SAMPLES
             # (1024 = 4 × NB_FFT_SIZE = ~21 ms), then call once with the
             # combined chunk and the timestamp of the first packet in the batch.
+
             _FLEX_BATCH_SAMPLES = 1024
             try:
                 drained = 0
@@ -856,7 +1006,8 @@ def run_radio_source(self):
                             break
 
                     # Normalise FlexRadio DAXIQ samples from ±32768 ADC scale to ±1.0.
-                    pkt_chunk = (np.asarray(packet.samples, dtype=np.complex64)
+                    # Flex is always single-channel; apply polarization combine (ch0 passthrough).
+                    pkt_chunk = (_polarization_combine(np.asarray(packet.samples, dtype=np.complex64))
                                  / FLEX_DAXIQ_FULL_SCALE)
                     drained += 1
 
@@ -878,6 +1029,62 @@ def run_radio_source(self):
                                 packet.timestamp_frac * (1_000_000_000_000 / self.sample_rate)
                             )
 
+                    # Gate processing during transmit — TX leakback floods the
+                    # NB and channelizer with false detections.  Discard packets
+                    # while TX is active; reset NB state on the TX→RX transition
+                    # so it re-learns the noise floor from a clean signal.
+                    now_tx = getattr(self.radio_client, 'transmitting', False)
+                    was_tx = getattr(self, '_flex_was_tx', False)
+                    self._flex_was_tx = now_tx
+
+                    if now_tx:
+                        # Drain and discard — don't let the queue fill up during TX.
+                        _batch_chunks  = []
+                        _batch_ts_int  = None
+                        _batch_ts_frac = None
+                        _batch_n       = 0
+                        # Reset channelizer buffer on TX entry so there's nothing
+                        # stale to process when RX resumes.
+                        if not was_tx:
+                            self._ch_buf_end = 0
+                            self._ch_buf[:] = 0
+                        # Empty remaining queued packets without processing them.
+                        while True:
+                            try:
+                                self.radio_client.sample_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                        break   # exit inner drain loop; outer loop will re-enter
+
+                    if was_tx and not now_tx:
+                        # TX just ended — flush queue, purge NB state so it
+                        # re-initialises from the first clean RX block.
+                        # Also set a settling gate so AGC transients in the first
+                        # ~500 ms don't produce broadband false detections.
+                        pass  # TX→RX transition: NB state reset (debug)
+                        while True:
+                            try:
+                                self.radio_client.sample_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                        self._nb_spec_avg = None
+                        if hasattr(self, '_pct25'):
+                            del self._pct25
+                        self._pct25_ctr = 0
+                        # Reset channelizer buffer and state so stale TX samples
+                        # don't overflow the accumulation buffer on re-entry.
+                        self._ch_buf_end = 0
+                        self._ch_buf[:] = 0
+                        from .channelizer import make_channelizer_state, N_CHANNELS
+                        self._ch_state = make_channelizer_state(N_CHANNELS, self._ch_taps, self.sample_rate)
+                        # 500 ms settling gate at current sample rate
+                        self._tx_settle_remaining = int(self.sample_rate * 0.5)
+                        _batch_chunks  = []
+                        _batch_ts_int  = None
+                        _batch_ts_frac = None
+                        _batch_n       = 0
+                        break   # re-enter outer loop cleanly
+
                     _batch_chunks.append(pkt_chunk)
                     _batch_n += len(pkt_chunk)
 
@@ -892,7 +1099,7 @@ def run_radio_source(self):
                         _batch_n       = 0
 
                 # Flush any remaining samples shorter than a full batch.
-                if _batch_chunks:
+                if _batch_chunks and not getattr(self, '_flex_was_tx', False):
                     self.process_iq_data(
                         np.concatenate(_batch_chunks),
                         _batch_ts_int, _batch_ts_frac,
@@ -939,13 +1146,17 @@ def _get_tuned_frequency_mhz(self):
             slice_freq = getattr(dax_setup, 'slice_frequency_mhz', None)
             pan_freq = getattr(dax_setup, 'pan_frequency_mhz', None)
             pan_bw = getattr(dax_setup, 'pan_bandwidth_hz', None)
-            if slice_freq is not None:
-                tuned_freq_mhz = slice_freq
-                tuned_source = 'Slice'
-            elif pan_freq is not None:
+            # DAXIQ always delivers IQ centred at the panadapter centre, regardless
+            # of where the associated slice is tuned.  The slice dial frequency is a
+            # cursor in the pan and does NOT determine the IQ stream centre.
+            # Prefer pan_freq; fall back to slice_freq only when pan is unknown.
+            if pan_freq is not None:
                 tuned_freq_mhz = pan_freq
                 tuned_source = 'Pan'
                 tuned_bandwidth_hz = pan_bw
+            elif slice_freq is not None:
+                tuned_freq_mhz = slice_freq
+                tuned_source = 'Slice'
     return tuned_freq_mhz, tuned_source, tuned_bandwidth_hz
 
 
@@ -957,11 +1168,13 @@ def closeEvent(self, event):
     # does not ignore the event and block teardown.
     self._app_closing = True
 
+    _SETTINGS.setValue('source_mode',          self.source_mode)
+    _SETTINGS.setValue('selected_wav_path',    self.selected_wav_path or '')
     _SETTINGS.setValue('window_geometry',      self.saveGeometry())
     _SETTINGS.setValue('min_level',            self.min_level)
     _SETTINGS.setValue('max_level',            self.max_level)
-    _SETTINGS.setValue('detect_min_level',     self.detect_min_level)
-    _SETTINGS.setValue('detect_max_level',     self.detect_max_level)
+    _SETTINGS.setValue('detect_min_level_f',   self.detect_min_level)
+    _SETTINGS.setValue('detect_max_level_f',   self.detect_max_level)
     _SETTINGS.setValue('nb_factor',            self.nb_factor)
     _td_sl = getattr(self, 'td_scale_slider', None)
     _SETTINGS.setValue('td_scale',             _td_sl.value() if _td_sl else 10)
@@ -976,6 +1189,7 @@ def closeEvent(self, event):
         (getattr(self, '_usrp_win',       None), 'usrp_geometry',       None),
         (getattr(self, '_airspy_win',     None), 'airspy_geometry',     None),
         (getattr(self, '_rtlsdr_win',     None), 'rtlsdr_geometry',     None),
+        (getattr(self, '_screenshot_win', None), 'screenshot_geometry', None),
     ]:
         if win is not None:
             _SETTINGS.setValue(geo_key, win.saveGeometry())
@@ -1014,10 +1228,18 @@ def closeEvent(self, event):
     # until every top-level window is closed.  _app_closing=True above ensures
     # their closeEvent accepts rather than ignoring the event.
     for _attr in ('_fast_graph_win', '_detect_win', '_iq_nb_win',
-                  '_reporting_win', '_flex_win', '_usrp_win', '_airspy_win', '_rtlsdr_win'):
+                  '_reporting_win', '_flex_win', '_usrp_win', '_airspy_win', '_rtlsdr_win',
+                  '_screenshot_win'):
         _w = getattr(self, _attr, None)
         if _w is not None:
             _w.close()
+
+    # Close any open analysis windows (saves their settings automatically via closeEvent).
+    for _w in list(getattr(self, '_analysis_windows', [])):
+        try:
+            _w.close()
+        except Exception:
+            pass
 
     print("Shutdown complete")
     event.accept()

@@ -27,7 +27,7 @@ Main window (QMainWindow)
 
 Free-floating panel windows (QWidget with Qt.Window flag)
     Fast Graph          Accumulated + real-time IQ spectrograms; IQ colour-scale sliders.
-    Detection Heatmap   Per-channel SNR heatmap with threshold markers.
+    Tone Detection SNR  Per-channel squared-domain SNR image with threshold markers.
     IQ / Noise Blanker  IQ magnitude time-domain plot + noise blanker controls.
     Flex Radio          Flex Radio status and DAXIQ stream info.
     USRP B210           USRP B210 gain/antenna controls and IF stream info.
@@ -45,6 +45,8 @@ import subprocess
 import numpy as np
 from PyQt5 import QtWidgets, QtCore
 import pyqtgraph as pg
+
+from .widgets import ClickableImageItem
 
 
 def _get_version_string():
@@ -107,6 +109,7 @@ def setup_ui(self):
         setup_airspy_window, setup_rtlsdr_window,
     )
     from .reporting_window import setup_reporting_window
+    from .screenshot_window import setup_screenshot_window
 
     self.setWindowTitle(f'map144 - {self.center_freq_mhz:.3f} MHz')
     self.setGeometry(50, 50, 420, 800)
@@ -115,6 +118,16 @@ def setup_ui(self):
     menu_bar = self.menuBar()
 
     file_menu = menu_bar.addMenu("&File")
+
+    captures_menu = file_menu.addMenu("Captures")
+    open_capture_action = QtWidgets.QAction("Open Capture...", self)
+    open_capture_action.triggered.connect(self._on_open_capture)
+    captures_menu.addAction(open_capture_action)
+    browse_captures_action = QtWidgets.QAction("Browse Captures Folder", self)
+    browse_captures_action.triggered.connect(self._on_browse_captures)
+    captures_menu.addAction(browse_captures_action)
+    file_menu.addSeparator()
+
     self.source_action_group = QtWidgets.QActionGroup(self)
     self.source_action_group.setExclusive(True)
 
@@ -148,6 +161,11 @@ def setup_ui(self):
     self.source_wav_action.triggered.connect(self.on_select_source_wav)
     self.source_action_group.addAction(self.source_wav_action)
     file_menu.addAction(self.source_wav_action)
+    file_menu.addSeparator()
+    screenshot_action  = QtWidgets.QAction("Screenshots",          self)
+    screenshot_action.setCheckable(True)
+    screenshot_action.setChecked(False)
+    file_menu.addAction(screenshot_action)
 
     view_menu = menu_bar.addMenu("&View")
 
@@ -156,15 +174,17 @@ def setup_ui(self):
     about_action.triggered.connect(self._on_about)
     help_menu.addAction(about_action)
 
-    fg_action        = QtWidgets.QAction("Fast Graph",          self)
-    det_action       = QtWidgets.QAction("Detection Heatmap",   self)
-    iq_nb_action     = QtWidgets.QAction("IQ / Noise Blanker",  self)
-    reporting_action = QtWidgets.QAction("Reporting",            self)
-    flex_action      = QtWidgets.QAction("Flex Radio",           self)
-    usrp_action      = QtWidgets.QAction("USRP B210",            self)
-    airspy_action    = QtWidgets.QAction("Airspy HF+",           self)
-    rtlsdr_action    = QtWidgets.QAction("RTL-SDR",              self)
+    fg_action          = QtWidgets.QAction("Fast Graph",          self)
+    det_action         = QtWidgets.QAction("Tone Detection SNR",   self)
+    iq_nb_action       = QtWidgets.QAction("IQ / Noise Blanker",  self)
+    reporting_action   = QtWidgets.QAction("Reporting",            self)
+    analysis_action    = QtWidgets.QAction("Analysis",             self)
+    flex_action        = QtWidgets.QAction("Flex Radio",           self)
+    usrp_action        = QtWidgets.QAction("USRP B210",            self)
+    airspy_action      = QtWidgets.QAction("Airspy HF+",           self)
+    rtlsdr_action      = QtWidgets.QAction("RTL-SDR",              self)
     for act in (fg_action, det_action, iq_nb_action, reporting_action,
+                analysis_action,
                 flex_action, usrp_action, airspy_action, rtlsdr_action):
         act.setCheckable(True)
         act.setChecked(True)
@@ -181,46 +201,142 @@ def setup_ui(self):
     colormap = pg.ColorMap(positions, colors)
 
     # ── Plot widgets ──────────────────────────────────────────────────────────
-    self.realtime_plot = pg.PlotWidget(title="Current (15 sec)")
-    self.realtime_plot.setLabel('left', 'Frequency', units='MHz')
-    self.realtime_plot.setLabel('bottom', 'Time', units='s')
-    self.realtime_img = pg.ImageItem(axisOrder='col-major')
+    # No titles — saves vertical space.  H/V identity shown via Y-axis label.
+    # Time axis: carried by a dedicated ruler widget (viewbox collapsed to 0 px)
+    # placed below all data plots.  All data plots permanently hide their bottom
+    # axis so every data viewbox gets identical height (stretch=1 with no axis).
+    _time_ticks = [[(i, str(i)) for i in range(self.history_secs + 1)]]
+
+    def _make_time_ruler():
+        """PlotWidget with viewbox collapsed to zero — just a time axis bar."""
+        _r = pg.PlotWidget()
+        _r.getAxis('left').hide()
+        _r.getAxis('right').hide()
+        _r.getAxis('top').hide()
+        _r.getAxis('bottom').setTicks(_time_ticks)
+        _r.setXRange(0, float(self.history_secs) + 0.5, padding=0)
+        _r.getViewBox().disableAutoRange()
+        # Collapse the viewbox row (row 2) in PlotItem's internal GraphicsLayout
+        _pi = _r.getPlotItem()
+        for _row in (0, 1, 2):   # title, top-axis, viewbox
+            _pi.layout.setRowMaximumHeight(_row, 0)
+            _pi.layout.setRowMinimumHeight(_row, 0)
+        _r.setMinimumHeight(44)
+        _r.setMaximumHeight(50)
+        return _r
+
+    self.realtime_plot = pg.PlotWidget()
+    self.realtime_plot.setLabel('left', 'H  Freq (MHz)')
+    self.realtime_plot.getAxis('bottom').hide()
+    self.realtime_plot.getViewBox().disableAutoRange()
+    self.realtime_img = ClickableImageItem(axisOrder='col-major')
     self.realtime_plot.addItem(self.realtime_img)
     self.realtime_plot.setAspectLocked(False)
     self.realtime_img.setColorMap(colormap)
-    self.realtime_plot.setXRange(0, float(self.history_secs), padding=0)
+    self.realtime_plot.setXRange(0, float(self.history_secs) + 0.5, padding=0)
+    self.realtime_plot.getAxis('bottom').setTicks(_time_ticks)
+    self.realtime_img.sigClicked.connect(
+        lambda x, y, mod: self._on_fast_graph_click(x, y, mod, window='current')
+    )
 
-    self.spectrogram_plot = pg.PlotWidget(title="Previous (15 sec snapshot)")
-    self.spectrogram_plot.setLabel('left', 'Frequency', units='MHz')
-    self.spectrogram_plot.setLabel('bottom', 'Time', units='s')
-    self.spectrogram_img = pg.ImageItem(axisOrder='col-major')
+    self.spectrogram_plot = pg.PlotWidget()
+    self.spectrogram_plot.setLabel('left', 'H  Freq (MHz)')
+    self.spectrogram_plot.getAxis('bottom').hide()
+    self.spectrogram_plot.getViewBox().disableAutoRange()
+    self.spectrogram_plot.getAxis('bottom').setTicks(_time_ticks)
+    self.spectrogram_img = ClickableImageItem(axisOrder='col-major')
     self.spectrogram_plot.addItem(self.spectrogram_img)
     self.spectrogram_plot.setAspectLocked(False)
     self.spectrogram_img.setColorMap(colormap)
-
-    _half_ch = N_CHANNELS // 2
-    self._detect_freq_min_khz  = -float(_half_ch)
-    self._detect_freq_span_khz =  float(N_CHANNELS)
-
-    self.ch_detect_plot = pg.PlotWidget(
-        title=f"Channel Detection SNR  (threshold {DETECT_THRESH_DB:.0f} dB above noise)"
+    self.spectrogram_img.sigClicked.connect(
+        lambda x, y, mod: self._on_fast_graph_click(x, y, mod, window='previous')
     )
-    self.ch_detect_plot.setLabel('left', 'Frequency offset', units='kHz')
-    self.ch_detect_plot.setLabel('bottom', 'Time', units='s')
+
+    # V-channel panes (dual-pol only — hidden in single-pol mode).
+    # Bottom axis always hidden — the shared time ruler widget carries the scale.
+    self.realtime_plot_v = pg.PlotWidget()
+    self.realtime_plot_v.setLabel('left', 'V  Freq (MHz)')
+    self.realtime_plot_v.getAxis('bottom').hide()
+    self.realtime_plot_v.getAxis('bottom').setTicks(_time_ticks)
+    self.realtime_plot_v.getViewBox().disableAutoRange()
+    self.realtime_img_v = ClickableImageItem(axisOrder='col-major')
+    self.realtime_plot_v.addItem(self.realtime_img_v)
+    self.realtime_plot_v.setAspectLocked(False)
+    self.realtime_img_v.setColorMap(colormap)
+    self.realtime_plot_v.setXRange(0, float(self.history_secs) + 0.5, padding=0)
+    self.realtime_img_v.sigClicked.connect(
+        lambda x, y, mod: self._on_fast_graph_click(x, y, mod, window='current')
+    )
+
+    self.spectrogram_plot_v = pg.PlotWidget()
+    self.spectrogram_plot_v.setLabel('left', 'V  Freq (MHz)')
+    self.spectrogram_plot_v.getAxis('bottom').hide()
+    self.spectrogram_plot_v.getAxis('bottom').setTicks(_time_ticks)
+    self.spectrogram_plot_v.getViewBox().disableAutoRange()
+    self.spectrogram_img_v = ClickableImageItem(axisOrder='col-major')
+    self.spectrogram_plot_v.addItem(self.spectrogram_img_v)
+    self.spectrogram_plot_v.setAspectLocked(False)
+    self.spectrogram_img_v.setColorMap(colormap)
+    self.spectrogram_plot_v.setXRange(0, float(self.history_secs) + 0.5, padding=0)
+    self.spectrogram_img_v.sigClicked.connect(
+        lambda x, y, mod: self._on_fast_graph_click(x, y, mod, window='previous')
+    )
+    self.realtime_plot_v.hide()
+    self.spectrogram_plot.hide()    # shown only for live sources
+    self.spectrogram_plot_v.hide()
+
+    # Heatmap Y: logging dial offset kHz (fc_hz−1500)/1000 for markers; coarse IF = s×1 kHz + offset.
+    _half_ch = N_CHANNELS // 2
+    self._detect_freq_min_khz  = -(float(_half_ch) + 0.5)  # −24.5 kHz: channel k center aligns to y=k kHz
+    self._detect_freq_span_khz =  float(N_CHANNELS)        # 48 kHz span unchanged
+
+    _detect_title = (f"Channel Detection SNR  (threshold {DETECT_THRESH_DB:.0f} dB above noise)"
+                     f"   circles: green=decoded  red=running  orange=no_decode")
+    self.ch_detect_plot = pg.PlotWidget(title="H — " + _detect_title)
+    self.ch_detect_plot.setLabel('left', 'Dial offset (kHz)')
     self.ch_detect_plot.setAspectLocked(False)
     self.ch_detect_img = pg.ImageItem(axisOrder='col-major')
     self.ch_detect_plot.addItem(self.ch_detect_img)
     self.ch_detect_img.setColorMap(colormap)
-    self.ch_detect_curve_red   = pg.PlotCurveItem(pen=pg.mkPen('r', width=1.5))
-    self.ch_detect_curve_green = pg.PlotCurveItem(pen=pg.mkPen('g', width=1.5))
-    self.ch_detect_plot.addItem(self.ch_detect_curve_red)
+    self.ch_detect_curve_cyan   = pg.PlotCurveItem(pen=pg.mkPen((0,  220, 220),   width=1.5))  # SPD decoded
+    self.ch_detect_curve_green  = pg.PlotCurveItem(pen=pg.mkPen('g',             width=1.5))  # jt9 decoded
+    self.ch_detect_curve_red    = pg.PlotCurveItem(pen=pg.mkPen('r',             width=1.5))  # running
+    self.ch_detect_curve_orange = pg.PlotCurveItem(pen=pg.mkPen((255, 140, 0),   width=1.5))  # no decode
+    self.ch_detect_plot.addItem(self.ch_detect_curve_cyan)
     self.ch_detect_plot.addItem(self.ch_detect_curve_green)
-    self.ch_detect_plot.setXRange(0, 15.0, padding=0)
+    self.ch_detect_plot.addItem(self.ch_detect_curve_red)
+    self.ch_detect_plot.addItem(self.ch_detect_curve_orange)
+    self.ch_detect_plot.setXRange(0, 15.5, padding=0)
+    self.ch_detect_plot.getAxis('bottom').hide()
     self.ch_detect_plot.setYRange(
         self._detect_freq_min_khz - 0.5,
         self._detect_freq_min_khz + self._detect_freq_span_khz + 0.5,
         padding=0,
     )
+
+    # V-channel detection heatmap (hidden in single-pol mode)
+    self.ch_detect_plot_v = pg.PlotWidget(title="V — " + _detect_title)
+    self.ch_detect_plot_v.setLabel('left', 'Dial offset (kHz)')
+    self.ch_detect_plot_v.getAxis('bottom').hide()
+    self.ch_detect_plot_v.setAspectLocked(False)
+    self.ch_detect_img_v = pg.ImageItem(axisOrder='col-major')
+    self.ch_detect_plot_v.addItem(self.ch_detect_img_v)
+    self.ch_detect_img_v.setColorMap(colormap)
+    self.ch_detect_curve_cyan_v   = pg.PlotCurveItem(pen=pg.mkPen((0,  220, 220), width=1.5))  # SPD decoded
+    self.ch_detect_curve_green_v  = pg.PlotCurveItem(pen=pg.mkPen('g',           width=1.5))  # jt9 decoded
+    self.ch_detect_curve_red_v    = pg.PlotCurveItem(pen=pg.mkPen('r',           width=1.5))  # running
+    self.ch_detect_curve_orange_v = pg.PlotCurveItem(pen=pg.mkPen((255, 140, 0), width=1.5))  # no decode
+    self.ch_detect_plot_v.addItem(self.ch_detect_curve_cyan_v)
+    self.ch_detect_plot_v.addItem(self.ch_detect_curve_green_v)
+    self.ch_detect_plot_v.addItem(self.ch_detect_curve_red_v)
+    self.ch_detect_plot_v.addItem(self.ch_detect_curve_orange_v)
+    self.ch_detect_plot_v.setXRange(0, 15.5, padding=0)
+    self.ch_detect_plot_v.setYRange(
+        self._detect_freq_min_khz - 0.5,
+        self._detect_freq_min_khz + self._detect_freq_span_khz + 0.5,
+        padding=0,
+    )
+    self.ch_detect_plot_v.hide()
     # Do NOT setXLink here — PyQtGraph's link is bidirectional and would
     # override explicit setXRange calls on realtime_plot.
     self.realtime_plot.getViewBox().disableAutoRange()
@@ -230,28 +346,36 @@ def setup_ui(self):
     # ── Slider bar helper ─────────────────────────────────────────────────────
     def _make_slider_bar(title, min_label_ref, min_range, min_default,
                          max_label_ref, max_range, max_default,
-                         min_slot, max_slot, tick_interval):
+                         min_slot, max_slot, tick_interval, scale=1):
+        """Build a labelled min/max slider bar.
+
+        *scale* divides slider integer positions to produce the displayed dB
+        value.  scale=2 gives 0.5 dB resolution; scale=1 (default) gives 1 dB.
+        *min_default* and *max_default* are the actual dB values (floats);
+        the slider is initialised to round(value * scale).
+        """
         bar = QtWidgets.QWidget()
         row = QtWidgets.QHBoxLayout(bar)
         row.setContentsMargins(6, 2, 6, 2)
         row.setSpacing(8)
         row.addWidget(QtWidgets.QLabel(f"<b>{title}</b>"))
-        min_lbl = QtWidgets.QLabel(f"Min: {min_default} dB")
+        _fmt = (lambda v: f"{v:.1f}") if scale > 1 else (lambda v: f"{int(v)}")
+        min_lbl = QtWidgets.QLabel(f"Min: {_fmt(min_default)} dB")
         setattr(self, min_label_ref, min_lbl)
         row.addWidget(min_lbl)
         min_sl = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         min_sl.setMinimum(min_range[0]); min_sl.setMaximum(min_range[1])
-        min_sl.setValue(min_default)
+        min_sl.setValue(round(min_default * scale))
         min_sl.setTickPosition(QtWidgets.QSlider.TicksBelow)
         min_sl.setTickInterval(tick_interval)
         min_sl.valueChanged.connect(min_slot)
         row.addWidget(min_sl, stretch=1)
-        max_lbl = QtWidgets.QLabel(f"Max: {max_default} dB")
+        max_lbl = QtWidgets.QLabel(f"Max: {_fmt(max_default)} dB")
         setattr(self, max_label_ref, max_lbl)
         row.addWidget(max_lbl)
         max_sl = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         max_sl.setMinimum(max_range[0]); max_sl.setMaximum(max_range[1])
-        max_sl.setValue(max_default)
+        max_sl.setValue(round(max_default * scale))
         max_sl.setTickPosition(QtWidgets.QSlider.TicksBelow)
         max_sl.setTickInterval(tick_interval)
         max_sl.valueChanged.connect(max_slot)
@@ -292,26 +416,44 @@ def setup_ui(self):
     )
     self._fast_graph_win = _PanelWindow("MapMSK144 — Fast Graph", fg_action, self, 'fast_graph_geometry')
     self._fast_graph_win.setMinimumSize(500, 350)
+
+    # Thin separator between the two 15-second pairs (current / previous).
+    # Shown only when the previous pair is visible (live source).
+    self._fg_pair_sep = QtWidgets.QFrame()
+    self._fg_pair_sep.setFixedHeight(6)
+    self._fg_pair_sep.setStyleSheet("QFrame { background-color: #444; border: none; }")
+    self._fg_pair_sep.hide()
+
     fg_layout = QtWidgets.QVBoxLayout(self._fast_graph_win)
     fg_layout.setContentsMargins(0, 0, 0, 0)
     fg_layout.setSpacing(0)
-    fg_layout.addWidget(self.realtime_plot,    stretch=1)
-    fg_layout.addWidget(self.spectrogram_plot, stretch=1)
+    # Pair 1: current 15 sec
+    fg_layout.addWidget(self.realtime_plot,      stretch=1)
+    fg_layout.addWidget(self.realtime_plot_v,    stretch=1)
+    # Visual gap + pair 2: previous 15 sec
+    fg_layout.addWidget(self._fg_pair_sep)
+    fg_layout.addWidget(self.spectrogram_plot,   stretch=1)
+    fg_layout.addWidget(self.spectrogram_plot_v, stretch=1)
+    # Shared time axis ruler — all data plots have their bottom axis hidden
+    fg_layout.addWidget(_make_time_ruler())
     fg_layout.addWidget(iq_sliders)
 
     # ── Panel window: Detection Heatmap ───────────────────────────────────────
     detect_sliders = _make_slider_bar(
         "Detection Color Scale",
-        "detect_min_level_label",  (0, 20),  self.detect_min_level,
-        "detect_max_level_label",  (1, 50),  self.detect_max_level,
-        self.on_detect_min_level_changed, self.on_detect_max_level_changed, 5,
+        "detect_min_level_label",  (-20, 60),  self.detect_min_level,
+        "detect_max_level_label",  (2,  100),  self.detect_max_level,
+        self.on_detect_min_level_changed, self.on_detect_max_level_changed, 10,
+        scale=2,
     )
-    self._detect_win = _PanelWindow("MapMSK144 — Detection Heatmap", det_action, self, 'detect_geometry')
+    self._detect_win = _PanelWindow("MapMSK144 — Tone Detection SNR", det_action, self, 'detect_geometry')
     self._detect_win.setMinimumSize(400, 250)
     det_layout = QtWidgets.QVBoxLayout(self._detect_win)
     det_layout.setContentsMargins(0, 0, 0, 0)
     det_layout.setSpacing(0)
-    det_layout.addWidget(self.ch_detect_plot, stretch=1)
+    det_layout.addWidget(self.ch_detect_plot,   stretch=1)
+    det_layout.addWidget(self.ch_detect_plot_v, stretch=1)
+    det_layout.addWidget(_make_time_ruler())
     det_layout.addWidget(detect_sliders)
 
     # ── Panel windows: source-specific ───────────────────────────────────────
@@ -321,6 +463,7 @@ def setup_ui(self):
     setup_usrp_window(self,       usrp_action)
     setup_airspy_window(self,     airspy_action)
     setup_rtlsdr_window(self,     rtlsdr_action)
+    setup_screenshot_window(self, screenshot_action)
 
     # ── Wire View menu actions ────────────────────────────────────────────────
     fg_action.triggered.connect(
@@ -335,6 +478,9 @@ def setup_ui(self):
     reporting_action.triggered.connect(
         lambda checked: self._reporting_win.show() if checked else self._reporting_win.hide()
     )
+    analysis_action.triggered.connect(
+        lambda checked: _open_analysis_window(self, None) if checked else None
+    )
     flex_action.triggered.connect(
         lambda checked: self._flex_win.show() if checked else self._flex_win.hide()
     )
@@ -346,6 +492,9 @@ def setup_ui(self):
     )
     rtlsdr_action.triggered.connect(
         lambda checked: self._rtlsdr_win.show() if checked else self._rtlsdr_win.hide()
+    )
+    screenshot_action.triggered.connect(
+        lambda checked: self._screenshot_win.show() if checked else self._screenshot_win.hide()
     )
 
     # ── Restore saved geometry and visibility ─────────────────────────────────
@@ -359,6 +508,7 @@ def setup_ui(self):
         (self._usrp_win,       'usrp_geometry',       QtCore.QRect(450, 870, 360, 440)),
         (self._airspy_win,     'airspy_geometry',     QtCore.QRect(450, 870, 360, 340)),
         (self._rtlsdr_win,     'rtlsdr_geometry',     QtCore.QRect(450, 870, 360, 340)),
+        (self._screenshot_win, 'screenshot_geometry', QtCore.QRect(50,  50,  340, 440)),
     ]
     for win, key, default_rect in _win_settings:
         geo = _SETTINGS.value(key)
@@ -389,38 +539,97 @@ def setup_ui(self):
         if win._view_action is not None:
             win._view_action.setChecked(False)
 
-    # ── Status bar ────────────────────────────────────────────────────────────
+    # ── Info panel — vertical stack below decode list ─────────────────────────
+    # Four compact rows: receiver | centre freq | channel range | UTC
+    # Same font as the decode list so the bottom of the window is visually uniform.
+    _info_ss = (
+        "QLabel { background: #2a2a2a; color: #aaaaaa; padding: 1px 4px; }"
+    )
+    _info_ss_bold = (
+        "QLabel { background: #2a2a2a; color: #cccccc; padding: 1px 4px; }"
+    )
+
+    self._receiver_label    = QtWidgets.QLabel("—")
+    self.tuned_freq_label   = QtWidgets.QLabel("—")
+    self._msk_monitor_label = QtWidgets.QLabel("Channels: —")
+    self.utc_clock_label    = QtWidgets.QLabel("UTC: —")
+
+    for _lbl in (self._receiver_label, self.tuned_freq_label,
+                 self._msk_monitor_label, self.utc_clock_label):
+        _lbl.setFont(_mono9)
+
+    self._receiver_label.setStyleSheet(_info_ss_bold)
+    self.tuned_freq_label.setStyleSheet(_info_ss_bold)
+    self._msk_monitor_label.setStyleSheet(_info_ss)
+    self._msk_monitor_label.setToolTip(
+        "Coarse IF channel offsets (kHz) from pan centre; see channel_plan.py"
+    )
+    self.utc_clock_label.setStyleSheet(_info_ss_bold)
+
+    _info_sep = QtWidgets.QFrame()
+    _info_sep.setFrameShape(QtWidgets.QFrame.HLine)
+    _info_sep.setStyleSheet("QFrame { color: #555; }")
+
+    central_vbox.addWidget(_info_sep)
+    central_vbox.addWidget(self._receiver_label)
+    central_vbox.addWidget(self.tuned_freq_label)
+    central_vbox.addWidget(self._msk_monitor_label)
+    central_vbox.addWidget(self.utc_clock_label)
+
+    # Keep status bar for transient messages only (capture saves, errors, etc.)
     self.statusBar().showMessage('Initializing...')
-    self.tuned_freq_label = QtWidgets.QLabel("Tuned: --")
-    self.tuned_freq_label.setStyleSheet("QLabel { font-weight: bold; padding: 0 10px; }")
-    self.statusBar().addPermanentWidget(self.tuned_freq_label)
-    self.utc_clock_label = QtWidgets.QLabel()
-    self.utc_clock_label.setStyleSheet("QLabel { font-weight: bold; padding: 0 10px; }")
-    self.statusBar().addPermanentWidget(self.utc_clock_label)
+
+    # ── Restore last source mode ──────────────────────────────────────────────
+    _last_mode = _SETTINGS.value('source_mode', 'idle', type=str)
+    _last_wav  = _SETTINGS.value('selected_wav_path', '', type=str)
+    if _last_mode == 'radio':
+        self.on_select_source_radio()
+    elif _last_mode == 'usrp':
+        self.on_select_source_usrp()
+    elif _last_mode == 'airspy':
+        self.on_select_source_airspy()
+    elif _last_mode == 'rtlsdr':
+        self.on_select_source_rtlsdr()
+    elif _last_mode == 'wav':
+        # Do not auto-start WAV playback on restart — user must explicitly
+        # choose a file.  Auto-playing can cause a crash when a previous
+        # run's threads are still cleaning up, and it's surprising behaviour.
+        pass
 
     self.update_timer = QtCore.QTimer()
     self.update_timer.timeout.connect(self.update_displays)
     self.update_timer.start(100)
 
+    from .displays import recolor_decode_panel
+    self._age_timer = QtCore.QTimer()
+    self._age_timer.timeout.connect(lambda: recolor_decode_panel(self.decode_panel))
+    self._age_timer.start(15_000)   # recolor every 15 s
+
 
 def on_min_level_changed(self, value):
     self.min_level = value
     self.min_level_label.setText(f"Min: {value} dB")
+    self.spectrogram_img.setLevels([value, self.max_level])
+    self.realtime_img.setLevels([value, self.max_level])
 
 
 def on_max_level_changed(self, value):
     self.max_level = value
     self.max_level_label.setText(f"Max: {value} dB")
+    self.spectrogram_img.setLevels([self.min_level, value])
+    self.realtime_img.setLevels([self.min_level, value])
 
 
 def on_detect_min_level_changed(self, value):
-    self.detect_min_level = value
-    self.detect_min_level_label.setText(f"Min: {value} dB")
+    self.detect_min_level = value * 0.5
+    self.detect_min_level_label.setText(f"Min: {self.detect_min_level:.1f} dB")
+    self.ch_detect_img.setLevels([self.detect_min_level, self.detect_max_level])
 
 
 def on_detect_max_level_changed(self, value):
-    self.detect_max_level = value
-    self.detect_max_level_label.setText(f"Max: {value} dB")
+    self.detect_max_level = value * 0.5
+    self.detect_max_level_label.setText(f"Max: {self.detect_max_level:.1f} dB")
+    self.ch_detect_img.setLevels([self.detect_min_level, self.detect_max_level])
 
 
 def on_nb_factor_changed(self, value):
@@ -431,12 +640,17 @@ def on_nb_factor_changed(self, value):
 def on_td_scale_changed(self, value):
     self.td_scale = value * 0.01   # slider 1–100 → y-max 0.01–1.0
     self.td_plot.setYRange(0.0, self.td_scale, padding=0)
+    if hasattr(self, 'td_plot_v'):
+        self.td_plot_v.setYRange(0.0, self.td_scale, padding=0)
 
 
 def on_td_span_changed(self, value):
     self.td_span_ms = float(value)
     self.td_span_val_label.setText(f"{value} ms")
     self.td_plot.setTitle(f'IQ Magnitude — {value} ms')
+    _td_ruler = getattr(self, 'td_ruler', None)
+    if _td_ruler is not None:
+        _td_ruler.setXRange(0.0, float(value), padding=0)
 
 
 def on_select_source_airspy(self):
@@ -447,7 +661,7 @@ def on_select_source_airspy(self):
     self.selected_wav_path = None
     self.source_airspy_action.setChecked(True)
     show_source_window(self, "airspy")
-    self.statusBar().showMessage("Source: Airspy HF+")
+    self._receiver_label.setText("Airspy HF+")
 
 
 def on_select_source_rtlsdr(self):
@@ -458,7 +672,7 @@ def on_select_source_rtlsdr(self):
     self.selected_wav_path = None
     self.source_rtlsdr_action.setChecked(True)
     show_source_window(self, "rtlsdr")
-    self.statusBar().showMessage("Source: NESDR Smart (RTL-SDR)")
+    self._receiver_label.setText("RTL-SDR")
 
 
 def on_select_source_usrp(self):
@@ -469,7 +683,7 @@ def on_select_source_usrp(self):
     self.selected_wav_path = None
     self.source_usrp_action.setChecked(True)
     show_source_window(self, "usrp")
-    self.statusBar().showMessage("Source: USRP B210")
+    self._receiver_label.setText("USRP B210")
 
 
 def on_select_source_radio(self):
@@ -479,7 +693,7 @@ def on_select_source_radio(self):
     self.selected_wav_path = None
     self.source_radio_action.setChecked(True)
     show_source_window(self, "radio")
-    self.statusBar().showMessage("Source: Flex Radio")
+    self._receiver_label.setText("Flex Radio")
 
 
 def on_select_source_wav(self):
@@ -502,7 +716,7 @@ def on_select_source_wav(self):
     self._wav_done = False
     self.source_wav_action.setChecked(True)
     show_source_window(self, "wav")   # hides all radio windows
-    self.statusBar().showMessage(f"Source: WAV File ({_Path(file_path).name})")
+    self._receiver_label.setText("Simulation")
 
 
 def _on_about(self):
@@ -515,3 +729,97 @@ def _on_about(self):
         f"Copyright &copy; 2026 Jeff Millar, WA1HCO<br>"
         f"GNU General Public License v3",
     )
+
+
+def _on_fast_graph_click(self, x_sec, y_mhz, modifiers, window='current'):
+    """Handle click on realtime or spectrogram image — save capture, optionally open analysis."""
+    from PyQt5.QtCore import Qt
+    from .capture import collect_capture_iq, save_capture, CAPTURES_DIR
+    from pathlib import Path
+
+    iq = collect_capture_iq(self, window=window)
+    if iq.size == 0:
+        self.statusBar().showMessage("Capture failed: ring buffer not yet full", 3000)
+        return
+
+    mode = getattr(self, 'source_mode', 'unknown')
+    src_wav = getattr(self, 'selected_wav_path', None)
+    is_test = mode == 'wav'
+    _source_labels = {
+        'radio':  'Flex Radio',
+        'airspy': 'Airspy HF+',
+        'rtlsdr': 'RTL-SDR',
+        'usrp':   'USRP B210',
+    }
+    if mode == 'wav' and src_wav:
+        from pathlib import Path as _Path
+        source_label = f"WAV: {_Path(src_wav).name}"
+    else:
+        source_label = _source_labels.get(mode, mode)
+
+    wav_path, json_path = save_capture(
+        iq,
+        center_freq_mhz = float(self.display_center_freq_mhz),
+        source          = source_label,
+        nb_factor       = float(getattr(self, 'nb_factor', 6.0)),
+        nb_enabled      = True,
+        is_test_wav     = is_test,
+        source_wav_path = src_wav,
+    )
+
+    msg = f"Capture saved: {wav_path.name}"
+    self.statusBar().showMessage(msg, 5000)
+    print(f"[capture] {msg}", flush=True)
+
+    if modifiers & Qt.ShiftModifier:
+        _open_analysis_window(self, wav_path)
+
+
+def _open_analysis_window(self, wav_path):
+    """Launch the analysis window with the given capture WAV.
+
+    Each call opens a fresh independent window (multiple captures can be
+    analysed side-by-side).  If wav_path is None, opens a file dialog first.
+    """
+    from pathlib import Path
+    from PyQt5.QtCore import Qt
+    from .capture import browse_captures
+    from .analysis_window import AnalysisWindow
+
+    if wav_path is None:
+        wav_path = browse_captures(self)
+        if wav_path is None:
+            return
+
+    reporter = getattr(self, 'reporter', None)
+    win = AnalysisWindow(Path(wav_path), reporter=reporter, parent=self)
+    # Keep a reference so Python/Qt don't garbage-collect it.
+    if not hasattr(self, '_analysis_windows'):
+        self._analysis_windows = []
+    self._analysis_windows.append(win)
+    win.setAttribute(Qt.WA_DeleteOnClose)
+    win.destroyed.connect(lambda: self._analysis_windows.remove(win)
+                          if win in self._analysis_windows else None)
+    win.show()
+
+
+def _on_open_capture(self):
+    """File → Captures → Open Capture..."""
+    from .capture import browse_captures
+    wav_path = browse_captures(self)
+    if wav_path:
+        _open_analysis_window(self, wav_path)
+
+
+def _on_browse_captures(self):
+    """File → Captures → Browse Captures Folder."""
+    import subprocess as _sp
+    from .capture import CAPTURES_DIR
+    from pathlib import Path
+    d = Path(CAPTURES_DIR).resolve()
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        _sp.Popen(['xdg-open', str(d)])
+    except Exception:
+        from PyQt5 import QtWidgets
+        QtWidgets.QMessageBox.information(self, "Captures Folder", str(d))

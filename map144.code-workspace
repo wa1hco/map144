@@ -9,7 +9,7 @@
 	],
 	"settings": {
 		"chat.tools.terminal.autoApprove": {
-			"/home/jeff/ham/mapmsk144/.venv/bin/python": true
+			"/home/jeff/ham/map144/.venv/bin/python": true
 		}
 	}
 }

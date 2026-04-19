@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/jeff/ham/map144/.venv/bin/python3
 """Analyze a single MSK144 WAV file.
 
 Standalone diagnostic and decode tool for MSK144 audio files.  Produces a
@@ -148,13 +148,38 @@ def read_wav(path: Path) -> tuple[np.ndarray, int]:
 
     Returns complex64 IQ (L=I, R=Q) for stereo files, or float32 mono
     for single-channel files.  Samples are normalised to ±1.
+
+    Supports PCM int8/int16/int32 (format 1) and IEEE float32 (format 3).
+    Python's wave module only handles PCM, so RIFF parsing is done manually
+    so that capture files written by capture.py (float32 stereo) also load.
     """
-    with wave.open(str(path), 'rb') as wf:
-        sample_rate = wf.getframerate()
-        channels = wf.getnchannels()
-        sample_width = wf.getsampwidth()
-        n_frames = wf.getnframes()
-        raw = wf.readframes(n_frames)
+    import struct as _struct
+    with open(str(path), 'rb') as f:
+        file_bytes = f.read()
+
+    if file_bytes[:4] != b'RIFF' or file_bytes[8:12] != b'WAVE':
+        raise ValueError(f"Not a RIFF/WAVE file: {path}")
+
+    pos = 12
+    fmt_code = channels = sample_rate = sample_width = None
+    raw = None
+    while pos < len(file_bytes) - 8:
+        chunk_id   = file_bytes[pos:pos+4]
+        chunk_size = _struct.unpack_from('<I', file_bytes, pos+4)[0]
+        pos += 8
+        if chunk_id == b'fmt ':
+            fmt_code    = _struct.unpack_from('<H', file_bytes, pos)[0]
+            channels    = _struct.unpack_from('<H', file_bytes, pos+2)[0]
+            sample_rate = _struct.unpack_from('<I', file_bytes, pos+4)[0]
+            sample_width = _struct.unpack_from('<H', file_bytes, pos+14)[0] // 8
+        elif chunk_id == b'data':
+            raw = file_bytes[pos:pos+chunk_size]
+        pos += chunk_size + (chunk_size & 1)   # RIFF chunks are word-aligned
+
+    if raw is None or fmt_code is None:
+        raise ValueError(f"Malformed WAV file: {path}")
+    if fmt_code not in (1, 3):
+        raise ValueError(f"Unsupported WAV format {fmt_code} in {path}")
 
     if sample_width == 1:
         data = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
@@ -273,16 +298,25 @@ def _estimate_median(spec_db: np.ndarray) -> np.ndarray:
 
 
 def _flatten(spec_db: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Flatten spectrogram by raising bins with low noise floor to the peak floor level.
+    """Flatten spectrogram by correcting for the wideband noise floor shape.
+
+    Correction is derived from a frequency-smoothed median floor so that
+    narrowband features (EMI lines, calibration tones) are NOT equalized away —
+    only the gradual passband tilt is removed.
 
     Returns:
         spec_flat  – corrected spectrogram (nstep, nfreq)
-        floor_flat – corrected noise floor (nfreq,); constant at peak_db
+        floor_flat – per-bin median floor after correction (nfreq,)
         correction – per-bin additive correction (nfreq,)
     """
     floor = _estimate_median(spec_db)
-    peak = float(np.max(floor))
-    correction = peak - floor
+    # Smooth in frequency to average out narrowband lines (~2 kHz box-car).
+    # With nfft=512 at 48 kHz each bin is ~94 Hz; 21 bins ≈ 2 kHz.
+    nsmooth = 21
+    kernel = np.ones(nsmooth, dtype=np.float64) / nsmooth
+    floor_smooth = np.convolve(floor.astype(np.float64), kernel, mode='same')
+    peak = float(np.max(floor_smooth))
+    correction = peak - floor_smooth
     spec_flat = spec_db.astype(np.float64) + correction[np.newaxis, :]
     return spec_flat, floor + correction, correction
 
@@ -792,7 +826,8 @@ def plot_channel_detection(
 
     def _ch_for_ping(p):
         """Map ping center_hz to display slot index."""
-        k = int(round(p['center_hz'] / ch_spacing)) % N_CH
+        # center_hz = k*1000 + 1500; subtract 1500 before dividing to get k.
+        k = int(round((p['center_hz'] - 1500.0) / ch_spacing)) % N_CH
         return int((k - half_ch) % N_CH)
 
     def _frame_for_ping(p):
@@ -1040,13 +1075,14 @@ def plot_analysis(
     t1, f1, s1_raw = _compute_spectrogram(samples, rate)
     t0 = _tick('analysis: normal_spectrogram', t0)
 
-    if flatten:
+    is_iq = np.iscomplexobj(samples)
+    if flatten and not is_iq:
         s1, floor1, _ = _flatten(s1_raw)
         row1_title    = "Spectrogram (flattened)"
     else:
         s1     = s1_raw.astype(np.float64)
         floor1 = _estimate_median(s1)
-        row1_title = "Spectrogram (original)"
+        row1_title = "Spectrogram"
     t0 = _tick('analysis: median_flatten_row1', t0)
 
     # ── Row 2: detection heatmap (complex IQ) or squared spectrogram (mono) ─
@@ -1078,8 +1114,10 @@ def plot_analysis(
         return [float(t[0]), float(t[-1]), float(f[0]) / 1000.0, float(f[-1]) / 1000.0]
 
     # ── [0,0]  Normal spectrogram ──────────────────────────────────────────
-    f1_min_khz = 0.0
-    f1_max_khz = 3.0
+    # For mono audio (12 kHz, 0–6 kHz) show only 0–3 kHz (MSK144 passband).
+    # For complex IQ (48 kHz, ±24 kHz) show the full bilateral spectrum.
+    f1_min_khz = float(f1[0])  / 1000.0 if is_iq else 0.0
+    f1_max_khz = float(f1[-1]) / 1000.0 if is_iq else 3.0
     ax00, ax01 = axes[0]
     img1 = ax00.imshow(
         s1.T, aspect='auto', origin='lower',
@@ -1090,6 +1128,8 @@ def plot_analysis(
     ax00.set_ylabel("Frequency (kHz)")
     ax00.set_ylim(f1_min_khz, f1_max_khz)
     ax00.xaxis.set_major_locator(MultipleLocator(1.0))
+    if is_iq:
+        ax00.axhline(0, color='white', lw=0.5, alpha=0.4, linestyle='--', dashes=(4, 4))  # centre freq marker
 
     # ── [0,1]  Median noise floor vs frequency ─────────────────────────────
     floor1_line, = ax01.plot(floor1, f1 / 1000.0, lw=1.2, color='tab:orange')
@@ -1244,17 +1284,20 @@ def plot_analysis(
 
             # Row 1
             t1n, f1n, s1n_raw = _compute_spectrogram(new_samples, new_rate)
-            if flatten:
+            _is_iq_n = np.iscomplexobj(new_samples)
+            if flatten and not _is_iq_n:
                 s1n, floor1n, _ = _flatten(s1n_raw)
                 ax00.set_title("Spectrogram (flattened)")
             else:
                 s1n = s1n_raw.astype(np.float64)
                 floor1n = _estimate_median(s1n)
-                ax00.set_title("Spectrogram (original)")
+                ax00.set_title("Spectrogram")
             img1.set_data(s1n.T)
             img1.set_extent(_extent(t1n, f1n))
-            ax00.set_ylim(0.0, 3.0)
-            ax01.set_ylim(0.0, 3.0)
+            _f1n_min = float(f1n[0])  / 1000.0 if _is_iq_n else 0.0
+            _f1n_max = float(f1n[-1]) / 1000.0 if _is_iq_n else 3.0
+            ax00.set_ylim(_f1n_min, _f1n_max)
+            ax01.set_ylim(_f1n_min, _f1n_max)
             floor1_line.set_xdata(floor1n)
             floor1_line.set_ydata(f1n / 1000.0)
 

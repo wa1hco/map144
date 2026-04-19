@@ -45,10 +45,12 @@ Fields:
                                  (picoseconds when TSF=2; sample count when TSF=1).
     sequence        int          4-bit packet sequence number (0–15, wraps).
                                  Used by ``VITAReceiver`` to detect dropped packets.
-    samples         np.ndarray   Complex64 IQ samples: ``I + j*Q``.  Each element
-                                 is one sample pair unpacked from the little-endian
-                                 IEEE-754 float32 interleaved payload.  Values are
-                                 in the range approximately ±1.0 (full-scale float).
+    samples         np.ndarray   Complex64 IQ samples, shape ``(N, num_channels)``.
+                                 ``samples[:, 0]`` is the primary (or only) channel.
+                                 Single-channel sources produce shape ``(N, 1)``.
+                                 Dual-channel sources (e.g. USRP with two RX ports)
+                                 produce shape ``(N, 2)``.  Values are approximately
+                                 ±1.0 full scale after consumer normalisation.
 """
 
 from dataclasses import dataclass, field
@@ -72,5 +74,5 @@ class VitaPacket:
     timestamp_frac: int         # fractional timestamp — units depend on tsf field
     tsf:            int         # TSF field from header: 0=none, 1=sample count, 2=picoseconds
     sequence:       int
-    samples:        np.ndarray  # complex64 array, I+jQ
+    samples:        np.ndarray  # complex64 array, shape (N, num_channels); channel 0 = primary
 

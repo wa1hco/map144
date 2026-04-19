@@ -108,11 +108,12 @@ class FlexDAXIQ:
         self.sample_rate     = sample_rate
         self.dax_channel     = dax_channel
         self.listen_port     = listen_port
-        self.bind_client_id = bind_client_id or bind_client_handle
+        self.bind_client_id  = bind_client_id or bind_client_handle
         self.sample_queue    = queue.Queue(maxsize=4000)
         self._tcp            = None
         self._dax_setup      = None
         self._vita           = None
+        self.transmitting    = False   # True while interlock state is TX_ACTIVE/PTT_REQUESTED
 
     def _log_bound_context_diagnostics(self):
         """Log bound-context diagnostics via supported list commands."""
@@ -211,7 +212,11 @@ class FlexDAXIQ:
                 self._log_bound_context_diagnostics()
             except RuntimeError as e:
                 log.warning(f"Could not bind to GUI client_id {bind_client_id}: {e}")
-                log.warning(f"Bind command failed: {bind_cmd}")
+                # A timeout means the radio closed the TCP connection — continuing
+                # would fail immediately on the next send.  Re-raise so the caller
+                # can tear down and retry with a fresh connection.
+                if "Command timeout" in str(e):
+                    raise RuntimeError(f"TCP connection lost during client bind: {e}") from e
 
         selected_port = _pick_udp_listen_port()
         log.debug(f"Using UDP:{selected_port} for DAXIQ stream")
@@ -235,7 +240,37 @@ class FlexDAXIQ:
             output_queue=self.sample_queue
         )
         self._vita.start()
+        self._dax_setup._vita_ref = self._vita   # enables dynamic filter_sid updates
         log.debug("DAXIQ stream running")
+
+        # Subscribe to interlock (TX) status so we can gate processing during TX.
+        # The radio pushes interlock state changes in real-time — no polling needed.
+        # Try both command forms; one will be accepted depending on firmware version.
+        for _sub_cmd in ("sub tx all", "sub interlock"):
+            try:
+                self._tcp.send_command(_sub_cmd)
+                log.debug(f"Subscribed to TX/interlock status via: {_sub_cmd}")
+                break
+            except RuntimeError as e:
+                log.warning(f"TX subscription '{_sub_cmd}' failed: {e}")
+
+        # Chain an interlock-aware status callback onto whatever setup.py installed.
+        _prev_cb = self._tcp._status_cb
+        def _interlock_cb(line: str):
+            if _prev_cb:
+                _prev_cb(line)
+            # S<handle>|interlock state=TX_ACTIVE ...
+            if '|interlock ' in line:
+                state = ''
+                for tok in line.split():
+                    if tok.startswith('state='):
+                        state = tok[6:]
+                        break
+                was_tx = self.transmitting
+                self.transmitting = state in ('PTT_REQUESTED', 'TRANSMITTING', 'UNKEY_REQUESTED', 'TX_FAULT')
+                if self.transmitting != was_tx:
+                    log.debug(f"TX state → {'TX' if self.transmitting else 'RX'} ({state})")
+        self._tcp._status_cb = _interlock_cb
 
     def stop(self):
         if self._vita:

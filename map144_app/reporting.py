@@ -66,6 +66,8 @@ MSG_DECODE    = 2
 
 HEARTBEAT_INTERVAL_S    = 15
 PSKREPORTER_INTERVAL_S  = 300   # 5 minutes — pskreporter asks for ≥5 min
+DX_DUPE_INTERVAL_S      = 1200  # 20 minutes — informal DX cluster etiquette
+DX_FREQ_CHANGE_KHZ      = 3.0   # re-spot if station moved ≥ this far (kHz)
 
 PSKREPORTER_HOST = "report.pskreporter.info"
 PSKREPORTER_PORT = 4739
@@ -419,6 +421,7 @@ class Reporter:
         self._dx_sock     = None
         self._dx_lock     = threading.Lock()
         self._dx_logged_in = False
+        self._dx_dupe_cache: dict[str, tuple[float, float]] = {}  # call → (last_time, last_freq_khz)
 
         # Runtime state
         self._sock       = None
@@ -558,7 +561,7 @@ class Reporter:
         """Send one DX spot. Reconnects once if the connection has dropped."""
         if not (self.dx_enabled and self.my_call):
             return
-        cmd = f"DX {freq_khz:.1f} {dx_call} {comment}\r\n"
+        cmd = f"DX {freq_khz:.3f} {dx_call} {comment}\r\n"
         for attempt in range(2):
             with self._dx_lock:
                 if self._dx_sock is None:
@@ -660,14 +663,30 @@ class Reporter:
                 self.stat_psk_queued = len(self._psk_spots)
 
         # ── DX Cluster ────────────────────────────────────────────────────────
-        # Send immediately on each decode; skip self-spots
+        # Skip self-spots; suppress duplicates within DX_DUPE_INTERVAL_S (20 min)
+        # to respect the informal DX cluster etiquette against flooding with the
+        # same callsign every 15-30 seconds when a local station is running CQ.
         if (self.dx_enabled and self.my_call and de_call
                 and de_call.upper() != self.my_call.upper()):
-            freq_khz = radio_khz
-            snr_str  = f"{snr:+d}dB" if snr is not None else ""
-            grid_str = grid or ""
-            comment  = f"MSK144 {grid_str} {snr_str}".strip()
-            self._dx_send_spot(freq_khz, de_call, comment)
+            _now      = time.time()
+            _key      = de_call.upper()
+            _last_t, _last_f = self._dx_dupe_cache.get(_key, (0.0, 0.0))
+            _freq_moved = abs(radio_khz - _last_f) >= DX_FREQ_CHANGE_KHZ
+            if _now - _last_t >= DX_DUPE_INTERVAL_S or _freq_moved:
+                freq_khz = radio_khz
+                snr_str  = f"{snr:+d}dB" if snr is not None else ""
+                grid_str = grid or ""
+                comment  = f"MSK144 {grid_str} {snr_str}".strip()
+                self._dx_send_spot(freq_khz, de_call, comment)
+                self._dx_dupe_cache[_key] = (_now, radio_khz)
+                # Prune stale entries so the cache doesn't grow unbounded
+                # during a long session with many unique callsigns.
+                if len(self._dx_dupe_cache) > 500:
+                    cutoff = _now - DX_DUPE_INTERVAL_S
+                    self._dx_dupe_cache = {
+                        k: v for k, v in self._dx_dupe_cache.items()
+                        if v[0] >= cutoff
+                    }
 
     def _psk_next_seq(self) -> int:
         self._psk_seq += 1

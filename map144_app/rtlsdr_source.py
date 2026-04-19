@@ -284,7 +284,7 @@ class NesdrSmartSource:
         ts_int  = int(t_chunk)
         ts_frac = int((t_chunk - ts_int) * 1e12)
 
-        pkt = _RtlPacket(chunk, ts_int, ts_frac)
+        pkt = _RtlPacket(chunk.reshape(-1, 1), ts_int, ts_frac)
         try:
             self.sample_queue.put_nowait(pkt)
         except queue.Full:

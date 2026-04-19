@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/jeff/ham/map144/.venv/bin/python3
 # Copyright (C) 2026  Jeff Millar, WA1HCO <wa1hco@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
@@ -32,6 +32,28 @@ for their operation +/- tolerance.
 A GUI (PyQt5) provides several options for viewing program status, including
 a live spectrogram, detection heatmap, SNR history, and decode log.
 
+SNR reporting
+-------------
+map144 reports two SNR estimates for each decoded ping:
+
+``est_snr_db`` (MAP144's own estimate)
+    Non-coherent energy detection: median PSD of the 500 ms pre-burst noise
+    segment normalised to the WSJT-X 2500 Hz bandwidth convention.  This is
+    computed before jt9 is called and is available even when jt9 cannot decode.
+
+``jt9_snr_db`` (jt9's estimate, preferred)
+    jt9's internal SNR from the 12 kHz WAV clip.  Used when available;
+    falls back to ``est_snr_db`` when jt9 reports no value.
+
+Both estimates read approximately **3–4 dB lower than WSJT-X** for the same
+ping.  Calibration (``snr_calibrate.py``) confirmed this is expected and
+correct: WSJT-X uses a coherent matched filter tuned to the exact MSK144
+symbol structure, which has an inherent ~3–4 dB processing gain over
+map144's non-coherent energy detector.  The IQ mix→decimate chain
+contributes negligible loss (≤0.5 dB).  Neither the signal chain nor the
+estimator algorithm is at fault — the offset is a fundamental consequence
+of coherent vs. incoherent detection.
+
 Usage
 -----
 ::
@@ -57,12 +79,12 @@ Bootstrap sequence
 ------------------
 1. Parse arguments.
 2. Configure logging (root logger + ``flexclient`` namespace).
-3. If --headless: instantiate Engine, set source_mode, call run_headless().
+3. Verify ``jt9`` (WSJT-X) is on ``PATH``.
 4. Create ``QApplication``; set ``quitOnLastWindowClosed = True``.
-5. Install ``SIGINT`` / ``SIGTERM`` handlers that call ``app.quit()`` via
-   ``QTimer.singleShot(0, ...)`` — posting the quit request through the Qt
-   event queue ensures it fires safely from the main thread even though Python
-   delivers signals asynchronously.
+5. Install ``SIGINT`` / ``SIGTERM`` handlers that close the main window via
+   ``QTimer.singleShot(0, ...)`` so ``closeEvent`` runs (stops radio / sources
+   cleanly).  Posting through the Qt event queue keeps shutdown on the main
+   thread even though Python delivers signals asynchronously.
 6. Instantiate and show ``MAP144Visualizer``.
 7. Start a 500 ms Qt timer with a no-op slot.  Qt's C++ event loop blocks
    Python's GIL-based signal delivery; this timer forces the interpreter back
@@ -73,28 +95,87 @@ Bootstrap sequence
 9. Enter the Qt event loop via ``app.exec_()``.
 """
 
+import argparse
+import faulthandler
 import logging
+import os
+import shutil
 import signal
 import sys
+from datetime import datetime
+from pathlib import Path
 
-from map144gui.visualizer import MAP144Visualizer
+faulthandler.enable()   # print C-level stack trace to stderr on SIGSEGV
+
+# Limit numpy/BLAS/OpenMP to 1 thread — must be set before numpy is imported.
+# The processing loop is single-threaded; multi-threaded BLAS creates contention
+# across concurrent calls (channelizer matmul vs waterfall FFT) that causes
+# unpredictable 10-100x slowdowns under high signal levels.
+os.environ.setdefault("OMP_NUM_THREADS",     "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS","1")
+os.environ.setdefault("MKL_NUM_THREADS",     "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+from map144_app.visualizer import MAP144Visualizer
 
 
 def _configure_logging(level_name: str):
-    level = getattr(logging, level_name.upper(), logging.INFO)
+    level      = getattr(logging, level_name.upper(), logging.INFO)
+    log_dir    = Path(__file__).parent / 'MSK144' / 'logs'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path   = log_dir / f"map144_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    fmt        = '%(asctime)s %(levelname)s %(message)s'
+    formatter  = logging.Formatter(fmt)
+
+    # File handler — captures everything including print() via stdout redirect
+    file_handler = logging.FileHandler(log_path, encoding='utf-8')
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(level)
+
+    # Console handler — same output to terminal
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(level)
+
     root_logger = logging.getLogger()
-    if not root_logger.handlers:
-        logging.basicConfig(level=level, format='%(asctime)s %(levelname)s %(message)s')
-    else:
-        root_logger.setLevel(level)
+    root_logger.setLevel(level)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
 
     logging.getLogger('flexclient').setLevel(level)
+
+    # Redirect stdout (print statements) to the log file as well.
+    # Most diagnostic output in detection.py / processing.py uses print().
+    sys.stdout = _TeeStream(sys.stdout, log_path)
+
+    print(f"[map144] log file: {log_path}", flush=True)
+
+
+class _TeeStream:
+    """Write to both the original stdout and a log file."""
+    def __init__(self, original, log_path: Path):
+        self._orig     = original
+        self._log_file = open(log_path, 'a', buffering=1, encoding='utf-8')
+
+    def write(self, data):
+        self._orig.write(data)
+        self._log_file.write(data)
+
+    def flush(self):
+        self._orig.flush()
+        self._log_file.flush()
+
+    def fileno(self):
+        return self._orig.fileno()
+
+    def isatty(self):
+        return self._orig.isatty()
 
 
 def main():
     """Launch the Radio IQ visualizer GUI."""
-    import argparse
-
     parser = argparse.ArgumentParser(description='map144 MSK144 meteor scatter decoder')
     parser.add_argument('--bind-client-id', type=str, default=None,
                         help='GUI client UUID for `client bind client_id=<uuid>`')
@@ -107,7 +188,6 @@ def main():
 
     _configure_logging(args.log_level)
 
-    import shutil
     if shutil.which('jt9') is None:
         print("error: jt9 not found on PATH", file=sys.stderr)
         sys.exit(1)
@@ -124,14 +204,19 @@ def main():
         # skipped and UHD's C++ destructor calls std::terminate.
         # window.close() fires closeEvent → sources stop → event.accept() →
         # main window is destroyed → quitOnLastWindowClosed triggers app.quit.
-        QtCore.QTimer.singleShot(0, app._window.close)
+        def _do_shutdown():
+            w = getattr(app, '_window', None)
+            if w is not None:
+                w.close()
+            else:
+                app.quit()
+
+        QtCore.QTimer.singleShot(0, _do_shutdown)
 
     signal.signal(signal.SIGINT, _graceful_shutdown)
     signal.signal(signal.SIGTERM, _graceful_shutdown)
 
-    window = MAP144Visualizer(
-        bind_client_id=args.bind_client_id or args.bind_client,
-    )
+    window = MAP144Visualizer(bind_client_id=args.bind_client_id or args.bind_client)
     window.show()
 
     timer = QtCore.QTimer()
