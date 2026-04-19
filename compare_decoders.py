@@ -17,8 +17,9 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-WSJTX_ALL  = Path.home() / ".local/share/WSJT-X - Local/ALL.TXT"
-MAP144_LOG = Path(__file__).parent / "MSK144/detections/decodes.jsonl"
+WSJTX_ALL     = Path.home() / ".local/share/WSJT-X - Local/ALL.TXT"
+MAP144_LOG    = Path(__file__).parent / "MSK144/detections/decodes.jsonl"
+MAP144_LAUNCHES = Path(__file__).parent / "MSK144/detections/launches.jsonl"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -116,6 +117,79 @@ def is_test_message(msg: str) -> bool:
 def normalise_msg(msg: str) -> str:
     """Normalise a message for matching: uppercase, collapse spaces."""
     return ' '.join(msg.upper().split())
+
+
+def parse_launches(path: Path) -> list[dict]:
+    """Parse MAP144 launches.jsonl.
+
+    Each entry:  {"timestamp": "2026-04-19_12:36:10.3", "t_sec": 10.3,
+                  "radio_khz": 50277, "outcome": "no_decode", ...}
+
+    Returns a list with an added 'period' field (datetime at 15-s boundary).
+    """
+    launches = []
+    if not path.exists():
+        return launches
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts_str = d.get('timestamp', '')
+            try:
+                wall = datetime.strptime(ts_str, "%Y-%m-%d_%H:%M:%S.%f").replace(tzinfo=timezone.utc)
+            except ValueError:
+                try:
+                    wall = datetime.strptime(ts_str, "%Y-%m-%d_%H:%M:%S").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+            # period_start: wall time minus t_sec offset gives approximate period start
+            t_sec = d.get('t_sec', 0.0) or 0.0
+            approx_period_epoch = (wall.timestamp() - t_sec) // 15 * 15
+            d['period'] = datetime.fromtimestamp(approx_period_epoch, tz=timezone.utc)
+            launches.append(d)
+    return launches
+
+
+def _find_launch_for_wsjtx(wsjtx_decode: dict, launches: list[dict],
+                           freq_tol_khz: float = 2.5) -> dict | None:
+    """Return the best MAP144 launch matching a WSJT-X decode, or None.
+
+    Matches on:
+      - Same 15-second period (exact period_start equality)
+      - radio_khz within freq_tol_khz of the WSJT-X signal frequency
+        (WSJT-X signal freq = dial_khz + af_hz/1000)
+
+    Returns the closest-frequency launch, preferring 'decoded' > 'no_decode'
+    > 'timeout' outcomes.
+    """
+    # WSJT-X actual signal frequency: dial (MHz → kHz) + audio offset
+    sig_khz = wsjtx_decode['freq_mhz'] * 1000.0 + wsjtx_decode.get('af_hz', 0) / 1000.0
+    period  = wsjtx_decode['ts']   # already period_start from parse_wsjtx
+
+    outcome_rank = {'decoded': 0, 'no_decode': 1, 'timeout': 2, 'error': 3}
+
+    best      = None
+    best_rank = 99
+    best_df   = float('inf')
+
+    for launch in launches:
+        if launch['period'] != period:
+            continue
+        df = abs(launch.get('radio_khz', 0) - sig_khz)
+        if df > freq_tol_khz:
+            continue
+        rank = outcome_rank.get(launch.get('outcome', ''), 9)
+        if (rank < best_rank) or (rank == best_rank and df < best_df):
+            best      = launch
+            best_rank = rank
+            best_df   = df
+
+    return best
 
 
 def _dedup(decodes):
@@ -456,6 +530,10 @@ def main():
                     help='Match window in seconds (default: 1; both sources now use period-start timestamps)')
     ap.add_argument('--plot',   metavar='FILE', default=None,
                     help='Save detection-rate plot to FILE (e.g. detect.png)')
+    ap.add_argument('--launches', metavar='FILE', default=str(MAP144_LAUNCHES),
+                    help='MAP144 launches.jsonl (default: MSK144/detections/launches.jsonl)')
+    ap.add_argument('--no-launches', action='store_true',
+                    help='Skip launch cross-reference diagnostic')
     args = ap.parse_args()
 
     # Load
@@ -506,6 +584,16 @@ def main():
         map144_all = [d for d in map144_all if _in_window(d['ts'])]
         dropped = before_w - len(wsjtx_all) - len(map144_all)
         print(f"  (UTC window {args.utc}: dropped {dropped} outside-window decodes)")
+
+    # Load launches for diagnostic
+    launches_all: list[dict] = []
+    if not args.no_launches:
+        launches_path = Path(args.launches)
+        if launches_path.exists():
+            launches_all = parse_launches(launches_path)
+            print(f"  MAP144 launches: {len(launches_all)} entries")
+        else:
+            print(f"  MAP144 launches: not found ({launches_path})")
 
     if not wsjtx_all and not map144_all:
         print("No data in the specified time window.")
@@ -586,13 +674,42 @@ def main():
     print(f"  WSJT-X only: {len(w_only_c)}  {sorted(w_only_c)[:10]}")
     print(f"  MAP144 only: {len(m_only_c)}  {sorted(m_only_c)[:10]}")
 
-    # Show WSJT-X-only decodes (MAP144 missed)
+    # Show WSJT-X-only decodes (MAP144 missed) with launch cross-reference
     if wsjtx_only:
+        # Cross-reference each WSJT-X-only ping against MAP144 launches
+        n_detected_nodec = 0
+        n_detected_to    = 0
+        n_not_detected   = 0
+        rows = []
+        for d in sorted(wsjtx_only, key=lambda x: x['snr']):
+            if launches_all:
+                launch = _find_launch_for_wsjtx(d, launches_all)
+                if launch is None:
+                    tag = 'NOT_DETECTED'
+                    n_not_detected += 1
+                elif launch.get('outcome') in ('no_decode', 'error'):
+                    tag = 'NO_DECODE'
+                    n_detected_nodec += 1
+                elif launch.get('outcome') == 'timeout':
+                    tag = 'TIMEOUT'
+                    n_detected_to += 1
+                else:
+                    tag = launch.get('outcome', '?').upper()
+            else:
+                tag = ''
+            rows.append((d, tag))
+
         print(f"\nWSJT-X decoded, MAP144 missed ({len(wsjtx_only)}):")
-        for d in sorted(wsjtx_only, key=lambda x: x['snr'])[:20]:
-            print(f"  {d['ts'].strftime('%H:%M:%S')}  SNR{d['snr']:+3d}  {d['message']}")
-        if len(wsjtx_only) > 20:
-            print(f"  ... and {len(wsjtx_only)-20} more")
+        if launches_all:
+            print(f"  NOT_DETECTED={n_not_detected}  NO_DECODE={n_detected_nodec}"
+                  + (f"  TIMEOUT={n_detected_to}" if n_detected_to else ""))
+        for d, tag in rows[:30]:
+            sig_khz = d['freq_mhz'] * 1000.0 + d.get('af_hz', 0) / 1000.0
+            tag_str = f'  [{tag}]' if tag else ''
+            print(f"  {d['ts'].strftime('%H:%M:%S')}  SNR{d['snr']:+3d}  "
+                  f"{sig_khz:8.1f} kHz  {d['message']}{tag_str}")
+        if len(wsjtx_only) > 30:
+            print(f"  ... and {len(wsjtx_only)-30} more")
 
     # Show MAP144-only decodes (WSJT-X missed)
     if map144_only:
