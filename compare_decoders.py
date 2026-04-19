@@ -118,14 +118,40 @@ def normalise_msg(msg: str) -> str:
     return ' '.join(msg.upper().split())
 
 
+def _dedup(decodes):
+    """Deduplicate decode list to one entry per (normalised_message, period_start).
+
+    A strong station calling CQ produces 3–6 identical decodes per 15-second
+    window in WSJT-X and 1–2 in MAP144.  Counting each repetition separately
+    inflates the WSJT-X-only count and understates MAP144 coverage.  The
+    meaningful question is: did the decoder hear this station in this window?
+    Keep the entry with the best (lowest) SNR to represent the hardest copy.
+    """
+    best: dict[tuple, dict] = {}
+    for d in decodes:
+        key = (normalise_msg(d['message']), d['ts'])
+        prev = best.get(key)
+        if prev is None or d.get('snr', 0) < prev.get('snr', 0):
+            best[key] = d
+    return list(best.values())
+
+
 def match_decodes(wsjtx, map144, window_sec=2):
     """
     Match decodes from both sources that refer to the same ping.
     Two decodes match if:
       - normalised messages are identical
       - timestamps are within window_sec of each other
+
+    Both lists are first deduplicated to one entry per
+    (message, 15-second period) so repeated decodes of the same CQ from
+    a strong station don't inflate the WSJT-X-only or MAP144-only counts.
+
     Returns (matched, wsjtx_only, map144_only).
     """
+    wsjtx  = _dedup(wsjtx)
+    map144 = _dedup(map144)
+
     # Index map144 by normalised message for fast lookup
     m144_by_msg = defaultdict(list)
     for d in map144:
