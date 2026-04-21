@@ -103,6 +103,25 @@ def recolor_decode_panel(panel: QtWidgets.QListWidget) -> None:
             item.setForeground(_age_color(now - ts))
 
 
+_MSG_COL_WIDTH = 13   # matches WSJT-X displaytext.cpp WORD1_WIDTH / WORD2_WIDTH
+                      # worst-case callsign: <...>/AB1CDE = 12 chars → fits with 1-space pad
+
+def _align_msk144_message(msg: str) -> str:
+    """Left-justify the three-part MSK144 message into fixed-width columns.
+
+    MSK144 messages have the form ``WORD1 WORD2 WORD3`` where WORD1 and WORD2
+    are callsigns (or compounds like ``<...>/AB1CDE``).  Pad each to
+    ``_MSG_COL_WIDTH`` chars so the decode panel lines up regardless of
+    callsign length, mirroring the WSJT-X ``alignCalls`` mod in
+    ``displaytext.cpp``.
+    """
+    parts = msg.split(None, 2)   # split on whitespace, at most 3 pieces
+    if len(parts) < 3:
+        return msg               # CQ / short messages — leave as-is
+    w1, w2, rest = parts
+    return w1.ljust(_MSG_COL_WIDTH) + w2.ljust(_MSG_COL_WIDTH) + rest
+
+
 def _format_bandwidth_hz(bandwidth_hz):
     if bandwidth_hz is None:
         return None
@@ -204,7 +223,10 @@ def update_displays(self):
         elif not _is_live and _sep.isVisible():
             _sep.hide()
 
-    if self.spec_staging_filled:
+    _fg_win     = getattr(self, '_fast_graph_win', None)
+    _fg_visible = _fg_win is None or _fg_win.isVisible()
+
+    if _fg_visible and self.spec_staging_filled:
         spec_array = self.spectrogram_data
 
         # Gate setImage to once per 15-second boundary — the accumulated
@@ -253,7 +275,7 @@ def update_displays(self):
                 _sp_v_plot.setXRange(0, self.max_time + 0.5, padding=0)
                 _sp_v_plot.setYRange(freq_min, freq_max, padding=0)
 
-    if self.realtime_filled and getattr(self, '_realtime_dirty', False):
+    if _fg_visible and self.realtime_filled and getattr(self, '_realtime_dirty', False):
         self._realtime_dirty = False
 
         # Capture array references once so the display uses a consistent
@@ -331,9 +353,13 @@ def update_displays(self):
                 radio_khz = result.get('radio_khz', 0.0)
                 snr       = result.get('jt9_snr')
                 utc_time  = result.get('utc_time', '')
-                rf_mhz    = radio_khz / 1000.0
-                snr_str   = f"{snr:+d} dB" if snr is not None else "  ?"
-                _item = QtWidgets.QListWidgetItem(f"{utc_time}  {rf_mhz:.3f}  {snr_str:>7}  {msg}")
+                theta_deg = result.get('theta_deg')
+                df_hz     = int(round((radio_khz - self.calling_freq_mhz * 1000) * 1000))
+                pol_str   = f"{int(round(theta_deg)):3d}\u00b0" if theta_deg is not None else "  --"
+                snr_str   = f"{snr:+d} dB" if snr is not None else "     ?"
+                _item = QtWidgets.QListWidgetItem(
+                    f"{utc_time}  {radio_khz:9.3f}  {df_hz:+5d}  {pol_str}  {snr_str:>7}  {_align_msk144_message(msg)}"
+                )
                 _item.setForeground(_age_color(0))        # brand-new — white
                 _item.setData(QtCore.Qt.UserRole, time.time())
                 self.decode_panel.insertItem(0, _item)
@@ -419,11 +445,17 @@ def update_displays(self):
                 return np.concatenate(xs), np.concatenate(ys)
 
             def _split_by_pol(mlist):
-                """Split markers onto H or V pane by theta_deg (< 45° → H, ≥ 45° → V)."""
+                """Split markers onto H or V pane.
+
+                Primary: theta_deg >= 45° → V (polarization search result).
+                Fallback when theta_deg is None: det_pol == 'v' → V (detecting channel).
+                """
                 h, v = [], []
                 for m in mlist:
                     th = m.get('theta_deg')
-                    if _dual and th is not None and th >= 45.0:
+                    if _dual and th is not None:
+                        (v if th >= 45.0 else h).append(m)
+                    elif _dual and m.get('det_pol') == 'v':
                         v.append(m)
                     else:
                         h.append(m)

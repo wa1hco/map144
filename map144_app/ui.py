@@ -138,6 +138,12 @@ def setup_ui(self):
     self.source_action_group.addAction(self.source_radio_action)
     file_menu.addAction(self.source_radio_action)
 
+    self.source_usrp_action = QtWidgets.QAction("USRP B210", self)
+    self.source_usrp_action.setCheckable(True)
+    self.source_usrp_action.triggered.connect(self.on_select_source_usrp)
+    self.source_action_group.addAction(self.source_usrp_action)
+    file_menu.addAction(self.source_usrp_action)
+
     self.source_airspy_action = QtWidgets.QAction("Airspy HF+", self)
     self.source_airspy_action.setCheckable(True)
     self.source_airspy_action.triggered.connect(self.on_select_source_airspy)
@@ -149,12 +155,6 @@ def setup_ui(self):
     self.source_rtlsdr_action.triggered.connect(self.on_select_source_rtlsdr)
     self.source_action_group.addAction(self.source_rtlsdr_action)
     file_menu.addAction(self.source_rtlsdr_action)
-
-    self.source_usrp_action = QtWidgets.QAction("USRP B210", self)
-    self.source_usrp_action.setCheckable(True)
-    self.source_usrp_action.triggered.connect(self.on_select_source_usrp)
-    self.source_action_group.addAction(self.source_usrp_action)
-    file_menu.addAction(self.source_usrp_action)
 
     self.source_wav_action = QtWidgets.QAction("WAV File", self)
     self.source_wav_action.setCheckable(True)
@@ -386,7 +386,7 @@ def setup_ui(self):
     # ── Central widget: callsign decode list ──────────────────────────────────
     _mono9 = _QtGui.QFont("Monospace", 9)
 
-    _decode_header = QtWidgets.QLabel("UTC       Freq        SNR   Message")
+    _decode_header = QtWidgets.QLabel("UTC       Freq(kHz)      DF   Pol    SNR    Message")
     _decode_header.setFont(_mono9)
     _decode_header.setStyleSheet(
         "QLabel { background: #2a2a2a; color: #aaaaaa; "

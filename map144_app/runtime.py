@@ -114,9 +114,12 @@ closeEvent(self, event)
     thread to exit (terminates forcibly if it does not), then accepts the event.
 """
 
+import logging
 import queue
 import time
 import importlib
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 from scipy.signal import hilbert
@@ -127,6 +130,29 @@ import json
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+
+def _fg_resize_for_plot_count(self):
+    """Resize the Fast Graph window so each pane keeps the same pixel height
+    when the set of visible plots changes (e.g. WAV→B210 adds the previous-15s
+    pair, doubling the plot count).  Called once at source/dual-pol transitions,
+    not on the 100 ms render timer.
+    """
+    fg_win = getattr(self, '_fast_graph_win', None)
+    if fg_win is None:
+        return
+    dual    = getattr(self, 'dual_pol', False)
+    is_live = getattr(self, 'source_mode', 'idle') not in ('idle', 'wav')
+    # Count how many stretch=1 plots will be visible after this transition.
+    n = 1                          # realtime_plot (H) always visible
+    if dual:    n += 1             # realtime_plot_v
+    if is_live: n += 1             # spectrogram_plot
+    if is_live and dual: n += 1    # spectrogram_plot_v
+    # Resize the window so each pane gets a constant target height.
+    _pane_h = max(fg_win.height() // max(1, getattr(self, '_fg_last_plot_count', n)), 150)
+    self._fg_last_plot_count = n
+    from PyQt5.QtCore import QTimer
+    QTimer.singleShot(0, lambda: fg_win.resize(fg_win.width(), max(_pane_h * n, 300)))
+
 
 # FlexRadio DAXIQ float32 payloads use ADC full scale ≈ ±32768.
 # Dividing by this constant at ingress normalises samples to the ±1.0 internal standard.
@@ -172,6 +198,9 @@ def _set_dual_pol(self, enabled: bool):
     if getattr(self, 'dual_pol', False) == enabled:
         return
     self.dual_pol = enabled
+    # Resize Fast Graph so each pane keeps its pixel height when the V panes
+    # appear/disappear.  Do this here (not in the render loop) so it fires once.
+    _fg_resize_for_plot_count(self)
     # Reset channeliser buffers for both polarizations.
     self._rebuild_channelizer_state()
     # Reset V-channel waterfall buffer.
@@ -287,9 +316,10 @@ def _connect_usrp_client(self):
         )
         self.usrp_client._gain_ch1    = _gain1
         self.usrp_client._antenna_ch1 = _ant1
-        print("[usrp] USRPSource created", flush=True)
+        logger.debug("[usrp] USRPSource created")
+        _fg_resize_for_plot_count(self)
     except Exception as exc:
-        print(f"[usrp] USRPSource creation failed: {exc}", flush=True)
+        logger.error("[usrp] USRPSource creation failed: %s", exc)
         self.usrp_client = None
 
 
@@ -308,7 +338,7 @@ def _start_usrp_source(self) -> bool:
             self.decode_panel.clear()
         return True
     except Exception as exc:
-        print(f"[usrp] start error: {exc}", flush=True)
+        logger.error("[usrp] start error: %s", exc)
         import traceback; traceback.print_exc()
         self.usrp_client = None   # prevent retry spam
         return False
@@ -963,8 +993,7 @@ def run_radio_source(self):
                         self.process_iq_data(chunk, packet.timestamp_int, packet.timestamp_frac)
                         drained += 1
                 except Exception as exc:
-                    print(f"[usrp] queue/process error: {exc}", flush=True)
-                    import traceback; traceback.print_exc()
+                    logger.exception("[usrp] queue/process error: %s", exc)
                 continue
 
             if not _start_radio_source(self):
@@ -985,7 +1014,15 @@ def run_radio_source(self):
             # combined chunk and the timestamp of the first packet in the batch.
 
             _FLEX_BATCH_SAMPLES = 1024
+
             try:
+                # Anchor wall clock once per drain cycle; compute per-batch
+                # wall time from cumulative sample count within the cycle.
+                # One time.time() call per ~170 ms drain instead of per 21 ms
+                # batch eliminates OS scheduling jitter in the heatmap/spectrogram
+                # write index while staying crystal-accurate within the drain.
+                _drain_t0      = time.time()
+                _drain_samples = 0   # samples dispatched to process_iq_data so far
                 drained = 0
                 _batch_chunks   = []
                 _batch_ts_int   = None
@@ -1028,6 +1065,7 @@ def run_radio_source(self):
                             _batch_ts_frac = int(
                                 packet.timestamp_frac * (1_000_000_000_000 / self.sample_rate)
                             )
+
 
                     # Gate processing during transmit — TX leakback floods the
                     # NB and channelizer with false detections.  Discard packets
@@ -1089,10 +1127,13 @@ def run_radio_source(self):
                     _batch_n += len(pkt_chunk)
 
                     if _batch_n >= _FLEX_BATCH_SAMPLES:
+                        _wt = _drain_t0 + _drain_samples / self.sample_rate
                         self.process_iq_data(
                             np.concatenate(_batch_chunks),
-                            _batch_ts_int, _batch_ts_frac,
+                            int(_wt),
+                            int((_wt - int(_wt)) * 1_000_000_000_000),
                         )
+                        _drain_samples += _batch_n
                         _batch_chunks  = []
                         _batch_ts_int  = None
                         _batch_ts_frac = None
@@ -1100,9 +1141,11 @@ def run_radio_source(self):
 
                 # Flush any remaining samples shorter than a full batch.
                 if _batch_chunks and not getattr(self, '_flex_was_tx', False):
+                    _wt = _drain_t0 + _drain_samples / self.sample_rate
                     self.process_iq_data(
                         np.concatenate(_batch_chunks),
-                        _batch_ts_int, _batch_ts_frac,
+                        int(_wt),
+                        int((_wt - int(_wt)) * 1_000_000_000_000),
                     )
             except Exception as exc:
                 print(f"Queue get/process error: {exc}", flush=True)

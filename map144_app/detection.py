@@ -165,11 +165,12 @@ def _estimate_snr_db(audio: np.ndarray) -> int | None:
     we already have to produce an equivalent estimate:
 
     Noise
-        Overlap-averaged PSD (50 % hop, Hanning window) over the 500 ms
-        pre-burst segment (audio[1200:7200] at 12 kHz).  That segment
-        contains pure receiver noise — no signal — so the median power
-        across the out-of-band bins (200–5500 Hz, excluding the signal
-        band) gives a stable noise-density estimate in power/bin.
+        Overlap-averaged PSD (50 % hop, Hanning window) over the first
+        500 ms of pre-burst audio (audio[1200:7200] at 12 kHz).  When
+        called from the jt9 fallback path the audio has 1500 ms of
+        pre-burst, so the full noise_end window is used; the SPD path
+        supplies 500 ms.  The median power across out-of-band bins
+        (200–5500 Hz, excluding the signal band) gives the noise density.
 
     Signal
         A 1024-sample (≈ 85 ms) Hanning-windowed FFT is slid through the
@@ -187,12 +188,14 @@ def _estimate_snr_db(audio: np.ndarray) -> int | None:
 
     audio   – float32 mono at _DECODE_RATE (12 kHz), structured as:
                 [pad_n_dec] [pre_n_dec (noise)] [burst + post] [pad_n_dec]
-              where pad_n_dec = 100 ms, pre_n_dec = 500 ms.
+              where pad_n_dec = 100 ms, pre_n_dec matches the caller's pre_n.
 
     Returns SNR rounded to the nearest integer dB, or None on failure.
     """
     pad_n_dec  = int(0.100 * _DECODE_RATE)   # 1200 samples
-    pre_n_dec  = int(0.500 * _DECODE_RATE)   # 6000 samples
+    # Use whatever pre-burst was captured; if less than 500 ms, skip to avoid
+    # indexing into the burst region.
+    pre_n_dec  = int(0.500 * _DECODE_RATE)   # 6000 samples minimum noise window
     noise_end  = pad_n_dec + pre_n_dec        # 7200
     burst_start = noise_end
 
@@ -210,7 +213,10 @@ def _estimate_snr_db(audio: np.ndarray) -> int | None:
         psds.append(np.abs(np.fft.rfft(blk * _SNR_WINDOW)) ** 2)
     if not psds:
         return None
-    noise_per_bin = float(np.median(np.mean(psds, axis=0)[_SNR_NOISE_MASK]))
+    _arr = np.mean(psds, axis=0)[_SNR_NOISE_MASK]  # fancy-index returns new writable array
+    _k   = len(_arr) // 2
+    _arr.partition(_k)                              # in-place O(n); bypasses _wrapfunc/_quantile
+    noise_per_bin = float(_arr[_k])
     if noise_per_bin <= 0.0:
         return None
 
@@ -449,7 +455,7 @@ def extract_and_decode(
     """
     theta_deg = 0.0   # set by pol search below; initialised here so except blocks can reference it
     dphi_deg  = 0.0
-    pre_n  = int(0.500 * sample_rate)   # 500 ms before detection
+    pre_n  = int(0.500 * sample_rate)   # 500 ms before detection — sufficient for SPD path
     post_n = int(1.200 * sample_rate)   # 1200 ms after detection — MSK144 envelope e·t·exp(-t)
                                         # decays to ~10% at 4× width; for max 300 ms ping that
                                         # tail extends ~900 ms past peak, so 1200 ms captures it
@@ -562,15 +568,26 @@ def extract_and_decode(
     launch_ts = detect_ts or datetime.now(timezone.utc).strftime('%Y-%m-%d_%H:%M:%S.%f')[:21]
     _ts_file  = launch_ts[:10].replace('-', '') + '_' + launch_ts[11:19].replace(':', '') + 'Z'
 
-    # MSK144 period start: floor actual ping time to 15-second UTC boundary,
-    # matching WSJT-X's reporting convention (periods at :00/:15/:30/:45).
+    # MSK144 period timestamp: WSJT-X convention is the END of the Rx period
+    # (= start of the next 15-second window).  A ping received at 09:40:12 is
+    # in the period 09:40:00–09:40:15; WSJT-X logs it as 09:40:15.
+    # Using the same convention ensures MAP144 decodes match the correct QSO
+    # period in WSJT-X (1st/2nd checkbox) and in PSKReporter/DXcluster reports.
+    #
+    # PERIOD_SLIP correction: pipeline latency (0.3–0.5 s) can cause the detection
+    # trigger to fire just after a 15-second boundary even though the actual ping
+    # was in the preceding period.  Anchoring the period estimate to the START of
+    # the pre-burst window (launch – pre_n) rather than the trigger instant shifts
+    # the reference back by 500 ms, which is sufficient to correct the slip without
+    # misassigning normal pings.  For jt9 decodes the exact dt field is used instead.
     try:
         _launch_dt = datetime.strptime(launch_ts, "%Y-%m-%d_%H:%M:%S.%f").replace(tzinfo=timezone.utc)
     except ValueError:
         _launch_dt = datetime.strptime(launch_ts, "%Y-%m-%d_%H:%M:%S").replace(tzinfo=timezone.utc)
-    _period_epoch = int(_launch_dt.timestamp() // 15) * 15
-    _period_dt    = datetime.fromtimestamp(_period_epoch, tz=timezone.utc)
-    period_ts     = _period_dt.strftime("%Y-%m-%d_%H:%M:%S")
+    _ping_epoch_est = _launch_dt.timestamp() - pre_n / sample_rate   # start of pre-burst window
+    _period_epoch   = int(_ping_epoch_est // 15) * 15 + 15           # period END
+    _period_dt      = datetime.fromtimestamp(_period_epoch, tz=timezone.utc)
+    period_ts       = _period_dt.strftime("%Y-%m-%d_%H:%M:%S")
 
     def _log_launch(outcome: str, message: str = "", jt9_snr=None, jt9_line: str = ""):
         entry = {
@@ -621,7 +638,7 @@ def extract_and_decode(
                         't_sec':     t_sec,
                         'radio_khz': radio_khz,
                         'jt9_snr':   snr,
-                        'utc_time':  datetime.now(timezone.utc).strftime('%H:%M:%S'),
+                        'utc_time':  _period_dt.strftime('%H:%M:%S'),
                         'audio':     audio.copy(),
                         'theta_deg': round(theta_deg, 1),
                         'dphi_deg':  round(dphi_deg, 1),
@@ -645,6 +662,47 @@ def extract_and_decode(
 
             else:
                 # ── jt9 fallback (SPD missed — handles longer bursts) ─────────
+                #
+                # Extend the pre-burst noise window to 1500 ms before running jt9.
+                # jt9's SNR estimate needs a clean noise reference; 500 ms gives only
+                # ~9 PSD frames while 1500 ms gives ~34.  The ring buffer still holds
+                # this history — re-read it now that SPD has confirmed we need jt9.
+                # theta_deg/dphi_deg from the pol search are already determined and
+                # reused as-is; we skip the pol search on the extended buffer.
+                _jt9_pre_used = pre_n   # updated below if extended buffer is read
+                _pre_n_jt9 = int(1.500 * sample_rate)
+                _rp2, _as2 = ring_state_fn()
+                _iq_ext = _read_ring(iq_ring, _rp2, _as2,
+                                     detect_sample - _pre_n_jt9, _pre_n_jt9 + post_n)
+                if _iq_ext.size > 0:
+                    _slen2  = _iq_ext.shape[0]
+                    _t2     = np.arange(_slen2, dtype=np.float64)
+                    _mix2   = np.exp(-2j * np.pi * shift_hz * _t2 / sample_rate
+                                     ).astype(np.complex64)
+                    if dual_pol and _iq_ext.ndim == 2 and _iq_ext.shape[1] >= 2:
+                        _cos_t2 = float(np.cos(np.radians(theta_deg)))
+                        _sin_t2 = float(np.sin(np.radians(theta_deg)))
+                        _ph2    = np.exp(1j * np.radians(dphi_deg)).astype(np.complex64)
+                        _seg2   = (_cos_t2 * (_iq_ext[:, 0] * _mix2) +
+                                   _sin_t2 * _ph2 * (_iq_ext[:, 1] * _mix2)
+                                   ).astype(np.complex64)
+                    else:
+                        _ch2  = _iq_ext[:, 0] if _iq_ext.ndim == 2 else _iq_ext
+                        _seg2 = (_ch2 * _mix2).astype(np.complex64)
+                    _pad2     = np.zeros(pad_n, dtype=np.complex64)
+                    _iq_pad2  = np.concatenate([_pad2, _seg2, _pad2])
+                    _i2       = decimate(np.real(_iq_pad2).astype(np.float64),
+                                         _DECIMATE_FACTOR, zero_phase=False)
+                    audio_jt9 = _i2.astype(np.float32)
+                    est_snr   = _estimate_snr_db(audio_jt9)
+                    _jt9_pre_used = _pre_n_jt9  # extended buffer in use
+                    # Overwrite the WAV with the extended-noise version for jt9
+                    with wave.open(tmp_path, 'wb') as _wf2:
+                        _wf2.setnchannels(1)
+                        _wf2.setsampwidth(2)
+                        _wf2.setframerate(_DECODE_RATE)
+                        _wf2.writeframes((audio_jt9 * 32767).astype(np.int16).tobytes())
+
                 cmd = (jt9_args if jt9_args is not None else JT9_BASE_ARGS) + [tmp_path]
                 with _JT9_SEMAPHORE:
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=20.0)
@@ -656,8 +714,8 @@ def extract_and_decode(
                         decoded = s
                         break
 
-                if not decoded:
-                    print(f"[jt9 no_decode]  rc={result.returncode}  fc={fc_hz:.0f}Hz"
+                if not decoded and result.returncode != 0:
+                    print(f"[jt9 error]  rc={result.returncode}  fc={fc_hz:.0f}Hz"
                           f"  stdout: {result.stdout.strip()!r}", flush=True)
 
                 if decoded:
@@ -672,6 +730,18 @@ def extract_and_decode(
                     # jt9 cannot compute SNR from a short burst WAV (no noise baseline).
                     # Use our pre-burst estimate when jt9 gives nothing.
                     snr = jt9_snr if jt9_snr is not None else est_snr
+
+                    # Refine period using jt9's dt field (exact ping time in WAV).
+                    # dt is seconds from WAV start; WAV starts (pre+pad) before detection.
+                    try:
+                        _dt_jt9 = float(tokens[2])
+                        _wav_offset = (_jt9_pre_used + pad_n) / sample_rate
+                        _ping_epoch_jt9 = _launch_dt.timestamp() - _wav_offset + _dt_jt9
+                        _period_epoch   = int(_ping_epoch_jt9 // 15) * 15 + 15
+                        _period_dt      = datetime.fromtimestamp(_period_epoch, tz=timezone.utc)
+                        period_ts       = _period_dt.strftime("%Y-%m-%d_%H:%M:%S")
+                    except (ValueError, IndexError, TypeError):
+                        pass  # keep pre-burst-window heuristic
 
                     msg_safe  = re.sub(r'[^A-Za-z0-9]+', '_', full_msg).strip('_')
                     rf_int    = int(round(radio_khz))
@@ -690,7 +760,7 @@ def extract_and_decode(
                             't_sec':     t_sec,
                             'radio_khz': radio_khz,
                             'jt9_snr':   snr,
-                            'utc_time':  datetime.now(timezone.utc).strftime('%H:%M:%S'),
+                            'utc_time':  _period_dt.strftime('%H:%M:%S'),
                             'audio':     audio.copy(),
                             'theta_deg': round(theta_deg, 1),
                             'dphi_deg':  round(dphi_deg, 1),

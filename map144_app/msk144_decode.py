@@ -324,7 +324,7 @@ def _bpdecode128_90(
         if ncheck == 0:
             decoded = cw[:K_LDPC]
             if _check_crc13(decoded):
-                nharderror = int(np.sum(((2 * cw.astype(np.float32) - 1) * llr) < 0))
+                nharderror = int((((2 * cw.astype(np.float32) - 1) * llr) < 0).sum())
                 return decoded[:77].copy(), nharderror
 
         if iteration > 0:
@@ -564,8 +564,8 @@ def msk144decodeframe(
     c = c.astype(np.complex64)
 
     # ── Phase correction (msk144decodeframe.f90 lines 52-59) ──────────────────
-    cca = np.sum(c[0:42] * np.conj(_CB))
-    ccb = np.sum(c[336:378] * np.conj(_CB))
+    cca = (c[0:42] * np.conj(_CB)).sum()
+    ccb = (c[336:378] * np.conj(_CB)).sum()
     phase0 = np.angle(cca + ccb)
     cfac = np.complex64(np.cos(phase0) + 1j * np.sin(phase0))
     c = c * np.conj(cfac)
@@ -575,26 +575,30 @@ def msk144decodeframe(
     softbits = np.empty(144, dtype=np.float32)
 
     # Bit 0: imag wrapped around frame boundary
-    softbits[0] = (np.sum(np.imag(c[0:6]) * pp[6:12]) +
-                   np.sum(np.imag(c[858:864]) * pp[0:6]))
+    softbits[0] = ((c[0:6].imag * pp[6:12]).sum() +
+                   (c[858:864].imag * pp[0:6]).sum())
     # Bit 1: real, first 12 samples
-    softbits[1] = np.sum(np.real(c[0:12]) * pp)
+    softbits[1] = (c[0:12].real * pp).sum()
 
     # Bits 2..143 (Fortran i=2..72)
-    for i in range(2, 73):
-        softbits[2*i - 2] = np.sum(np.imag(c[(i-1)*12 - 6 : (i-1)*12 + 6]) * pp)
-        softbits[2*i - 1] = np.sum(np.real(c[(i-1)*12     : (i-1)*12 + 12]) * pp)
+    # The 71 imaginary windows are non-overlapping, stride=12, starting at offset 6:
+    #   c.imag[6:18], c.imag[18:30], ..., c.imag[846:858]  → reshape(71, 12)
+    # The 71 real windows are non-overlapping, stride=12, starting at offset 12:
+    #   c.real[12:24], c.real[24:36], ..., c.real[852:864]  → reshape(71, 12)
+    # Two matmul calls replace 142 individual np.sum() calls.
+    softbits[2::2] = c.imag[6:858].reshape(71, 12) @ pp   # even indices 2,4,...,142
+    softbits[3::2] = c.real[12:864].reshape(71, 12) @ pp  # odd  indices 3,5,...,143
 
     # ── Sync hard-error gate ──────────────────────────────────────────────────
     hardbits = (softbits >= 0).astype(np.int32)
-    nbadsync1 = (8 - int(np.sum((2*hardbits[0:8]  - 1) * _S8))) // 2
-    nbadsync2 = (8 - int(np.sum((2*hardbits[56:64] - 1) * _S8))) // 2
+    nbadsync1 = (8 - int(((2*hardbits[0:8]  - 1) * _S8).sum())) // 2
+    nbadsync2 = (8 - int(((2*hardbits[56:64] - 1) * _S8).sum())) // 2
     if nbadsync1 + nbadsync2 > 4:
         return None, -1
 
     # ── Normalise soft bits ────────────────────────────────────────────────────
-    sav  = np.mean(softbits)
-    s2av = np.mean(softbits ** 2)
+    sav  = softbits.mean()
+    s2av = (softbits ** 2).mean()
     ssig = np.sqrt(max(s2av - sav**2, 1e-10))
     softbits = softbits / ssig
 

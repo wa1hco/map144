@@ -125,6 +125,19 @@ def _build_sync_template() -> np.ndarray:
 
 _SYNC_CB = _build_sync_template()   # module-level singleton
 
+# Pre-computed constants for _sync_correlate — built once at import, never rebuilt.
+# idx1[ish, k] = ish + k           — indexes sync block at position 0 (0-based)
+# idx2[ish, k] = ish + k + 336     — indexes sync block at position 336
+# Both are (NSPM, 42) int32 arrays; all indices stay < 2*NSPM so ct2 access is safe.
+_SC_IDX1      = (np.arange(NSPM, dtype=np.int32)[:, None]
+                 + np.arange(42, dtype=np.int32)[None, :])   # (NSPM, 42)
+_SC_IDX2      = _SC_IDX1 + 336                               # (NSPM, 42)
+_SYNC_CB_CONJ = np.conj(_SYNC_CB)                            # (42,) precomputed conjugate
+
+# Pre-computed continuous-time vector for the common 4-frame window length.
+# Sliced for shorter windows; rebuilt only if the buffer is longer.
+_T_FULL_4NSPM = np.arange(4 * NSPM, dtype=np.float64) / FS  # (3456,)
+
 
 # ── Sync correlator ───────────────────────────────────────────────────────────
 
@@ -150,21 +163,17 @@ def _sync_correlate(c: np.ndarray) -> tuple[np.ndarray, float, int]:
     xmax     : float  — peak magnitude
     ish_best : int    — 0-based shift index of the peak
     """
-    cb   = _SYNC_CB                          # (42,) complex64
-    ct2  = np.concatenate([c, c])            # (2*NSPM,) doubled for circular shifts
+    ct2 = np.concatenate([c, c])   # (2*NSPM,) doubled for circular shifts
 
-    # Build index arrays for vectorised dot product over all 864 shifts
-    k    = np.arange(42, dtype=np.int32)
-    ish  = np.arange(NSPM, dtype=np.int32)
-    idx1 = ish[:, None] + k[None, :]        # (NSPM, 42) — sync block at position 0
-    idx2 = idx1 + 336                        # (NSPM, 42) — sync block at position 336
+    # sliding_window_view creates strided views — no copy, sequential memory access.
+    # Equivalent to ct2[_SC_IDX1] + ct2[_SC_IDX2] but avoids the two (NSPM,42)
+    # random-access fancy-index copies; reads are cache-friendly sliding windows.
+    wins1    = np.lib.stride_tricks.sliding_window_view(ct2,       42)[:NSPM]  # (NSPM, 42) view
+    wins2    = np.lib.stride_tricks.sliding_window_view(ct2[336:], 42)[:NSPM]  # (NSPM, 42) view
+    combined = wins1 + wins2                           # (NSPM, 42) — one allocation
 
-    combined = ct2[idx1] + ct2[idx2]         # (NSPM, 42) complex
-
-    # Σ conj(combined) * cb  (Fortran dot_product convention)
-    cc   = np.sum(np.conj(combined) * cb[None, :], axis=1)
-    xcc  = np.abs(cc).astype(np.float32)
-    ish_best = int(np.argmax(xcc))
+    xcc      = np.abs(combined @ _SYNC_CB_CONJ).astype(np.float32)
+    ish_best = int(xcc.argmax())
     return xcc, float(xcc[ish_best]), ish_best
 
 
@@ -206,20 +215,33 @@ def _freq_search_avg(
     ish_best   : int               — best timing shift (0-based)
     best_mixed : complex64 (len(cbase_window),) — freq-corrected signal at best ferr
     """
-    nframes = len(navmask)
+    nframes  = len(navmask)
     n_search = nframes * NSPM           # use exactly nframes*NSPM for freq search
     assert len(cbase_window) >= n_search, (
         f"cbase_window length {len(cbase_window)} < nframes*NSPM={n_search}"
     )
 
-    navg = int(np.sum(navmask))
+    navg = sum(navmask)          # Python sum; navmask is a 3-element list
     if navg == 0:
         return None, 0.0, 0.0, None, 0, None
 
-    fac = 1.0 / (48.0 * np.sqrt(float(navg)))      # normalisation (msk144_freq_search ln 18)
+    fac   = 1.0 / (48.0 * np.sqrt(float(navg)))     # normalisation (msk144_freq_search ln 18)
+    n_ifr = int(round(ntol / delf))
 
-    n_ifr   = int(round(ntol / delf))
-    t_full  = np.arange(len(cbase_window), dtype=np.float64) / FS   # continuous time over full window
+    # Continuous-time vector — reuse the pre-computed constant when possible.
+    wlen   = len(cbase_window)
+    t_full = _T_FULL_4NSPM[:wlen] if wlen <= 4 * NSPM else np.arange(wlen, dtype=np.float64) / FS
+
+    # Incremental phasor: start at ifr=-n_ifr, advance by phasor_step each iteration.
+    # This replaces (2*n_ifr+1) np.exp calls with one initial exp + (2*n_ifr) multiplies.
+    #   mixed at ifr  = cbase_window * exp(-j·2π·ifr·delf·t)
+    #   mixed at ifr+1 = mixed at ifr * exp(-j·2π·delf·t)   ← phasor_step
+    phasor_step = np.exp(-1j * 2.0 * np.pi * delf * t_full).astype(np.complex64)
+    mixed = (cbase_window.astype(np.complex64)
+             * np.exp(1j * 2.0 * np.pi * n_ifr * delf * t_full).astype(np.complex64))
+
+    # navmask as float row-vector for a single vector-matrix frame sum.
+    nav_row = np.array(navmask, dtype=np.float32)    # (nframes,)
 
     best_xmax  = -1.0
     best_c     = None
@@ -229,16 +251,12 @@ def _freq_search_avg(
     best_mixed = None
 
     for ifr in range(-n_ifr, n_ifr + 1):
-        ferr  = ifr * delf
+        ferr = ifr * delf
 
-        # Continuous-phase mix across the whole window (preserves inter-frame coherence)
-        mixed = cbase_window * np.exp(-1j * 2 * np.pi * ferr * t_full).astype(np.complex64)
-
-        # Sum selected frames (use first n_search samples for sync)
-        c = np.zeros(NSPM, dtype=np.complex64)
-        for i, m in enumerate(navmask):
-            if m:
-                c += mixed[i * NSPM:(i + 1) * NSPM]
+        # Sum selected frames with a single vector-matrix multiply.
+        # nav_row @ frames = Σ_i navmask[i] * mixed[i*NSPM:(i+1)*NSPM]
+        frames = mixed[:n_search].reshape(nframes, NSPM)   # (nframes, NSPM) view
+        c      = (nav_row @ frames).astype(np.complex64)   # (NSPM,)
 
         # Sync correlation
         xcc, xmax_raw, ish = _sync_correlate(c)
@@ -250,7 +268,11 @@ def _freq_search_avg(
             best_ferr  = ferr
             best_xcc   = xcc.copy()
             best_ish   = ish
-            best_mixed = mixed
+            best_mixed = mixed   # new array created by * below; reference is stable here
+
+        # Advance to next frequency step (creates a new array; old one kept alive if best)
+        if ifr < n_ifr:
+            mixed = mixed * phasor_step
 
     return best_c, best_xmax, best_ferr, best_xcc, best_ish, best_mixed
 
@@ -311,7 +333,7 @@ def _frame_to_wav_and_decode(
         np.zeros(pad_n,  dtype=np.float32),
     ])
 
-    peak = float(np.max(np.abs(audio)))
+    peak = float(np.abs(audio).max())
     if peak > 0:
         audio = audio / peak * 0.9
     else:
@@ -413,7 +435,7 @@ def msk144_spd_decode(
         # (msk144decodeframe) normalises its soft bits internally and is
         # therefore unaffected by this constant factor.
         n = len(complex_baseband)
-        rms = float(np.sqrt(np.mean(np.abs(complex_baseband.astype(np.complex128)) ** 2)))
+        rms = float((np.abs(complex_baseband.astype(np.complex128)) ** 2).mean() ** 0.5)
         if rms < 1e-12:
             return None, None, 0, 0.0, 0.0
         _SQRT2 = np.float32(np.sqrt(2.0))
@@ -431,7 +453,7 @@ def msk144_spd_decode(
         assert audio_real is not None, "Provide either audio_real or complex_baseband"
         assert abs(fs - FS) < 1, f"Expected fs={FS} Hz, got {fs}"
         n = len(audio_real)
-        rms = float(np.sqrt(np.mean(audio_real.astype(np.float64) ** 2)))
+        rms = float((audio_real.astype(np.float64) ** 2).mean() ** 0.5)
         if rms < 1e-12:
             return None, None, 0, fc, 0.0
         audio_norm = (audio_real.astype(np.float64) / rms).astype(np.float32)
@@ -473,16 +495,18 @@ def msk144_spd_decode(
         lo_lo = max(nfft // 2, idx_neg - half_win)
         lo_hi = min(nfft, idx_neg + half_win)
 
-        ah = float(np.max(tonespec[hi_lo:hi_hi])) if hi_hi > hi_lo else 0.0
-        al = float(np.max(tonespec[lo_lo:lo_hi])) if lo_hi > lo_lo else 0.0
+        ah = float(tonespec[hi_lo:hi_hi].max()) if hi_hi > hi_lo else 0.0
+        al = float(tonespec[lo_lo:lo_hi].max()) if lo_hi > lo_lo else 0.0
         detmet[istp] = max(ah, al)
         detfer[istp] = 0.0   # coarse freq error; inner freq search refines below
 
     # Normalise detection metric (median of lower quartile → noise floor = 1.0)
     # mirrors msk144spd.f90 ll 122-124
     q_idx = max(1, nstep // 4)
-    sorted_met = np.sort(detmet[:nstep])
-    xmed = float(sorted_met[q_idx]) if q_idx > 0 else 1.0
+    # ndarray.partition bypasses np.sort's _wrapfunc dispatch; O(n) vs O(n log n)
+    tmp = detmet[:nstep].copy()
+    tmp.partition(q_idx)
+    xmed = float(tmp[q_idx]) if q_idx > 0 else 1.0
     if xmed > 0:
         detmet[:nstep] /= xmed
 

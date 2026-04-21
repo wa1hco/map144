@@ -31,6 +31,7 @@ import pyqtgraph as pg
 
 from .channelizer import N_CHANNELS
 from .processing import DETECT_THRESH_DB
+from .displays import _align_msk144_message
 
 
 # ── colormap (same as main window) ────────────────────────────────────────────
@@ -123,10 +124,13 @@ class AnalysisWindow(QtWidgets.QWidget):
         # rows_vsplit: 3 rows, each is an h-splitter (plot | controls/plot)
         # right_col:   decode list | NB + buttons
         main_h = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self._main_h = main_h
         outer_vbox.addWidget(main_h, stretch=1)
 
         rows_vsplit = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self._rows_vsplit = rows_vsplit
         right_col   = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self._right_col = right_col
         main_h.addWidget(rows_vsplit)
         main_h.addWidget(right_col)
         main_h.setStretchFactor(0, 5)
@@ -381,6 +385,14 @@ class AnalysisWindow(QtWidgets.QWidget):
         self._rerun_btn.clicked.connect(self._load_and_run)
         ctrl_vbox.addWidget(self._rerun_btn)
 
+        self._progress_bar = QtWidgets.QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setTextVisible(True)
+        self._progress_bar.setFormat("Processing… %p%")
+        self._progress_bar.hide()
+        ctrl_vbox.addWidget(self._progress_bar)
+
         self._clear_btn = QtWidgets.QPushButton("Clear Circles")
         self._clear_btn.clicked.connect(self._clear_manual_decodes)
         ctrl_vbox.addWidget(self._clear_btn)
@@ -448,6 +460,8 @@ class AnalysisWindow(QtWidgets.QWidget):
         self._rerun_btn.setEnabled(False)
         self._lbl_pending.setText("Running replay…")
         self._decode_list.clear()
+        self._progress_bar.setValue(0)
+        self._progress_bar.show()
 
         # Stop any previous worker.
         if self._worker is not None:
@@ -463,6 +477,9 @@ class AnalysisWindow(QtWidgets.QWidget):
             self._worker = AnalysisWorker(engine)
             self._worker.finished.connect(self._on_replay_done)
             self._worker.error.connect(self._on_replay_error)
+            self._worker.progress.connect(
+                lambda f: self._progress_bar.setValue(int(f * 100))
+            )
             self._worker.start()
 
             # Update info bar from metadata (available before replay completes).
@@ -478,6 +495,8 @@ class AnalysisWindow(QtWidgets.QWidget):
         self._results  = results
         self._n_pending = results.get('n_launched', 0)
         self._rerun_btn.setEnabled(True)
+        self._progress_bar.setValue(100)
+        self._progress_bar.hide()
 
         markers = results.get('jt9_markers', [])
         n_sup   = sum(1 for m in markers if m.get('outcome') == 'suppressed')
@@ -499,6 +518,7 @@ class AnalysisWindow(QtWidgets.QWidget):
 
     def _on_replay_error(self, msg: str):
         self._rerun_btn.setEnabled(True)
+        self._progress_bar.hide()
         self._lbl_pending.setText(f"Replay error: {msg[:120]}")
         print(f"[analysis] replay error:\n{msg}", flush=True)
 
@@ -559,7 +579,7 @@ class AnalysisWindow(QtWidgets.QWidget):
                     _th = m.get('theta_deg')
                     _th_str = f"{_th:4.0f}°" if _th is not None else "   —"
                     item = QtWidgets.QListWidgetItem(
-                        f"  {t_s:5.1f}   {radio_mhz * 1000:9.3f}   {'?':>6}   {_th_str}  {m['message']}"
+                        f"  {t_s:5.1f}   {radio_mhz * 1000:9.3f}   {'?':>6}   {_th_str}  {_align_msk144_message(m['message'] or '')}"
                     )
                     item.setForeground(QColor('#80ff80'))
                     item.setData(QtCore.Qt.UserRole, result)
@@ -610,11 +630,13 @@ class AnalysisWindow(QtWidgets.QWidget):
                 self._dual_shown = True
                 new_h = max(self.height(), int(self.height() * 1.5), 1100)
                 self.resize(self.width(), new_h)
-                # Give H and V equal space in each inner splitter
-                for spl in (self._row0_specs, self._row1_hms):
-                    total = sum(spl.sizes())
-                    half  = total // 2
-                    spl.setSizes([half, half])
+                # Give H and V equal space in each inner splitter.
+                # Defer until the event loop has processed the resize — calling
+                # setSizes immediately reads pre-resize heights and halves H.
+                def _equalize():
+                    for spl in (self._row0_specs, self._row1_hms):
+                        spl.setSizes([10000, 10000])   # equal large values → 50/50
+                QtCore.QTimer.singleShot(0, _equalize)
         else:
             self._dual_shown = False
             self._spec_plot_v.hide()
@@ -693,11 +715,17 @@ class AnalysisWindow(QtWidgets.QWidget):
             return np.concatenate(xs), np.concatenate(ys)
 
         def _split_pol(mlist):
-            """Split markers to H (θ < 45°) or V (θ ≥ 45°) pane."""
+            """Split markers to H or V pane.
+
+            Primary: theta_deg >= 45° → V (polarization search result).
+            Fallback when theta_deg is None: det_pol == 'v' → V (detecting channel).
+            """
             h, v = [], []
             for m in mlist:
                 th = m.get('theta_deg')
-                if dual and th is not None and th >= 45.0:
+                if dual and th is not None:
+                    (v if th >= 45.0 else h).append(m)
+                elif dual and m.get('det_pol') == 'v':
                     v.append(m)
                 else:
                     h.append(m)
@@ -883,7 +911,7 @@ class AnalysisWindow(QtWidgets.QWidget):
         th_str    = f"{theta_deg:4.0f}°" if theta_deg is not None else "   —"
         item = QtWidgets.QListWidgetItem(
             f"  {t_s:5.1f}   {radio_khz:9.3f}   {snr_str:>6}   {th_str}  "
-            f"{message or f'({outcome})'}"
+            f"{_align_msk144_message(message) if message else f'({outcome})'}"
         )
         item.setForeground(QColor(color))
         item.setData(QtCore.Qt.UserRole, result)
@@ -983,11 +1011,19 @@ class AnalysisWindow(QtWidgets.QWidget):
     # ── Settings persistence ───────────────────────────────────────────────────
 
     def _restore_settings(self):
-        """Restore window geometry and slider values from QSettings."""
+        """Restore window geometry, slider values, and splitter positions from QSettings."""
         s = self._SETTINGS
         geom = s.value('analysis_window_geometry')
         if geom is not None:
             self.restoreGeometry(geom)
+        for attr, key in (
+            ('_main_h',      'analysis_main_h_state'),
+            ('_rows_vsplit', 'analysis_rows_vsplit_state'),
+            ('_right_col',   'analysis_right_col_state'),
+        ):
+            state = s.value(key)
+            if state is not None:
+                getattr(self, attr).restoreState(state)
         try:
             self._vmin_slider.setValue(int(s.value('analysis_vmin', -110)))
             self._vmax_slider.setValue(int(s.value('analysis_vmax', -70)))
@@ -1002,9 +1038,12 @@ class AnalysisWindow(QtWidgets.QWidget):
             pass   # leave defaults if settings are malformed
 
     def _save_settings(self):
-        """Persist window geometry and slider values to QSettings."""
+        """Persist window geometry, slider values, and splitter positions to QSettings."""
         s = self._SETTINGS
         s.setValue('analysis_window_geometry', self.saveGeometry())
+        s.setValue('analysis_main_h_state',      self._main_h.saveState())
+        s.setValue('analysis_rows_vsplit_state',  self._rows_vsplit.saveState())
+        s.setValue('analysis_right_col_state',    self._right_col.saveState())
         s.setValue('analysis_vmin',         self._vmin_slider.value())
         s.setValue('analysis_vmax',         self._vmax_slider.value())
         s.setValue('analysis_det_vmin',     self._det_vmin_slider.value())

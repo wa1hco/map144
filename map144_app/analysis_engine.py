@@ -76,7 +76,8 @@ class AnalysisEngine(Engine):
         self._decode_queue = queue.SimpleQueue()
 
     # ------------------------------------------------------------------
-    def run_replay(self, nb_factor: float = 6.0, nb_enabled: bool = True) -> dict:
+    def run_replay(self, nb_factor: float = 6.0, nb_enabled: bool = True,
+                   progress_cb=None) -> dict:
         """Feed all IQ samples through the DSP pipeline and return display data.
 
         Parameters
@@ -121,6 +122,8 @@ class AnalysisEngine(Engine):
         # at the end to populate spectrogram_data from spec_staging.
         block_size = NB_FFT_SIZE * 8
         pos = 0
+        _progress_stride = block_size * 20   # emit progress every ~20 blocks
+        _next_progress   = _progress_stride
         while pos < n:
             chunk = iq[pos:pos + block_size]
             t = pos / rate
@@ -130,6 +133,9 @@ class AnalysisEngine(Engine):
             ts_frac = int((t - ts_int) * 1_000_000_000_000)   # picoseconds
             self.process_iq_data(chunk, ts_int, ts_frac)
             pos += len(chunk)
+            if progress_cb is not None and pos >= _next_progress:
+                progress_cb(pos / n)
+                _next_progress = pos + _progress_stride
 
         # Return immediately — jt9 threads may still be running.
         # The caller (AnalysisWindow) drains _decode_queue via a QTimer and
@@ -242,6 +248,7 @@ class AnalysisWorker(QtCore.QThread):
 
     finished = QtCore.pyqtSignal(object)   # dict
     error    = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(float)    # 0.0 – 1.0
 
     def __init__(self, engine: AnalysisEngine,
                  nb_factor: float = 6.0, nb_enabled: bool = True,
@@ -256,6 +263,7 @@ class AnalysisWorker(QtCore.QThread):
             results = self._engine.run_replay(
                 nb_factor=self._nb_factor,
                 nb_enabled=self._nb_enabled,
+                progress_cb=lambda f: self.progress.emit(f),
             )
             self.finished.emit(results)
         except Exception as exc:

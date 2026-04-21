@@ -518,20 +518,23 @@ def image_slide(prs, title, label, caption="", notes="", png=None):
 
 def bullets_image_slide(prs, title, items, label, caption="", notes="", png=None,
                         img_right_margin=Inches(0.4), img_align='center',
-                        img_top=None, img_h=None):
+                        img_top=None, img_h=None,
+                        img_left=None, txt_w=None):
     """Left column: bullet text.  Right column: screenshot or placeholder.
 
     img_right_margin: gap between image right edge and slide edge (default 0.4").
     img_align:        'center' | 'right' — horizontal alignment within the box.
     img_top:          override image top position in EMU (default: Inches(1.05)).
     img_h:            override image box height in EMU (default: fills to footer).
+    img_left:         override image column left edge in EMU (default: Inches(6.1)).
+    txt_w:            override text column width in EMU (default: Inches(5.5)).
     Image is inserted before text shapes so text is always on top.
     """
     slide = _blank(prs)
     add_rect(slide, 0, 0, W, Pt(8), ACCENT)
 
     # ── Right: image (added first → behind text) ──────────────────────────
-    _IMG_LEFT  = Inches(6.1)
+    _IMG_LEFT  = img_left if img_left is not None else Inches(6.1)
     _IMG_W     = W - _IMG_LEFT - img_right_margin
     _txt_top   = Inches(1.05)
     _def_img_h = Inches(5.5) if not caption else Inches(5.0)
@@ -550,7 +553,7 @@ def bullets_image_slide(prs, title, items, label, caption="", notes="", png=None
                 Inches(0.4), Inches(0.15), Inches(12.5), Inches(0.75),
                 color=NAVY, size=28, bold=True)
 
-    _LEFT_W = Inches(5.5)
+    _LEFT_W = txt_w if txt_w is not None else Inches(5.5)
     _BODY_H = Inches(5.5) if not caption else Inches(5.0)
     txb = slide.shapes.add_textbox(Inches(0.4), _txt_top, _LEFT_W, _BODY_H)
     tf  = txb.text_frame
@@ -771,15 +774,16 @@ def build():
         (0, "6 · How to operate MAP144"),
         (0, "7 · System architecture (technical deep-dive)"),
         (0, "8 · Building the project with AI assistance"),
-        (0, "9 · Decoder sensitivity investigation"),
-        (0, "10 · MAP144 vs WSJT-X real-world comparison"),
-        (0, "11 · Support and resources"),
+        (0, "9 · Performance engineering — iterative profiling and optimization"),
+        (0, "10 · Decoder sensitivity investigation"),
+        (0, "11 · MAP144 vs WSJT-X real-world comparison"),
+        (0, "12 · Support and resources"),
     ], notes="Overview of the talk. Skip or reorder sections to suit the audience.")
 
     content_slide(prs, "Why MAP144?", [
         (0, "Normal MSK144 activity is concentrated on the calling frequency"),
         (1, "Little interference — few stations active at any one time"),
-        (1, "WSJT-X handles this well — operator watches and responds"),
+        (1, "WSJT-X handles this well"),
         (0, "During contests, increased activity"),
         (1, "Operators spread out from the calling frequency"),
         (1, "Scheduled contacts avoid the calling frequency"),
@@ -913,7 +917,10 @@ def build():
 
     content_slide(prs, "Short Underdense Pings — The Hardest Case", [
         (0, "Gamma-envelope model:  A(t) = (t/τ) · exp(−t/τ)"),
-        (1, "Peak at t = τ, then exponential decay — models trail formation + diffusion"),
+        (1, "Named for the Gamma distribution — the formula is Gamma(2, τ) in shape"),
+        (1, "Rise  (t/τ):       linear — electrons deposited as meteoroid ablates"),
+        (1, "Decay exp(−t/τ):   exponential — ionized trail diffuses radially outward"),
+        (1, "Peak at t = τ, then exponential fall"),
         (1, "Short underdense pings: τ = 30–100 ms"),
         (0, "Implication for detection"),
         (1, "Detection hop = 42.7 ms — the metric window advances once every hop"),
@@ -1012,7 +1019,7 @@ def build():
     content_slide(prs, "What MAP144 Does", [
         (0, "Takes a 48 kHz complex IF signal from a digital receiver"),
         (1, "Receiver tuned to the MSK144 calling frequency, looks +/- 17 kHz"),
-        (1, "Supports FlexRadio, AirSpy, RTL-SDR, USRP, and WAV file replay"),
+        (1, "Supports FlexRadio, USRP B210, AirSpy, RTL-SDR, and WAV file replay"),
         (0, "Finds and decodes all MSK144 signals across ±17 kHz"),
         (1, "Creates 48 channels, on 1 kHz spacing, monitored simultaneously"),
         (1, "No operator intervention required — decodes everything it hears"),
@@ -1078,21 +1085,22 @@ def build():
         (0, "FlexRadio 6000-series"),
         (1, "FlexClient via TCP — reads IQ directly from the panadapter slice"),
         (1, "Tracks pan center frequency automatically"),
+        (0, "USRP B210 (Ettus Research)"),
+        (1, "Via UHD — supports dual-polarization (H and V simultaneously)"),
         (0, "AirSpy R2 / Mini"),
         (1, "Direct sampling via airspy library"),
         (0, "RTL-SDR"),
         (1, "Low-cost USB dongle — 8-bit but functional"),
-        (0, "USRP B210 (Ettus Research)"),
-        (1, "Via UHD — supports dual-polarization (H and V simultaneously)"),
         (0, "WAV file replay"),
         (1, "Offline analysis of recorded IQ — single or dual-polarization"),
     ], notes="Skip USRP if talking to a general ham audience. "
              "Emphasise FlexRadio and RTL-SDR as the most common cases.")
 
     bullets_image_slide(prs, "FlexRadio Status Window", [
+        (0, "Discovers radios running FlexClient on the network"),
+        (1, "Shows radio identity and panadapter/slice table"),
         (0, "Connects via TCP to the FlexRadio DAXIQ stream"),
-        (0, "Shows radio identity and panadapter/slice table"),
-        (0, "DAXIQ stream status: packet rate, queue depth, loss"),
+        (1, "Shows DAXIQ stream status: packet rate, queue depth, loss"),
         (0, "Decodable dial frequency range — which USB freqs are covered"),
         (0, "Tracks panadapter center frequency automatically"),
         (1, "Channelizer NCO updates when pan moves"),
@@ -1102,10 +1110,12 @@ def build():
               "packet rate, queue depth, and loss counter.",
         png="map144_flex_radio.png",
         img_right_margin=0, img_align='right',
-        img_top=int(Pt(8)), img_h=int(_FOOTER_TOP - Pt(8)))
+        img_top=int(Pt(8)), img_h=int(_FOOTER_TOP - Pt(8)),
+        img_left=Inches(9.3), txt_w=Inches(8.9))
 
     bullets_image_slide(prs, "USRP B210 Status Window", [
-        (0, "Ettus Research USRP B210 — USB 3.0 software-defined radio"),
+        (0, "USRP B210 — USB 3.0 software-defined radio"),
+        (1, "Originally Ettus Research, now NI (National Instruments / Emerson)"),
         (0, "Hardware identity and IF stream parameters"),
         (1, "Sample rate, center frequency, active channels"),
         (0, "Two independent RF channels — H and V for dual-polarization"),
@@ -1121,7 +1131,8 @@ def build():
               "Buffer drop counter flags overrun conditions.",
         png="map144_usrp_b210.png",
         img_right_margin=0, img_align='right',
-        img_top=int(Pt(8)), img_h=int(_FOOTER_TOP - Pt(8)))
+        img_top=int(Pt(8)), img_h=int(_FOOTER_TOP - Pt(8)),
+        img_left=Inches(9.0), txt_w=Inches(8.6))
 
     content_slide(prs, "Dual-Polarization Support", [
         (0, "Antenna feeds two orthogonal polarizations: H and V"),
@@ -1249,9 +1260,9 @@ def build():
         (1, "Or build from source: physics.princeton.edu/pulsar/K1JT/wsjtx.html"),
         (0, "Radio-specific drivers:"),
         (1, "FlexRadio: no extra drivers — TCP connection"),
+        (1, "USRP: UHD  (apt install uhd-host)"),
         (1, "AirSpy: libairspy  (apt install airspy)"),
         (1, "RTL-SDR: librtlsdr  (apt install rtl-sdr)"),
-        (1, "USRP: UHD  (apt install uhd-host)"),
     ], mono_items={3, 4},
     notes="jt9 is the critical dependency — everything else can be worked around.")
 
@@ -1328,6 +1339,25 @@ def build():
               "cyan (SPD) is the short-ping path optimized for underdense meteors; "
               "green (jt9) handles overdense and longer bursts.",
         png="map144_detection_heatmap.png")
+
+    content_slide(prs, "SPD — Short Ping Decoder", [
+        (0, "SPD is MAP144's primary decoder, built specifically for meteor scatter"),
+        (0, "Why not just use jt9?"),
+        (1, "jt9 processes a full 15-second frame — it averages over all of it"),
+        (1, "A 100 ms ping is a small fraction of 15 seconds; most of the frame is noise"),
+        (1, "jt9 also requires real audio; half the signal (the Q channel) is discarded"),
+        (0, "SPD's key insight: coherent frame averaging"),
+        (1, "One MSK144 frame = exactly 72 ms at 2000 baud"),
+        (1, "Successive frames from the same ping are naturally phase-coherent"),
+        (1, "Averaging N frames before decoding improves SNR by √N"),
+        (1, "Operates on complex IQ — both I and Q channels, no signal loss"),
+        (0, "SPD runs first on every detection; jt9 is the fallback"),
+        (1, "SPD handles the common short underdense case with better sensitivity"),
+        (1, "jt9 handles longer overdense bursts that span many frames"),
+    ], notes="The coherent averaging gain is real: averaging 3 frames (the typical underdense ping) "
+             "gives √3 ≈ 1.7× SNR improvement = +2.5 dB before any decoding. "
+             "Combined with the complex IQ path (+3 dB over real audio) the SPD sensitivity "
+             "advantage over raw jt9 on a short burst is approximately 5 dB.")
 
     content_slide(prs, "Decode Path: What the Circle Colors Mean", [
         (0, "Every detection triggers a two-stage decode attempt:"),
@@ -1442,21 +1472,51 @@ def build():
              "The original channel-count gate was correct in principle but wrong in threshold — "
              "it did not account for normal multi-station activity.")
 
+    content_slide(prs, "Sliding Window Intervals — Three Layers", [
+        (0, "Three independent sliding windows operate at different rates and purposes"),
+        (0, "Layer 1 — Channelizer tone detector  (processing.py)"),
+        (1, "Window: 512 samples at 12 kHz = 42.7 ms  (one squarer block)"),
+        (1, "Hop:    256 samples = 21.3 ms  (50 % overlap)"),
+        (1, "Purpose: trip wire — detect tone-pair energy above 25th-pct baseline"),
+        (1, "Not aligned to MSK144 frame boundaries; just looking for power"),
+        (0, "Layer 2 — SPD burst search  (msk144_spd.py)"),
+        (1, "Window: 864 samples = 72 ms  (one MSK144 frame at 12 kHz)"),
+        (1, "Hop:    216 samples = 18 ms  (quarter-frame)"),
+        (1, "Purpose: find exact burst start after channelizer fires"),
+        (1, "Quarter-frame step ensures burst onset is captured within ±9 ms"),
+        (0, "Layer 3 — Pre-burst SNR estimator  (detection.py)"),
+        (1, "Window: 1024 samples = 85 ms  (wider for frequency resolution)"),
+        (1, "Hop:    512 samples = 42.7 ms  (50 % overlap)"),
+        (1, "Purpose: noise floor estimate over 500–1500 ms pre-burst segment"),
+    ], notes="The quarter-frame hop in SPD (216 samples) is the smallest — it determines "
+             "how precisely SPD can locate the burst onset. A half-frame hop would allow "
+             "the burst to be offset by up to 36 ms from the nearest window start, "
+             "which can shift the sync correlation enough to miss the sync word. "
+             "The channelizer 50% hop (256 samples) is a standard overlap-add choice — "
+             "finer would cost CPU without improving detection probability since the "
+             "trigger threshold works on energy, not phase alignment.")
+
     content_slide(prs, "Decode Path: SPD First, jt9 Fallback", [
         (0, "After coincidence gate fires, decode attempt starts immediately"),
-        (0, "Step 1 — Prepare complex IQ for SPD"),
-        (1, "Decimate I and Q independently 48→12 kHz (IIR, causal)"),
-        (1, "Mix to 0 Hz baseband: multiply by e^{−j2πf_c t}, f_c = 1500 Hz"),
-        (1, "Apply audio BPF ±1200 Hz (129-tap FIR, filtfilt — zero phase)"),
+        (0, "Step 1 — Capture IQ and estimate SNR (both paths)"),
+        (1, "Read [−500 ms, +1200 ms] window from ring buffer; zero-pad 100 ms each end"),
+        (1, "Mix fc_hz → 1500 Hz audio centre; decimate 48→12 kHz"),
+        (1, "est_snr_db: overlap-averaged PSD over 500 ms pre-burst noise — 9 frames"),
         (0, "Step 2 — Try SPD decoder on complex baseband IQ"),
         (1, "Short-Ping Decoder: optimized for 1–3 frame bursts"),
         (1, "Searches frequency, aligns sync, averages frames, runs BP+LDPC"),
-        (1, "If decoded → log [MSK144 SPD], save WAV, report"),
+        (1, "If decoded → log [MSK144 SPD] with est_snr_db, save WAV, report"),
         (0, "Step 3 — jt9 fallback if SPD returns None"),
-        (1, "Reads 12 kHz real audio from IQ ring buffer"),
-        (1, "Handles longer bursts and overdense trails that SPD misses"),
-        (1, "If decoded → log [MSK144 DECODE], save WAV, report"),
-    ], notes="The BPF is the key insight: it narrows noise bandwidth from 4800 Hz to 2400 Hz. "
+        (1, "Re-read ring buffer: extend pre-burst to 1500 ms — 34 PSD frames"),
+        (1, "Re-mix + re-decimate; recompute est_snr_db from wider noise window"),
+        (1, "Write extended WAV for jt9; handles longer bursts and overdense trails"),
+        (1, "If decoded → log [MSK144 DECODE] with est_snr_db, save WAV, report"),
+    ], notes="SPD path stays lean — 500 ms pre-burst is sufficient because SPD works on "
+             "complex IQ and doesn't need a noise reference for its own decoding. "
+             "jt9 needs a noise baseline for its SNR estimate; re-reading 1500 ms gives "
+             "3× more averaging (34 frames vs 9). The ring buffer always holds this history "
+             "since we already waited for 1200 ms post-detection IQ to arrive. "
+             "The BPF is the key insight: it narrows noise bandwidth from 4800 Hz to 2400 Hz. "
              "In the squared domain, noise×noise cross-terms drop as BW² — a factor of 4. "
              "Result: detection failures drop from 64% to 0%; system is decoder-limited.")
 
@@ -1482,14 +1542,6 @@ def build():
     ], notes="The noise-bandwidth issue is a key engineering insight — "
              "and a good story for the AI development section.")
 
-    image_slide(prs, "Software Module Structure",
-        "pyreverse class/package diagram",
-        caption="Generate with:  pyreverse -o png -p map144 map144_app/",
-        notes="Replace placeholder with the actual pyreverse output. "
-              "Key modules: engine.py (DSP state), processing.py (IQ ingress), "
-              "detection.py (channelizer + decoder), ui.py (Qt layout), "
-              "analysis_window.py (post-capture review).")
-
     # ═══════════════════════════════════════════════════════════════════════════
     # SECTION 7 — BUILDING WITH AI
     # ═══════════════════════════════════════════════════════════════════════════
@@ -1508,7 +1560,7 @@ def build():
         (1, "Catch bugs, explain what the code should do, iterate"),
         (0, "The domain knowledge stayed with the human"),
         (1, "Claude knew Python / Qt / DSP syntax"),
-        (1, "The engineer knew MSK144, meteor scatter, antenna physics"),
+        (1, "The engineer knew project goals, how to test, MSK144, meteor scatter, antenna physics"),
     ], notes="Set the expectation: this is not 'AI wrote the app'. "
              "It's a collaboration where the human provided direction and domain expertise.")
 
@@ -1713,9 +1765,269 @@ def build():
              "the algorithm was correct before optimising it.")
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # SECTION 9 — DECODER SENSITIVITY INVESTIGATION
+    # SECTION 9 — PERFORMANCE ENGINEERING
     # ═══════════════════════════════════════════════════════════════════════════
-    section_slide(prs, 9, "Decoder Sensitivity Investigation",
+    section_slide(prs, 9, "Performance Engineering",
+        subtitle="Iterative profiling and optimization — five rounds",
+        audience="Technical",
+        notes="This section traces the full profiling campaign from first profile to "
+              "the current optimised state. Each round shows what the profiler revealed, "
+              "the technique used to fix it, and how the fix was verified. "
+              "Good standalone talk for a software or SDR audience.")
+
+    content_slide(prs, "What Real-Time Means Here", [
+        (0, "MAP144 must keep up with dual 48 kHz IQ stream — continuously"),
+        (0, "Core work done every 20 ms (one receive block, 960 output samples):"),
+        (1, "Channelizer: 48-channel polyphase FIR bank → (48, 960) complex64"),
+        (1, "Squarer + detection metric: per-channel SNR, threshold, cluster gate"),
+        (1, "Ring buffer write, IQ capture for jt9 launch"),
+        (1, "Display update: waterfall FFT, spectrogram, detection plots"),
+        (0, "When a ping is detected (every few seconds during a shower):"),
+        (1, "IQ extract → decimate → SPD decode attempt"),
+        (1, "jt9 subprocess launched with 12 kHz audio"),
+        (0, "Budget: all of the above on a single laptop CPU, plus headroom for jt9"),
+        (0, "When any stage exceeds its slot, a backlog grows — missed pings, stale display"),
+    ], notes="Set the real-time constraint explicitly before the profiling story. "
+             "The audience needs to understand that 'slow' means lost decodes, not just "
+             "a sluggish UI.")
+
+    content_slide(prs, "The Profiling Tool: py-spy", [
+        (0, "py-spy — statistical sampling profiler for Python"),
+        (1, "Attaches to a running process with no code changes"),
+        (1, "sudo py-spy top --pid $(pgrep -u $USER -f map144.py)"),
+        (1, "Samples the call stack at ~100 Hz — no instrumentation overhead"),
+        (0, "Key columns in the output:"),
+        (1, "Own%    — time spent inside the function body (excludes callees)"),
+        (1, "Total%  — time in this function including all callees"),
+        (1, "OwnTime — absolute seconds in the function body over the profiling window"),
+        (0, "Two headline metrics reveal the bottleneck type:"),
+        (1, "Active%: fraction of time at least one Python frame was on-CPU"),
+        (1, "GIL%:    fraction of time the GIL was held — high means Python bytecode"),
+        (1, "GIL% ≈ Active% → pure Python compute; GIL% ≪ Active% → C extension work"),
+        (0, "Workflow: run under realistic load, sample for 60–120 s, compare across rounds"),
+    ], mono_items={1},
+    notes="The sudo is needed to attach to a process owned by the same user on some "
+          "Linux configurations. The GIL/Active relationship is the key diagnostic: "
+          "if both are high, the fix is JIT or vectorisation. "
+          "If Active is high but GIL is low, the bottleneck is already in C but doing "
+          "too much work — restructure or use a better API.")
+
+    # ── Round 1 table ─────────────────────────────────────────────────────────
+    _r1_slide = _title_content(prs)
+    add_rect(_r1_slide, 0, 0, W, Pt(8), ACCENT)
+    _fit_placeholders(_r1_slide)
+    _set_title_placeholder(_r1_slide, "Round 1 — The BP Decoder (97% of CPU)")
+    _fill_body_placeholder(_r1_slide, [
+        (0, "First profiling run.  One function.  Unmistakable."),
+        (0, "py-spy profile: 137 s wall clock, 50-ping synthetic test file"),
+    ])
+    _add_data_table(_r1_slide,
+        headers=["Function", "Own%", "OwnTime", "What it does"],
+        rows=[
+            ["_bpdecode128_90",  "97%", "133.1 s", "LDPC belief-propagation decoder"],
+            ["_sync_correlate",  " 0%",   "4.0 s", "MSK144 sync correlation"],
+            ["_freq_search_avg", " 1%",   "2.1 s", "Frequency search"],
+            ["Everything else",  " 2%",   "2.8 s", "Channelizer, display, I/O"],
+        ],
+        col_widths_in=[3.6, 1.0, 1.8, 5.3],
+        left=Inches(0.9), top=Inches(2.55), row_h_in=0.46)
+    add_textbox(_r1_slide,
+        "Fix: @numba.njit(cache=True) on the inner BP loop.  "
+        "Result: 137 ms → 0.06 ms per decode — 2300×.  "
+        "GIL% fell from 89% to single digits.  A 165 s backlog cleared to real-time.",
+        Inches(0.4), Inches(5.35), Inches(12.5), Inches(1.0),
+        color=MUTED, size=17, italic=True)
+    add_notes(_r1_slide,
+        "The full story is in Section 8. Summarised here as round 1 of the profiling "
+        "campaign so the table at the end of this section has a complete baseline.")
+
+    content_slide(prs, "Round 2 — NumPy Dispatch Overhead (_wrapfunc)", [
+        (0, "After Numba fix, a new entry appeared: _wrapfunc at 42 s (5% own)"),
+        (0, "Root cause: NumPy function-form calls route through a Python dispatcher"),
+        (1, "np.sort(arr)      → _wrapfunc → arr.__array_function__ → C sort"),
+        (1, "arr.sort()         → direct C method call — no Python dispatch"),
+        (0, "The dispatch layer adds one full Python stack frame per call"),
+        (1, "Called at 50 Hz × many channels — overhead accumulates"),
+        (0, "Affected calls in the hot path:"),
+        (1, "np.sort(...)         → arr.sort()                     (clustering)"),
+        (1, "np.partition(arr, k) → arr.partition(k)               (SNR percentile)"),
+        (1, "np.median(arr)       → arr.partition(k); return arr[k] (noise floor)"),
+        (0, "The np.median fix is the most instructive:"),
+        (1, "np.median → np.quantile → _quantile → partition — four levels deep"),
+        (1, "Replaced with: copy → .partition(k) → index  — direct, in-place, O(n)"),
+        (0, "Rule: prefer method forms (.sort, .partition) over function forms in hot loops"),
+    ], mono_items={1, 2, 7, 8, 9, 11, 12},
+    notes="This is a subtle but measurable effect. The _wrapfunc mechanism exists to "
+          "support array protocol dispatch (dask, cupy, etc.). Fine at the outer edge "
+          "of the program; significant overhead when called thousands of times per second.")
+
+    content_slide(prs, "Round 3 — Channelizer: Heap Allocations and the NCO", [
+        (0, "Profile after Round 2: apply_channelizer 30.6 s, _fir_filt_2d_c64 14.7 s"),
+        (0, "Old channelizer path per 20 ms block:"),
+        (1, "Phase matrix (n_ch × N): n_ch × N complex64 — new heap alloc"),
+        (1, "Mixed signal (n_ch × N): element-wise multiply raw × phase — second alloc"),
+        (1, "FIR filter over (n_ch × N) → decimate → HP filter"),
+        (0, "Two large allocations flushed the L2 cache on every hop — bottleneck was memory"),
+        (0, "Fix: fused NCO+FIR Numba prange kernel"),
+        (1, "One Numba prange loop over n_ch channels (runs parallel across cores)"),
+        (1, "Per thread: local buffer of size ntaps−1+N — NCO mix written inline"),
+        (1, "FIR dot product accumulated from local buffer — never writes a (n_ch, N) array"),
+        (1, "Phase returned as a scalar per channel — no np.angle / np.exp upcast"),
+        (0, "Single-pol:  0.591 ms → 0.405 ms  (−31%)"),
+        (0, "Dual-pol:    0.835 ms → 0.672 ms  (−19%)"),
+    ], mono_items={1, 2, 7, 8, 9, 10},
+    notes="The insight is that the bottleneck was not arithmetic — it was the memory "
+          "allocator and cache pressure from two large intermediate arrays. "
+          "The fused kernel eliminates both by staging in a thread-local buffer "
+          "that fits in L1 cache.")
+
+    code_slide(prs,
+        "Fused NCO+FIR Kernel — Core Loop",
+        """\
+@numba.njit(parallel=True, cache=True)
+def _nb_mix_fir_sp(b_rev, raw, mix_phase, mix_step, zi, y, new_zi, new_mix_phase):
+    ntaps = b_rev.shape[0]; N = raw.shape[0]; n_ch = mix_phase.shape[0]
+    for k in numba.prange(n_ch):          # parallel over channels
+        ph = mix_phase[k]; st = mix_step[k]
+        buf = np.empty(ntaps - 1 + N, dtype=np.complex64)  # thread-local
+        for j in range(ntaps - 1):        # copy filter state into local buf
+            buf[j] = zi[k, j]
+        for n in range(N):                # NCO mix: multiply inline → buf
+            buf[ntaps - 1 + n] = raw[n] * ph
+            ph *= st
+        for n in range(N):                # FIR: dot product over pre-rev taps
+            acc = np.complex64(0.0)
+            for j in range(ntaps):
+                acc += b_rev[j] * buf[n + j]
+            y[k, n] = acc
+        for j in range(ntaps - 1):        # save filter state for next block
+            new_zi[k, j] = buf[N + j]
+        new_mix_phase[k] = ph             # return phase — no np.exp upcast""",
+        caption=(
+            "b_rev: pre-reversed taps stored in ChannelizerState (no copy per call).  "
+            "Thread-local buf fits in L1 cache.  "
+            "NCO advance: ph *= st  (complex multiply) — no angle/exp."
+        ),
+        notes="The key insight: by fusing the NCO mix into the same pass as the FIR "
+              "filter state load, we never materialise the (n_ch, N) phase matrix or "
+              "the (n_ch, N) mixed-signal array. Both were flushing the L2 cache on "
+              "every 20 ms hop. The thread-local buf is small enough to stay in L1.")
+
+    content_slide(prs, "Round 4 — Display Windows Dominate CPU When Visible", [
+        (0, "Observation: closing the Fast Graph, Detection, and IQ windows changed the profile"),
+        (1, "Active% fell from 64% to 19% — two-thirds of CPU was pure display work"),
+        (0, "Root cause: display updates ran unconditionally, every 20 ms block"),
+        (1, "Waterfall FFT: np.fft.fft over fft_size samples, fftshift, log10 — every hop"),
+        (1, "Spectrogram setImage: pyqtgraph buffer copy + render — every hop"),
+        (1, "pyqtgraph's _rescaleData appeared in every profile — pure display overhead"),
+        (0, "Fix: visibility gate — check window.isVisible() once per block"),
+        (1, "Skip waterfall FFT and spectrogram writes when window is hidden"),
+        (1, "Buffer slide (timing state) always runs — just the compute is gated"),
+        (0, "Effect when all display windows open: Active ~60%, GIL ~15%"),
+        (0, "Effect when all display windows closed: Active ~19%, GIL ~7%"),
+        (0, "Lesson: display rendering is not free — gate it when nothing is watching"),
+    ], mono_items={1, 2, 3},
+    notes="This is an architectural point, not a numerical optimization. "
+          "The fix is a single isVisible() check — one line of code — but the result "
+          "is a 3× reduction in CPU when windows are closed. "
+          "Useful for headless or overnight operation where no one is watching the display.")
+
+    content_slide(prs, "Round 5 — The Hidden lfilter Slow Path (USRP Decimator)", [
+        (0, "Profile showed: _apply (usrp_source.py) 8.98 s, apply_along_axis 6.85 s"),
+        (0, "The USRP decimator: 4× FIR anti-alias before 48 kHz output"),
+        (1, "192 kHz → 48 kHz, 65-tap FIR, 3840 samples per block"),
+        (0, "Code used:  scipy.signal.lfilter(b, 1.0, x)"),
+        (1, "a = 1.0 signals a pure FIR (no IIR denominator)"),
+        (1, "In recent scipy, lfilter with a=[1] falls back to:"),
+        (1, "   apply_along_axis(lambda y: np.convolve(b, y), axis, x)"),
+        (1, "A Python-level loop — the 'mystery convolve' visible in every earlier profile"),
+        (0, "Fix: scipy.signal.upfirdn  — dedicated FIR + decimation Cython path"),
+        (1, "Processes real and imaginary parts separately as float32"),
+        (1, "Streaming state: prepend 64-sample history, slice to skip warmup + tail"),
+        (1, "Verified against lfilter ground truth: 9×10⁻⁷ relative error (float32 limit)"),
+        (0, "Result: 0.215 ms → 0.123 ms per block  (−43%)"),
+    ], mono_items={1, 3, 4, 5, 6, 8, 9, 10},
+    notes="The lfilter fallback is a scipy implementation detail that changed in a "
+          "relatively recent version. The behaviour is correct — it produces the right "
+          "output — but it dispatches through Python for every column of the array. "
+          "upfirdn is the canonical scipy function for FIR+decimation and avoids this.")
+
+    # ── Cumulative improvement scorecard ─────────────────────────────────────
+    _score_slide = _title_content(prs)
+    add_rect(_score_slide, 0, 0, W, Pt(8), ACCENT)
+    _fit_placeholders(_score_slide)
+    _set_title_placeholder(_score_slide, "Five Rounds — Cumulative Scorecard")
+    _fill_body_placeholder(_score_slide, [
+        (0, "Each round: profile → identify → change → verify → repeat"),
+    ])
+    _add_data_table(_score_slide,
+        headers=["Round", "Component", "Before", "After", "Improvement", "Technique"],
+        rows=[
+            ["1", "BP decoder",           "137 ms/decode",   "0.06 ms",  "2300×",   "Numba @njit"],
+            ["2", "NumPy dispatch",        "42 s profiler",   "~0 s",     "eliminated", "Method forms"],
+            ["3", "Channelizer (1-pol)",   "0.591 ms/block",  "0.405 ms", "−31%",    "Numba prange\nfused kernel"],
+            ["3", "Channelizer (2-pol)",   "0.835 ms/block",  "0.672 ms", "−19%",    "Numba prange\nfused kernel"],
+            ["4", "Display rendering",     "Active 64%",      "Active 19%","−70%",   "Visibility\ngating"],
+            ["5", "USRP decimator",        "0.215 ms/block",  "0.123 ms", "−43%",    "scipy upfirdn"],
+        ],
+        col_widths_in=[0.8, 2.5, 2.2, 1.8, 1.7, 2.3],
+        left=Inches(0.5), top=Inches(2.4), row_h_in=0.52)
+    add_textbox(_score_slide,
+        "Starting point: 165 s backlog on a 15 s file.  "
+        "End state: real-time at ≈19% Active CPU (windows closed), "
+        "≈60% Active (all displays open) — full headroom for jt9 and dual-pol.",
+        Inches(0.4), Inches(6.05), Inches(12.5), Inches(0.9),
+        color=MUTED, size=17, italic=True)
+    add_notes(_score_slide,
+        "The improvements compound: fixing round 1 exposed round 2 and 3; "
+        "fixing round 3 exposed round 4 and 5. Without profiling, most of these "
+        "would have been invisible — especially the lfilter slow path and the "
+        "display rendering cost.")
+
+    content_slide(prs, "Techniques Summary — Right Tool for Each Problem", [
+        (0, "Numba @njit  —  pure Python numeric loops that can't be vectorised"),
+        (1, "BP decoder inner loops: graph structure defeats array operations"),
+        (1, "Add one decorator; identical source; ~C speed from LLVM machine code"),
+        (0, "Numba @njit prange  —  parallel work with per-thread local state"),
+        (1, "Channelizer: 48 independent channels, each needs its own NCO phase"),
+        (1, "Thread-local buffer avoids cache conflicts; eliminates (n_ch, N) heap allocs"),
+        (0, "NumPy method forms  —  avoid the array-protocol dispatch layer"),
+        (1, ".sort(), .partition(k)  instead of np.sort(), np.partition()"),
+        (1, "Matters at > 100 calls/second; invisible in occasional use"),
+        (0, "scipy upfirdn  —  dedicated Cython path for FIR + decimation"),
+        (1, "Faster than lfilter for FIR (no IIR denominator, no Python dispatch)"),
+        (1, "Streaming state via prepend-and-slice — no stateful API required"),
+        (0, "Architecture  —  visibility gating"),
+        (1, "Don't compute what nobody sees — check isVisible() once per block"),
+        (1, "Two-thirds of CPU saved when display windows are hidden"),
+    ], mono_items={1, 3, 5, 7, 9, 11, 13},
+    notes="The common thread: always profile first, then match the technique to the "
+          "root cause. Using Numba for everything would not have fixed the display "
+          "rendering or the dispatch overhead.")
+
+    content_slide(prs, "Lessons from Five Rounds of Profiling", [
+        (0, "Profile before optimising — the bottleneck is almost never where you expect"),
+        (1, "Round 1 looked like a display problem; it was the decoder"),
+        (1, "Round 5 looked like an FFT problem; it was a scipy API regression"),
+        (0, "Read GIL% and Active% together"),
+        (1, "Both high → Python bytecode compute → Numba or vectorise"),
+        (1, "Active high, GIL low → already in C → restructure, better API, less allocation"),
+        (0, "One fix unmasks the next — profiling is iterative by nature"),
+        (0, "Verify every change numerically, not just by feel"),
+        (1, "Compare output to a known-good reference: lfilter, Fortran BP, synthetic signals"),
+        (1, "A faster but wrong result is worse than a slow correct one"),
+        (0, "Gates and guards are free — computing invisible things is not"),
+        (0, "The profiler is the most important tool in the SDR performance toolkit"),
+        (1, "py-spy attaches with no code changes — use it early and often"),
+    ], notes="Wrap the section with actionable takeaways. "
+             "The audience should leave knowing: profile first, fix the measured "
+             "bottleneck, verify, repeat. The specific techniques (Numba, upfirdn, "
+             "method forms) are secondary to the discipline.")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SECTION 10 — DECODER SENSITIVITY INVESTIGATION
+    # ═══════════════════════════════════════════════════════════════════════════
+    section_slide(prs, 10, "Decoder Sensitivity Investigation",
         subtitle="A systematic hunt for 5 missing decibels",
         audience="Technical",
         notes="This section describes a days-long, multi-tool investigation carried out "
@@ -1851,13 +2163,13 @@ def build():
 
     # Gap 3 ── SPD pipeline overhead
     content_slide(prs, "Gap 3: Oracle Testing — Isolating Pipeline Stages", [
+        (0, "Oracle methodology: bypass each stage in turn and re-measure"),
+        (1, "oracle_sync: skip detection, feed the correct frame position directly"),
+        (1, "oracle_decode: skip detection + sync, feed the correct aligned frame"),
         (0, "The SPD pipeline has three stages that could cause missed decodes:"),
         (1, "Detection — squared-spectrum sliding window; candidate selection"),
         (1, "Sync — correlate against known sync word pattern; threshold 1.3"),
         (1, "Decoder — BP + LDPC on the averaged frame"),
-        (0, "Oracle methodology: bypass each stage in turn and re-measure"),
-        (1, "oracle_sync: skip detection, feed the correct frame position directly"),
-        (1, "oracle_decode: skip detection + sync, feed the correct aligned frame"),
         (0, "Three failure categories per trial:"),
         (1, "det_miss: detection never found the correct window"),
         (1, "sync_miss: detection found window, sync gate rejected it"),
@@ -2008,9 +2320,9 @@ def build():
              "The combination of human domain knowledge and AI execution speed is the leverage.")
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # SECTION 10 — MAP144 vs WSJT-X REAL-WORLD COMPARISON
+    # SECTION 11 — MAP144 vs WSJT-X REAL-WORLD COMPARISON
     # ═══════════════════════════════════════════════════════════════════════════
-    section_slide(prs, 10, "MAP144 vs WSJT-X",
+    section_slide(prs, 11, "MAP144 vs WSJT-X",
         subtitle="Real-world overnight comparison",
         audience="Technical / operators",
         notes="Run MAP144 and WSJT-X simultaneously overnight on the same band. "
@@ -2020,7 +2332,7 @@ def build():
     content_slide(prs, "The Comparison Method", [
         (0, "MAP144 and WSJT-X run simultaneously on the same radio"),
         (1, "MAP144: FlexRadio DAX IQ — direct complex IQ at 48 kHz"),
-        (1, "WSJT-X: FlexRadio DAX audio — standard SSB audio at 48 kHz"),
+        (1, "WSJT-X: FlexRadio DAX audio — standard SSB audio as digital sound in the PC"),
         (1, "Independent paths — no shared samples, no interference"),
         (0, "MAP144 logs every decode to MSK144/detections/decodes.jsonl"),
         (1, "One JSON line per decode: message, SNR, frequency, timestamp, decoder used"),
@@ -2028,26 +2340,33 @@ def build():
         (1, "Standard WSJT-X format: date/time, freq, SNR, dt, audio-Hz, message"),
         (0, "compare_decoders.py reads both logs, matches on message + time (±1 s)"),
         (1, "Three categories: Both decoded  |  WSJT-X only  |  MAP144 only"),
+        (0, "Deal with different multiple decodes per 15 second period"),
     ], notes="The independent radio paths are important — if they shared audio, "
              "any correlated noise would make the comparison misleading.")
 
     content_slide(prs, "compare_decoders.py — Output", [
         (0, "Per-ping classification table"),
         (1, "Both decoded / WSJT-X only / MAP144 only — with timestamp and frequency"),
+        (1, "WSJT-X-only misses tagged: NOT_DETECTED / NO_DECODE / PERIOD_SLIP"),
         (0, "Coverage statistics"),
         (1, "WSJT-X coverage % and MAP144 coverage % of all unique pings observed"),
         (0, "SNR comparison on matched pairs"),
-        (1, "WSJT-X uses coherent matched filter; MAP144 uses non-coherent energy"),
-        (1, "Expected bias: WSJT-X SNR ~3–4 dB higher for the same ping"),
-        (0, "SNR histograms for each decoder"),
-        (0, "Unique callsigns heard by each, and by both"),
+        (1, "MAP144 SNR field: est_snr_db (1500 ms pre-burst PSD, preferred)"),
+        (1, "  jt9_snr_db on a short clip is unreliable — clusters at 0 dB"),
+        (1, "Measured bias: WSJT-X SNR ≈ +1.7 dB over MAP144 est_snr_db"),
+        (1, "  WSJT-X: coherent matched filter over full 15 s frame"),
+        (1, "  MAP144: non-coherent peak-power vs pre-burst noise floor"),
         (0, "Optional plots: detection-rate curve and SNR scatter"),
         (1, "Detection-rate: MAP144 decode% vs WSJT-X SNR bin"),
-        (1, "Scatter: (WSJT-X SNR, MAP144 SNR) for matched pairs + rail marks for misses"),
+        (1, "Scatter: (WSJT-X SNR, MAP144 est_snr) for matched pairs + stacked miss rail"),
     ], mono_items={},
-    notes="The detection-rate curve is the most useful single plot: "
-          "it shows MAP144 sensitivity relative to WSJT-X as a function of SNR. "
-          "A 50% rate at −1 dB means MAP144 is competitive with WSJT-X for those pings.")
+    notes="The +1.7 dB bias (measured April 2026 overnight run) replaces the earlier "
+          "~3–4 dB estimate that was inflated by jt9 short-clip SNR artifacts — "
+          "jt9 has no noise baseline on a burst WAV and reported 0 dB for ~49% of decodes. "
+          "est_snr_db uses the 1500 ms pre-burst window (jt9 fallback path) or "
+          "500 ms (SPD path) and is the reliable SNR source. "
+          "The detection-rate curve is the most useful single plot: "
+          "it shows MAP144 sensitivity relative to WSJT-X as a function of SNR.")
 
     content_slide(prs, "Running the Morning Report", [
         (0, "After an overnight session:"),
@@ -2068,9 +2387,9 @@ def build():
           "If no_decode >> decoded, the threshold may be too low.")
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # SECTION 11 — SUPPORT
+    # SECTION 12 — SUPPORT
     # ═══════════════════════════════════════════════════════════════════════════
-    section_slide(prs, 11, "Support and Resources",
+    section_slide(prs, 12, "Support and Resources",
         audience="Everyone",
         notes="Close on a light note.")
 
@@ -2094,11 +2413,13 @@ def build():
 
     content_slide(prs, "Getting Help", [
         (0, "For installation and operation questions:"),
-        (1, "Open a GitHub issue — include your OS, radio type, error message"),
+        (1, "This is 2026, just ask AI and/or feed it error messages"),
+        (1, "AI knows this stuff _way_ better than I"),
         (0, "For code questions:"),
-        (1, "Ask Claude (claude.ai) — paste the relevant code and describe the problem"),
-        (1, "It wrote most of it and can explain any of it"),
+        (1, "Ask Claude (claude.ai) — point to or paste the relevant code and ask for explanation"),
+        (1, "Claude wrote it and can explain any of it"),
         (0, "For MSK144 / meteor scatter questions:"),
+        (1, "Claude knows all the published literature"),
         (1, "WSJT-X community: wsjt.sourceforge.io"),
         (1, "ON4KST chat during meteor showers"),
         (1, "Your local VHF/UHF club"),
