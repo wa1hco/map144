@@ -74,24 +74,37 @@ class Engine:
         self._sbuf_v_end = 0
 
         # Noise blanker state — H channel
-        self._nb_env      = None   # running mean magnitude (display)
-        self._nb_floor    = None   # noise floor derived from per-bin averages (display)
+        self._nb_env           = None   # running mean magnitude (signal+noise, display)
+        self._nb_floor         = None   # noise floor from per-bin mean (display)
+        self._nb_wideband_floor = None  # noise floor from median across bins (robust estimator)
+        self._nb_lowlevel_frac  = 0.75  # fraction of bins below threshold (estimate quality)
         self._nb_spec_avg = None   # per-bin running average power, shape (NB_FFT_SIZE,)
         self._nb_last_P   = None   # per-bin power of the most recent block (display)
         self._nb_last_hot = 0      # hot-bin count of the most recent block (display)
         self._nb_blanked_count = 0
         self._nb_total_count = 0
+        # Running median of per-block RMS amplitudes — updated unconditionally from every
+        # block (impulse or noise) so it converges to the true noise RMS regardless of how
+        # many impulse blocks are present.  Used as the broadband-gate reference and TD
+        # amplitude threshold; immune to the per-bin average inflation problem.
+        self._nb_blkrms_median = None
 
         # Noise blanker state — V channel (dual-pol display only; blanking uses H mask)
         self._nb_spec_avg_v = None
         self._nb_last_P_v   = None
 
         # Time-domain magnitude display buffer (200 ms circular) — H and V
+        # _td_mag_buf*     : post-blanker (cleaned signal, for waveform display)
+        # _td_mag_buf_raw* : pre-blanker  (raw ADC amplitude, for peak/headroom display)
         _td_n = int(0.200 * self.sample_rate)
-        self._td_mag_buf   = np.zeros(_td_n, dtype=np.float32)
-        self._td_mag_pos   = 0
-        self._td_mag_buf_v = np.zeros(_td_n, dtype=np.float32)
-        self._td_mag_pos_v = 0
+        self._td_mag_buf     = np.zeros(_td_n, dtype=np.float32)
+        self._td_mag_pos     = 0
+        self._td_mag_buf_raw = np.zeros(_td_n, dtype=np.float32)
+        self._td_mag_pos_raw = 0
+        self._td_mag_buf_v   = np.zeros(_td_n, dtype=np.float32)
+        self._td_mag_pos_v   = 0
+        self._td_mag_buf_raw_v = np.zeros(_td_n, dtype=np.float32)
+        self._td_mag_pos_raw_v = 0
 
         current_time = datetime.datetime.now().timestamp()
         self.time_in_window = current_time % self.history_secs

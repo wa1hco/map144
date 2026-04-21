@@ -100,21 +100,148 @@ def _set_queue_label(parent, attr, q):
     lbl.setStyleSheet(f"QLabel {{ color: {color}; font-family: monospace; }}")
 
 
+def _compute_peak_db(self, buf_attr):
+    """Return peak amplitude as a float dBFS value, or None if buffer is empty."""
+    buf = getattr(self, buf_attr, None)
+    if buf is None or len(buf) == 0:
+        return None
+    peak = float(np.max(buf))
+    return 20.0 * np.log10(peak) if peak > 1e-10 else None
+
+
+def _noise_floor_db(self):
+    """Return noise floor as a float dBFS value from the wideband or per-bin estimator."""
+    from .processing import NB_FFT_SIZE
+    wb = getattr(self, '_nb_wideband_floor', None)
+    if wb is not None and float(wb) > 1e-30:
+        rms = float(wb / NB_FFT_SIZE) ** 0.5
+        return 20.0 * np.log10(rms)
+    nb = getattr(self, '_nb_floor', None)
+    if nb is not None and float(nb) > 1e-10:
+        return 20.0 * np.log10(float(nb))
+    return None
+
+
+class _BlankerBar(QtWidgets.QWidget):
+    """Horizontal stacked bar showing noise floor / peak-clean / peak-raw levels.
+
+    Left edge = -110 dBFS, right edge = 0 dBFS (ADC clip).
+
+    Segments:
+      dark grey  — below noise floor (the noise baseline)
+      blue       — noise floor → peak clean (signal passing through blanker)
+      red        — peak clean → peak raw (impulse content the blanker is catching)
+      light grey — peak raw → 0 dBFS (available ADC headroom)
+    """
+    _DB_MIN = -110.0
+    _DB_MAX =    0.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._noise   = None
+        self._p_clean = None
+        self._p_raw   = None
+        self.setMinimumHeight(20)
+        self.setMaximumHeight(28)
+        self.setMinimumWidth(80)
+        self.setToolTip(
+            "Left = −110 dBFS  |  Right = 0 dBFS (clip)\n"
+            "Dark grey: below noise floor\n"
+            "Blue: clean peak above noise\n"
+            "Red: impulse content caught by blanker\n"
+            "Light grey: ADC headroom"
+        )
+
+    def update_values(self, noise_db, peak_clean_db, peak_raw_db):
+        self._noise   = noise_db
+        self._p_clean = peak_clean_db
+        self._p_raw   = peak_raw_db
+        self.update()
+
+    def _x(self, db):
+        t = max(0.0, min(1.0, (db - self._DB_MIN) / (self._DB_MAX - self._DB_MIN)))
+        return int(t * self.width())
+
+    def paintEvent(self, event):
+        from PyQt5.QtGui import QPainter, QColor, QPen
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+
+        # Background: ADC headroom (light grey)
+        p.fillRect(0, 0, w, h, QColor("#e0e0e0"))
+
+        if all(v is not None for v in (self._noise, self._p_clean, self._p_raw)):
+            x_noise = self._x(self._noise)
+            x_clean = self._x(self._p_clean)
+            x_raw   = self._x(self._p_raw)
+
+            # Below noise floor
+            p.fillRect(0, 0, x_noise, h, QColor("#9e9e9e"))
+            # Clean peak above noise floor
+            if x_clean > x_noise:
+                p.fillRect(x_noise, 0, x_clean - x_noise, h, QColor("#1565c0"))
+            # Impulse content caught by blanker
+            if x_raw > x_clean:
+                p.fillRect(x_clean, 0, x_raw - x_clean, h, QColor("#c62828"))
+
+        # Tick marks every 10 dB
+        p.setPen(QPen(QColor("#ffffff"), 1))
+        for db in range(-100, 0, 10):
+            x = self._x(float(db))
+            p.drawLine(x, 0, x, h)
+
+        # Clip marker at 0 dBFS
+        p.fillRect(w - 3, 0, 3, h, QColor("#b71c1c"))
+        p.end()
+
+
+def _compute_peak_dbfs(self, buf_attr='_td_mag_buf'):
+    """Return (peak_dbfs_str, color) from an IQ magnitude buffer.
+
+    Color reflects headroom: green > 10 dB below clip, orange 3–10 dB, red < 3 dB.
+    """
+    buf = getattr(self, buf_attr, None)
+    if buf is None or len(buf) == 0:
+        return "—", "#555555"
+    peak = float(np.max(buf))
+    if peak < 1e-10:
+        return "—", "#555555"
+    peak_db = 20.0 * np.log10(peak)
+    s = f"{peak_db:.1f} dBFS"
+    if peak_db >= -3.0:
+        color = "#b71c1c"   # red — near clip
+    elif peak_db >= -10.0:
+        color = "#8a3a00"   # orange — getting close
+    else:
+        color = "#1a6b1a"   # green — healthy headroom
+    return s, color
+
+
 def _compute_dbfs(self):
-    """Return (signal_dbfs, noise_dbfs) strings from the IQ magnitude buffer."""
+    """Return (signal_dbfs, noise_dbfs) strings from the IQ magnitude buffer.
+
+    noise_dbfs uses the wideband median noise floor estimator when available,
+    falling back to the per-bin-mean _nb_floor.  The median estimator is robust
+    to narrowband spurs; the fallback is not, but is always available.
+    """
+    from .processing import NB_FFT_SIZE
     buf = getattr(self, '_td_mag_buf', None)
     if buf is None or len(buf) == 0:
         return "—", "—"
     rms = float(np.sqrt(np.mean(buf.astype(np.float64) ** 2)))
-    if rms < 1e-10:   # buffer is zeros — no data yet
-        sig_str = "—"
+    sig_str = "—" if rms < 1e-10 else f"{20.0 * np.log10(rms):.1f} dBFS"
+
+    wb_floor = getattr(self, '_nb_wideband_floor', None)
+    if wb_floor is not None and float(wb_floor) > 1e-30:
+        # Convert median bin power to RMS amplitude: rms = sqrt(median_P / N)
+        rms_floor = float(wb_floor / NB_FFT_SIZE) ** 0.5
+        noise_str = f"{20.0 * np.log10(rms_floor):.1f} dBFS"
     else:
-        sig_str = f"{20.0 * np.log10(rms):.1f} dBFS"
-    nb_env = getattr(self, '_nb_env', None)
-    if nb_env is not None and float(nb_env) > 1e-10:
-        noise_str = f"{20.0 * np.log10(float(nb_env)):.1f} dBFS"
-    else:
-        noise_str = "—"
+        nb_floor = getattr(self, '_nb_floor', None)
+        if nb_floor is not None and float(nb_floor) > 1e-10:
+            noise_str = f"{20.0 * np.log10(float(nb_floor)):.1f} dBFS"
+        else:
+            noise_str = "—"
     return sig_str, noise_str
 
 
@@ -125,8 +252,16 @@ def setup_iq_nb_window(self, view_action):
     from .ui import _PanelWindow
     from .visualizer import _SETTINGS
 
+    _FONT   = "monospace"
+    _GRP_SS = (
+        f"QGroupBox {{ font-family: {_FONT}; }}"
+        f"QGroupBox::title {{ font-family: {_FONT}; }}"
+        f"QLabel {{ font-family: {_FONT}; }}"
+    )
+
     win = _PanelWindow("map144 — IQ / Noise Blanker", view_action, self, 'iq_nb_geometry')
     win.setMinimumSize(350, 370)
+    win.setStyleSheet(f"QLabel {{ font-family: {_FONT}; }}")
     layout = QtWidgets.QVBoxLayout(win)
     layout.setContentsMargins(8, 8, 8, 8)
     layout.setSpacing(6)
@@ -139,9 +274,11 @@ def setup_iq_nb_window(self, view_action):
 
     def _make_td_plot(label):
         p = pg.PlotWidget()
-        p.setLabel('left', label)
-        p.setBackground('#111111')
+        p.setLabel('left', label, color='k')
+        p.setBackground('w')
         p.getAxis('left').setWidth(55)
+        p.getAxis('left').setTextPen('k')
+        p.getAxis('left').setPen('k')
         p.setMinimumHeight(100)
         p.setMaximumHeight(150)
         p.getViewBox().disableAutoRange()
@@ -151,12 +288,14 @@ def setup_iq_nb_window(self, view_action):
     def _make_td_ruler(span_ms):
         """Collapsed-viewbox time ruler widget shared by H and V td plots."""
         r = pg.PlotWidget()
-        r.setBackground('#111111')
+        r.setBackground('w')
         r.getAxis('left').setWidth(55)   # match data plot left-axis width
         r.getAxis('left').hide()
         r.getAxis('right').hide()
         r.getAxis('top').hide()
-        r.setLabel('bottom', '')
+        r.setLabel('bottom', '', color='k')
+        r.getAxis('bottom').setTextPen('k')
+        r.getAxis('bottom').setPen('k')
         r.getAxis('bottom').show()
         r.setXRange(0.0, span_ms, padding=0)
         r.getViewBox().disableAutoRange()
@@ -172,13 +311,13 @@ def setup_iq_nb_window(self, view_action):
     self.td_curve = pg.PlotCurveItem(
         np.linspace(0.0, 200.0, _td_n, endpoint=False),
         np.zeros(_td_n, dtype=np.float32),
-        pen=pg.mkPen('#4fc3f7', width=1),
+        pen=pg.mkPen('#1565c0', width=1),
     )
     self.td_plot.addItem(self.td_curve)
     self.td_plot.setXRange(0.0, 200.0, padding=0)
     self.td_thresh_line = pg.InfiniteLine(
         pos=0.0, angle=0,
-        pen=pg.mkPen('#ff7043', width=1, style=QtCore.Qt.DashLine),
+        pen=pg.mkPen('#c62828', width=1, style=QtCore.Qt.DashLine),
     )
     self.td_plot.addItem(self.td_thresh_line)
 
@@ -186,13 +325,13 @@ def setup_iq_nb_window(self, view_action):
     self.td_curve_v = pg.PlotCurveItem(
         np.linspace(0.0, 200.0, _td_n, endpoint=False),
         np.zeros(_td_n, dtype=np.float32),
-        pen=pg.mkPen('#ce93d8', width=1),
+        pen=pg.mkPen('#6a1b9a', width=1),
     )
     self.td_plot_v.addItem(self.td_curve_v)
     self.td_plot_v.setXRange(0.0, 200.0, padding=0)
     self.td_thresh_line_v = pg.InfiniteLine(
         pos=0.0, angle=0,
-        pen=pg.mkPen('#ff7043', width=1, style=QtCore.Qt.DashLine),
+        pen=pg.mkPen('#c62828', width=1, style=QtCore.Qt.DashLine),
     )
     self.td_plot_v.addItem(self.td_thresh_line_v)
     self.td_plot_v.hide()
@@ -233,7 +372,7 @@ def setup_iq_nb_window(self, view_action):
     td_span_row.addWidget(QtWidgets.QLabel("Span (ms):"))
     self.td_span_val_label = QtWidgets.QLabel(f"{int(self.td_span_ms)} ms")
     self.td_span_val_label.setStyleSheet(
-        "QLabel { color: #c8e6c9; font-family: monospace; min-width: 52px; }"
+        "QLabel { color: #1a6b1a; font-family: monospace; min-width: 52px; }"
     )
     td_span_row.addWidget(self.td_span_val_label)
     self.td_span_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
@@ -254,9 +393,11 @@ def setup_iq_nb_window(self, view_action):
 
     def _make_nb_plot(show_title):
         p = pg.PlotWidget()
-        p.setBackground('#111111')
-        p.setLabel('left', '')
+        p.setBackground('w')
+        p.setLabel('left', '', color='k')
         p.getAxis('left').setWidth(45)
+        p.getAxis('left').setTextPen('k')
+        p.getAxis('left').setPen('k')
         p.setMinimumHeight(100)
         p.setMaximumHeight(140)
         p.setXRange(_nb_freqs[0], _nb_freqs[-1], padding=0)
@@ -264,18 +405,20 @@ def setup_iq_nb_window(self, view_action):
         p.getViewBox().disableAutoRange()
         p.getAxis('bottom').hide()
         if show_title:
-            p.setTitle('Blanker Spectrum — floor / block')
+            p.setTitle('Blanker Spectrum — floor / block', color='k')
         return p
 
     def _make_nb_ruler():
         """Collapsed-viewbox frequency ruler shared by H and V nb spectrum plots."""
         r = pg.PlotWidget()
-        r.setBackground('#111111')
+        r.setBackground('w')
         r.getAxis('left').setWidth(45)   # match data plot left-axis width
         r.getAxis('left').hide()
         r.getAxis('right').hide()
         r.getAxis('top').hide()
-        r.setLabel('bottom', 'Frequency', units='kHz')
+        r.setLabel('bottom', 'Frequency', units='kHz', color='k')
+        r.getAxis('bottom').setTextPen('k')
+        r.getAxis('bottom').setPen('k')
         r.getAxis('bottom').show()
         r.setXRange(_nb_freqs[0], _nb_freqs[-1], padding=0)
         r.getViewBox().disableAutoRange()
@@ -289,11 +432,11 @@ def setup_iq_nb_window(self, view_action):
 
     self.nb_spec_plot = _make_nb_plot(show_title=True)
     self.nb_floor_curve = pg.PlotCurveItem(
-        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#66bb6a', width=1))
+        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#1b5e20', width=1))
     self.nb_block_curve = pg.PlotCurveItem(
-        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#4fc3f7', width=1, style=QtCore.Qt.DotLine))
+        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#1565c0', width=1, style=QtCore.Qt.DotLine))
     self.nb_thresh_curve = pg.PlotCurveItem(
-        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#ff7043', width=1, style=QtCore.Qt.DashLine))
+        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#c62828', width=1, style=QtCore.Qt.DashLine))
     self.nb_spec_plot.addItem(self.nb_floor_curve)
     self.nb_spec_plot.addItem(self.nb_block_curve)
     self.nb_spec_plot.addItem(self.nb_thresh_curve)
@@ -301,11 +444,11 @@ def setup_iq_nb_window(self, view_action):
 
     self.nb_spec_plot_v = _make_nb_plot(show_title=False)
     self.nb_floor_curve_v = pg.PlotCurveItem(
-        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#66bb6a', width=1))
+        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#1b5e20', width=1))
     self.nb_block_curve_v = pg.PlotCurveItem(
-        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#ce93d8', width=1, style=QtCore.Qt.DotLine))
+        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#6a1b9a', width=1, style=QtCore.Qt.DotLine))
     self.nb_thresh_curve_v = pg.PlotCurveItem(
-        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#ff7043', width=1, style=QtCore.Qt.DashLine))
+        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#c62828', width=1, style=QtCore.Qt.DashLine))
     self.nb_spec_plot_v.addItem(self.nb_floor_curve_v)
     self.nb_spec_plot_v.addItem(self.nb_block_curve_v)
     self.nb_spec_plot_v.addItem(self.nb_thresh_curve_v)
@@ -315,6 +458,7 @@ def setup_iq_nb_window(self, view_action):
 
     # Noise blanker controls
     nb_group = QtWidgets.QGroupBox("Spectral Noise Blanker")
+    nb_group.setStyleSheet(_GRP_SS)
     nb_vbox  = QtWidgets.QVBoxLayout(nb_group)
     nb_vbox.setSpacing(3)
 
@@ -322,11 +466,11 @@ def setup_iq_nb_window(self, view_action):
     nb_factor_row.addWidget(QtWidgets.QLabel("K (amplitude, K²=power ratio):"))
     self.nb_factor_label = QtWidgets.QLabel(f"{self.nb_factor:.1f}")
     self.nb_factor_label.setStyleSheet(
-        "QLabel { color: #c8e6c9; font-family: monospace; min-width: 32px; }"
+        "QLabel { color: #1a6b1a; font-family: monospace; min-width: 32px; }"
     )
     nb_factor_row.addWidget(self.nb_factor_label)
     nb_sl = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-    nb_sl.setMinimum(10); nb_sl.setMaximum(100)
+    nb_sl.setMinimum(20); nb_sl.setMaximum(100)
     nb_sl.setValue(int(round(self.nb_factor * 10)))
     nb_sl.setTickPosition(QtWidgets.QSlider.TicksBelow)
     nb_sl.setTickInterval(10)
@@ -338,14 +482,14 @@ def setup_iq_nb_window(self, view_action):
     nb_status_row.addWidget(QtWidgets.QLabel("Blanked:"))
     self._nb_count_val = QtWidgets.QLabel("0.00%")
     self._nb_count_val.setStyleSheet(
-        "QLabel { color: #c76000; font-family: monospace; min-width: 52px; }"
+        "QLabel { color: #8a3a00; font-family: monospace; min-width: 52px; }"
     )
     nb_status_row.addWidget(self._nb_count_val)
     nb_status_row.addSpacing(12)
     nb_status_row.addWidget(QtWidgets.QLabel("Hot bins:"))
     self._nb_hot_val = QtWidgets.QLabel(f"0/{NB_FFT_SIZE}")
     self._nb_hot_val.setStyleSheet(
-        "QLabel { color: #ffb74d; font-family: monospace; min-width: 52px; }"
+        "QLabel { color: #b85c00; font-family: monospace; min-width: 52px; }"
     )
     nb_status_row.addWidget(self._nb_hot_val)
     nb_status_row.addStretch()
@@ -539,7 +683,7 @@ def setup_usrp_window(self, view_action):
     self._usrp_gain_db = _gain_saved
     self._usrp_gain_label = QtWidgets.QLabel(f"{_gain_saved:.0f} dB")
     self._usrp_gain_label.setStyleSheet(
-        "QLabel { color: #c8e6c9; font-family: monospace; min-width: 48px; }"
+        "QLabel { color: #1a6b1a; font-family: monospace; min-width: 48px; }"
     )
     self._usrp_gain_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
     self._usrp_gain_slider.setMinimum(0)
@@ -549,8 +693,8 @@ def setup_usrp_window(self, view_action):
     self._usrp_gain_slider.setTickInterval(10)
     self._usrp_gain_slider.valueChanged.connect(self.on_usrp_gain_changed)
     gain_row = QtWidgets.QHBoxLayout()
-    gain_row.addWidget(self._usrp_gain_label)
     gain_row.addWidget(self._usrp_gain_slider, stretch=1)
+    gain_row.addWidget(self._usrp_gain_label)
     rxa_form.addRow("Gain:", gain_row)
 
     try:
@@ -562,8 +706,11 @@ def setup_usrp_window(self, view_action):
     self._usrp_antenna_combo.setCurrentText(_ant_saved)
     self._usrp_antenna_combo.currentTextChanged.connect(self.on_usrp_antenna_changed)
     rxa_form.addRow("Antenna:", self._usrp_antenna_combo)
-    rxa_form.addRow("Signal:",  _stat_label(self, "_usrp_sig_dbfs_val"))
     rxa_form.addRow("Noise Floor:", _stat_label(self, "_usrp_noise_dbfs_val"))
+    rxa_form.addRow("Peak raw:",    _stat_label(self, "_usrp_peak_raw_dbfs_val"))
+    rxa_form.addRow("Peak clean:",  _stat_label(self, "_usrp_peak_dbfs_val"))
+    self._usrp_blanker_bar = _BlankerBar()
+    rxa_form.addRow(self._usrp_blanker_bar)
     layout.addWidget(rxa_grp)
 
     # ── RF 1 (second polarization channel, always RX2 port) ──
@@ -591,7 +738,7 @@ def setup_usrp_window(self, view_action):
     self._usrp_gain_db_ch1 = _gain1_saved
     self._usrp_gain_label_ch1 = QtWidgets.QLabel(f"{_gain1_saved:.0f} dB")
     self._usrp_gain_label_ch1.setStyleSheet(
-        "QLabel { color: #c8e6c9; font-family: monospace; min-width: 48px; }"
+        "QLabel { color: #1a6b1a; font-family: monospace; min-width: 48px; }"
     )
     self._usrp_gain_slider_ch1 = QtWidgets.QSlider(QtCore.Qt.Horizontal)
     self._usrp_gain_slider_ch1.setMinimum(0)
@@ -601,11 +748,14 @@ def setup_usrp_window(self, view_action):
     self._usrp_gain_slider_ch1.setTickInterval(10)
     self._usrp_gain_slider_ch1.valueChanged.connect(self.on_usrp_gain_ch1_changed)
     gain1_row = QtWidgets.QHBoxLayout()
-    gain1_row.addWidget(self._usrp_gain_label_ch1)
     gain1_row.addWidget(self._usrp_gain_slider_ch1, stretch=1)
+    gain1_row.addWidget(self._usrp_gain_label_ch1)
     rxb_form.addRow("Gain:", gain1_row)
-    rxb_form.addRow("Signal:",      _stat_label(self, "_usrp_sig_dbfs_ch1_val"))
     rxb_form.addRow("Noise Floor:", _stat_label(self, "_usrp_noise_dbfs_ch1_val"))
+    rxb_form.addRow("Peak raw:",    _stat_label(self, "_usrp_peak_raw_dbfs_ch1_val"))
+    rxb_form.addRow("Peak clean:",  _stat_label(self, "_usrp_peak_dbfs_ch1_val"))
+    self._usrp_blanker_bar_ch1 = _BlankerBar()
+    rxb_form.addRow(self._usrp_blanker_bar_ch1)
     layout.addWidget(rxb_grp)
 
     layout.addStretch()
@@ -1113,10 +1263,30 @@ def _update_usrp_window(self, sig_str, noise_str, rate_str, drops_str):
     # Signal: use recv-loop RMS directly — reliable regardless of whether
     # process_iq_data is consuming the queue.
     # Noise floor: from noise blanker envelope on ch0 (ch1 stub pending).
-    _setlbl(self, '_usrp_sig_dbfs_val',       _rms_to_dbfs_str(getattr(uc, 'ch0_rms', None) if uc else None))
     _setlbl(self, '_usrp_noise_dbfs_val',      noise_str)
-    _setlbl(self, '_usrp_sig_dbfs_ch1_val',   _rms_to_dbfs_str(getattr(uc, 'ch1_rms', None) if uc else None))
-    _setlbl(self, '_usrp_noise_dbfs_ch1_val', "—")
+    _setlbl(self, '_usrp_noise_dbfs_ch1_val', noise_str)
+    for _attr, _buf in (
+        ('_usrp_peak_raw_dbfs_val',     '_td_mag_buf_raw'),    # pre-blanker H
+        ('_usrp_peak_dbfs_val',         '_td_mag_buf'),         # post-blanker H
+        ('_usrp_peak_raw_dbfs_ch1_val', '_td_mag_buf_raw_v'),  # pre-blanker V
+        ('_usrp_peak_dbfs_ch1_val',     '_td_mag_buf_v'),       # post-blanker V
+    ):
+        _ps, _pc = _compute_peak_dbfs(self, _buf)
+        _setlbl(self, _attr, _ps)
+        _lbl = getattr(self, _attr, None)
+        if _lbl is not None:
+            _lbl.setStyleSheet(f"QLabel {{ color: {_pc}; font-family: monospace; }}")
+
+    # Stacked bar: noise floor / peak-clean / peak-raw
+    _ndb = _noise_floor_db(self)
+    for _bar_attr, _buf_clean, _buf_raw in (
+        ('_usrp_blanker_bar',     '_td_mag_buf',   '_td_mag_buf_raw'),
+        ('_usrp_blanker_bar_ch1', '_td_mag_buf_v', '_td_mag_buf_raw_v'),
+    ):
+        _bar = getattr(self, _bar_attr, None)
+        if _bar is not None:
+            _bar.update_values(_ndb, _compute_peak_db(self, _buf_clean),
+                               _compute_peak_db(self, _buf_raw))
 
     # Actual gain readback from hardware (once per second — every 10 update cycles)
     if (uc is not None and getattr(uc, '_usrp', None) is not None

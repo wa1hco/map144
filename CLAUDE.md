@@ -1,12 +1,12 @@
-# Claude DSP Collaboration Guidelines
+# MAP144 Project Guidelines
 
-This file defines the preferred working style, architecture rules, math conventions, and safety constraints for AI-assisted work on MAP144 and WSJT-X related experiments. It is intended to help Claude act like a careful engineering collaborator rather than a generic code generator. The goal is to preserve correct signal-processing behavior, maintain architectural clarity, and reduce unhelpful refactors that make the code harder to reason about.
+This file contains MAP144- and WSJT-X-specific guidance. General collaboration style, architectural rules, coding preferences, and safety rails are in `~/.claude/CLAUDE.md` and apply here unless overridden below.
 
 ## How to use this file
 
 Use this document as standing project guidance for any task in this repository unless the prompt explicitly overrides it.
 
-This repo also uses a persistent memory system at `~/.claude/projects/.../memory/` (indexed by `MEMORY.md`). Cross-session findings — algorithm decisions, sensitivity investigation results, architectural constraints — are stored there. Read relevant memory entries before starting work on detection, decode, or sensitivity topics; update them when a finding changes.
+This repo uses a persistent memory system at `~/.claude/projects/.../memory/` (indexed by `MEMORY.md`). Cross-session findings — algorithm decisions, sensitivity investigation results, architectural constraints — are stored there. Read relevant memory entries before starting work on detection, decode, or sensitivity topics; update them when a finding changes.
 
 Before proposing code changes:
 
@@ -48,80 +48,20 @@ For WSJT-X-related edits:
 - Prefer minimal patches that can be explained in a short commit message.
 - Preserve behavior unless the task is explicitly about changing behavior.
 
-## Engineering stance
-
-Claude should behave like a DSP-aware peer reviewer and implementation assistant.
-
-Preferred behavior:
-
-- Think in terms of signal flow, data flow, and invariants.
-- Explain tradeoffs before changing core algorithms.
-- Favor readable, layered code over clever compressed code.
-- Keep math helpers pure when possible.
-- Isolate experimental code from production paths.
-
-Avoid:
-
-- Rewriting working code just to make it look cleaner.
-- Mixing UI concerns into DSP code.
-- Hiding important math inside large multifunction routines.
-- Creating abstractions that obscure the real signal path.
-- Producing documentation that sounds confident but is mathematically vague.
-
-## Architectural rules
-
-### Layering
-
-Maintain a clear separation between these layers:
-
-1. Input/acquisition/buffering
-2. Preprocessing
-3. Spectral or correlation analysis
-4. Detection logic
-5. Decode logic
-6. Post-analysis / reporting / visualization
-7. UI or operator control
-
-A lower layer should not depend on a higher layer.
-
-Examples:
-
-- Detection code should not directly depend on UI objects.
-- Core DSP routines should not perform ad hoc printing or GUI updates.
-- Decode logic should not reach backward into acquisition internals unless there is a clearly defined interface.
-
-### Small interfaces
-
-Prefer narrow interfaces that pass only what is needed.
-
-Good:
-
-- Pass arrays, sample rate, timing metadata, and configuration explicitly.
-- Return structured results with clearly named fields.
-
-Avoid:
-
-- Passing large stateful objects into low-level math routines.
-- Letting helpers read hidden globals when explicit parameters would be clearer.
-
-### Refactor policy
-
-When asked to refactor:
-
-- First describe the current structure.
-- Then describe the proposed structure.
-- Then explain why it preserves or improves the signal path.
-- Prefer staged refactors over one-shot rewrites.
-
-If a refactor changes both behavior and structure, call that out explicitly.
-
 ## Signal-flow expectations
 
 Always reason about the code as a pipeline.
 
-A typical weak-signal path may look like:
+The current MAP144 production pipeline is:
 
-raw samples -> conditioning / filtering -> synchronization aids -> FFT / correlation / accumulation -> candidate detection -> candidate ranking -> decode attempts -> scoring / reporting
+RF input (SDR) -> polyphase channelizer (complex IQ per channel) -> audio BPF (129-tap FIR, ±1200 Hz on complex baseband) -> SPD coherent-averaging decoder (primary) -> jt9 fallback (if SPD misses) -> reporting
+
+Key invariants of this pipeline:
+
+- The channelizer produces complex IQ; the Hilbert-to-analytic conversion step is intentionally absent (removed to recover ~3 dB sensitivity).
+- The audio BPF on complex baseband is the primary sensitivity mechanism; removing it reverts to detection-limited behavior.
+- SPD runs first on every candidate; jt9 is fallback only, not co-primary.
+- RMS normalization is used in SPD (not peak normalization); peak normalization suppresses signal at low SNR.
 
 For polarization-related experiments, the flow may include parallel H and V streams and a combination stage before or during detection/decode depending on the experiment.
 
@@ -164,20 +104,24 @@ When implementing correlation or coherent accumulation:
 - State what is being phase-aligned, and how.
 - Preserve the distinction between detection statistics and decoded-symbol logic.
 
+### Normalization conventions in SPD
+
+RMS normalization must be preserved in `msk144_spd.py`. Peak normalization (e.g. scaling to 0.9 peak) suppresses low-SNR signals and costs roughly 1.5 dB of sensitivity. Do not switch normalization strategy without calling it out.
+
+The LLR scaling parameter `sigma=0.60` is confirmed optimal for the Python `bpdecode128_90` implementation. Do not change it without a controlled sensitivity sweep.
+
 ### Polarization combination
 
 For dual-polarization experiments, the working model may include a combined signal of the form:
 
-\[
-\text{combined} = H \cdot \cos\theta + V \cdot e^{j\Delta\phi} \cdot \sin\theta
-\]
+$$\text{combined} = H \cdot \cos\theta + V \cdot e^{j\Delta\phi} \cdot \sin\theta$$
 
 where:
 
-- \(H\) is the horizontal-polarization complex signal
-- \(V\) is the vertical-polarization complex signal
-- \(\theta\) controls the mixing angle
-- \(\Delta\phi\) is the relative phase offset
+- $H$ is the horizontal-polarization complex signal
+- $V$ is the vertical-polarization complex signal
+- $\theta$ controls the mixing angle
+- $\Delta\phi$ is the relative phase offset
 
 When working in this area:
 
@@ -196,48 +140,6 @@ Examples:
 - Be careful with normalization when magnitudes may approach zero.
 - Guard divisions when a denominator can be zero or nearly zero.
 - Preserve precision in accumulation loops when practical.
-
-## Coding preferences
-
-### Style
-
-- Prefer straightforward, readable code.
-- Favor descriptive names over short opaque names, especially in DSP logic.
-- Keep functions focused on one logical operation.
-- Separate pure computation from side effects.
-- Use comments to explain why, not to narrate every line.
-
-### Preferred function shape
-
-A DSP helper should ideally:
-
-- accept explicit inputs
-- avoid hidden state
-- return a clearly defined result
-- expose units or interpretation where helpful
-
-Example pattern:
-
-```python
-def estimate_candidate_snr(spec_power, noise_floor, bins, sample_rate_hz):
-    ...
-    return snr_db
-```
-
-Less desirable pattern:
-
-```python
-def do_processing(state):
-    # reads hidden globals, mutates many fields, logs, plots, and computes thresholds
-    ...
-```
-
-### Logging and debug output
-
-- Debugging hooks are good when they help inspect the pipeline.
-- Logging should be optional and structured.
-- Do not bury core logic inside debug branches.
-- Prefer returning intermediate artifacts or metrics when useful for analysis.
 
 ## Testing expectations
 
@@ -264,31 +166,14 @@ If exact expected values are not available, propose invariant-based tests, such 
 - no regression in previously detected cases
 - thresholds move in expected direction after normalization changes
 
-## Safety rails
+## Safety rails (MAP144-specific)
 
-Do not do the following unless explicitly asked:
+In addition to the general safety rails in `~/.claude/CLAUDE.md`, do not do the following without explicit instruction:
 
-- Rewrite major subsystems for style alone.
-- Change public interfaces across many files in one step.
-- Replace domain-specific code with generic framework code.
-- Remove existing comments that encode domain knowledge.
-- Change constants, thresholds, or normalization factors without explaining why.
-- Introduce threading, async behavior, or buffering changes into DSP code unless the task is specifically about execution model or throughput.
-
-If a request appears to conflict with these rules, point out the conflict and ask for confirmation.
-
-## How to present proposed changes
-
-For simple tasks (renaming, adding a column, fixing a typo), just make the change with a brief explanation. Reserve the full structure below for nontrivial tasks — algorithm changes, new pipeline stages, threshold modifications, or anything that affects decode sensitivity:
-
-1. Current behavior
-2. Problem being solved
-3. Proposed change
-4. Why it respects signal flow and layering
-5. Risks / assumptions
-6. Suggested tests
-
-If the task is exploratory, say so explicitly and separate hypothesis from fact.
+- Remove the audio BPF from the SPD path — it is the primary mechanism that makes the system detection-capable at low SNR.
+- Re-add a proximity guard (±N channel suppression on active threads) to the detection gating — it was deliberately removed because it blocked legitimate adjacent-channel signals and same-frequency re-triggers.
+- Switch from RMS to peak normalization in SPD.
+- Change `sigma` in `bpdecode128_90` LLR scaling without a controlled sweep.
 
 ## MAP144-specific guidance
 
@@ -297,6 +182,19 @@ If the task is exploratory, say so explicitly and separate hypothesis from fact.
 - Keep intermediate observables available for plotting, inspection, or offline analysis.
 - When simulating channels or polarization effects, document assumptions clearly.
 - Favor code that makes it easy to compare algorithm variants side by side.
+
+### Detection gating invariants
+
+The cluster-based detection gating in `processing.py` has several non-obvious invariants that must be preserved:
+
+- A cluster is defined as a group of triggered channels with no gap wider than 3 channels; two clusters can both launch independently.
+- The `_too_many` broadband gate counts only *fresh* (non-cooldown) triggered channels — previously-cooled sidelobe remnants must not count against the gate threshold.
+- On launch, only the single best channel (`_best`, ±0 radius) is suppressed; suppressing ±1 blocks legitimate adjacent-channel signals.
+- The proximity guard (±2ch `fc_hz` check on active threads) was intentionally removed — it incorrectly blocked same-frequency re-triggers and legitimate adjacent signals.
+
+When touching detection gating logic, state which invariant is affected and why the change is safe.
+
+### Polarization optimization targets
 
 If proposing changes related to polarization optimization, state whether the optimization target is:
 
@@ -315,7 +213,7 @@ These are not always the same objective.
 - Explain any performance impact, even if expected to be small.
 - Avoid speculative cleanup in files touched for a narrow behavioral fix.
 
-## Questions Claude should ask when needed
+## Questions to ask for MAP144 work
 
 If key context is missing, ask focused questions such as:
 
@@ -326,43 +224,14 @@ If key context is missing, ask focused questions such as:
 - Is this experimental-only code or production-path code?
 - Should the optimization favor weak-signal sensitivity, speed, or maintainability?
 
-## Preferred collaboration model
-
-The preferred collaboration style is:
-
-- user defines goals, architecture intent, and acceptance criteria
-- Claude helps inspect code, suggest structure, implement contained changes, and write tests
-- Claude should challenge ambiguous or risky assumptions, but should not fight the requested architecture without a concrete technical reason
-
-Claude is most useful here as an engineer who respects the system model and helps with careful execution.
-
-## Session-start prompt template
-
-Use this template at the start of a new Claude coding session:
-
-```text
-Please use `CLAUDE.md` as standing guidance for this repo.
-
-Important priorities:
-1. Preserve signal-flow clarity.
-2. Keep detection and decode conceptually separate unless I explicitly ask otherwise.
-3. Do not change mathematical conventions, normalization, or phase handling without calling it out.
-4. Prefer small, testable changes.
-5. Explain risks and suggested tests for any nontrivial DSP change.
-
-Before changing code, summarize the current structure and proposed change.
-```
-
-Note: `CLAUDE.md` is auto-loaded by Claude Code at session start, so this template is only needed when starting a session in a tool that does not auto-load it.
-
 ## Maintenance notes
 
 This file should be updated whenever one of these happens:
 
 - a repeated Claude failure mode is discovered
-- a new architectural rule becomes important
+- a new architectural rule becomes important for MAP144
 - a math convention is clarified
 - a project-specific testing pattern proves useful
-- a recurring good prompt pattern emerges
+- a sensitivity finding changes the pipeline architecture
 
 Treat this as a living engineering contract between the human and the assistant.
