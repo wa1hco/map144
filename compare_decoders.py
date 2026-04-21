@@ -107,7 +107,7 @@ def parse_map144(path: Path):
             ts = period_start(ts)
             est = d.get('est_snr_db')
             jt9 = d.get('jt9_snr_db')
-            snr = est if est is not None else jt9
+            snr = jt9 if jt9 is not None else est
             results.append({
                 'ts':       ts,
                 'freq_mhz': d.get('radio_khz', 0) / 1000.0,

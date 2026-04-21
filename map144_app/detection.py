@@ -129,6 +129,7 @@ _SNR_SIG_MASK  = (_SNR_FREQS >= 900.0) & (_SNR_FREQS <= 2100.0)
 # Noise band: above DC artefacts, below Nyquist rolloff, excluding signal band.
 _SNR_NOISE_MASK = (_SNR_FREQS > 200.0) & (_SNR_FREQS < 5500.0) & ~_SNR_SIG_MASK
 _SNR_REF_BINS  = 2500.0 / _SNR_BIN_HZ  # 2500 Hz reference bandwidth in bins
+_SNR_N_SIG_BINS = int(_SNR_SIG_MASK.sum())  # bins in signal band (noise floor correction)
 
 # ── SPD audio BPF (300–2700 Hz modelled as complex lowpass ±1200 Hz) ─────────
 # Applied to complex baseband IQ at 12 kHz before the SPD.  The MSK144 signal
@@ -234,9 +235,15 @@ def _estimate_snr_db(audio: np.ndarray) -> int | None:
     if best_sig <= 0.0:
         return None
 
-    # SNR = in-band signal power / (noise_per_bin × ref_bins)
-    # Both use the same FFT normalisation so units cancel cleanly.
-    snr_db = 10.0 * np.log10(best_sig / (noise_per_bin * _SNR_REF_BINS))
+    # Subtract the noise contribution from the signal-band sum so the estimator
+    # does not bottom out at 10*log10(n_sig_bins/ref_bins) ≈ −3 dB when SNR→0.
+    # Without this, the noise power in the ~103 signal bins dominates at low SNR
+    # and clamps the reported value to 0–2 dB even when the true SNR is −8 dB.
+    signal_only = best_sig - noise_per_bin * _SNR_N_SIG_BINS
+    if signal_only <= 0.0:
+        return None   # signal indistinguishable from noise — caller uses jt9_snr_db
+
+    snr_db = 10.0 * np.log10(signal_only / (noise_per_bin * _SNR_REF_BINS))
     return int(round(snr_db))
 
 
