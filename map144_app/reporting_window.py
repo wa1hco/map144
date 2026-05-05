@@ -78,6 +78,15 @@ def setup_reporting_window(self, view_action):
 
     layout.addWidget(udp_grp)
 
+    # ── Advisory: avoid double-spotting via downstream tools ─────────────────
+    note = QtWidgets.QLabel(
+        "If GridTracker (or similar) is already spotting to DX Cluster "
+        "or PSKReporter, leave those disabled here to avoid duplicate spots."
+    )
+    note.setWordWrap(True)
+    note.setStyleSheet("QLabel { color: #555; font-style: italic; }")
+    layout.addWidget(note)
+
     # ── DX Cluster ───────────────────────────────────────────────────────────
     dx_grp  = QtWidgets.QGroupBox("DX Cluster")
     dx_form = QtWidgets.QFormLayout(dx_grp)
@@ -146,10 +155,14 @@ def setup_reporting_window(self, view_action):
 
     layout.addStretch()
 
-    # ── Instantiate Reporter and apply saved settings immediately ─────────────
+    # ── Instantiate Reporter and apply saved settings ────────────────────────
+    # Defer the apply via singleShot(0): apply_settings() may trigger a
+    # synchronous DX-cluster TCP connect with blocking recv() that can stall
+    # for tens of seconds.  Doing it inline blocks setup_ui and the event
+    # loop, leaving the GUI invisible during the wait.
     self.reporter = Reporter()
-    _on_reporting_apply(self)
-    self.reporter.start()
+    QtCore.QTimer.singleShot(0, lambda: (_on_reporting_apply(self),
+                                          self.reporter.start()))
 
 
 def _on_enable_changed(self):

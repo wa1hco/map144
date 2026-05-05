@@ -109,14 +109,19 @@ def _compute_peak_db(self, buf_attr):
     return 20.0 * np.log10(peak) if peak > 1e-10 else None
 
 
-def _noise_floor_db(self):
-    """Return noise floor as a float dBFS value from the wideband or per-bin estimator."""
+def _noise_floor_db(self, channel='h'):
+    """Return noise floor (dBFS) for the specified channel, 'h' or 'v'.
+
+    Falls back to the wideband estimator when available, else the
+    per-bin-mean floor.  Channel-specific attributes have a ``_v`` suffix.
+    """
     from .processing import NB_FFT_SIZE
-    wb = getattr(self, '_nb_wideband_floor', None)
+    suffix = '_v' if channel == 'v' else ''
+    wb = getattr(self, f'_nb_wideband_floor{suffix}', None)
     if wb is not None and float(wb) > 1e-30:
         rms = float(wb / NB_FFT_SIZE) ** 0.5
         return 20.0 * np.log10(rms)
-    nb = getattr(self, '_nb_floor', None)
+    nb = getattr(self, f'_nb_floor{suffix}', None)
     if nb is not None and float(nb) > 1e-10:
         return 20.0 * np.log10(float(nb))
     return None
@@ -217,27 +222,28 @@ def _compute_peak_dbfs(self, buf_attr='_td_mag_buf'):
     return s, color
 
 
-def _compute_dbfs(self):
-    """Return (signal_dbfs, noise_dbfs) strings from the IQ magnitude buffer.
+def _compute_dbfs(self, channel='h'):
+    """Return (signal_dbfs, noise_dbfs) strings for the specified channel.
 
     noise_dbfs uses the wideband median noise floor estimator when available,
-    falling back to the per-bin-mean _nb_floor.  The median estimator is robust
-    to narrowband spurs; the fallback is not, but is always available.
+    falling back to the per-bin-mean _nb_floor.  ``channel`` selects H or V
+    state (``_nb_floor`` / ``_nb_floor_v``).
     """
     from .processing import NB_FFT_SIZE
-    buf = getattr(self, '_td_mag_buf', None)
+    suffix  = '_v' if channel == 'v' else ''
+    buf_name = '_td_mag_buf_v' if channel == 'v' else '_td_mag_buf'
+    buf = getattr(self, buf_name, None)
     if buf is None or len(buf) == 0:
         return "—", "—"
     rms = float(np.sqrt(np.mean(buf.astype(np.float64) ** 2)))
     sig_str = "—" if rms < 1e-10 else f"{20.0 * np.log10(rms):.1f} dBFS"
 
-    wb_floor = getattr(self, '_nb_wideband_floor', None)
+    wb_floor = getattr(self, f'_nb_wideband_floor{suffix}', None)
     if wb_floor is not None and float(wb_floor) > 1e-30:
-        # Convert median bin power to RMS amplitude: rms = sqrt(median_P / N)
         rms_floor = float(wb_floor / NB_FFT_SIZE) ** 0.5
         noise_str = f"{20.0 * np.log10(rms_floor):.1f} dBFS"
     else:
-        nb_floor = getattr(self, '_nb_floor', None)
+        nb_floor = getattr(self, f'_nb_floor{suffix}', None)
         if nb_floor is not None and float(nb_floor) > 1e-10:
             noise_str = f"{20.0 * np.log10(float(nb_floor)):.1f} dBFS"
         else:
@@ -259,7 +265,7 @@ def setup_iq_nb_window(self, view_action):
         f"QLabel {{ font-family: {_FONT}; }}"
     )
 
-    win = _PanelWindow("map144 — IQ / Noise Blanker", view_action, self, 'iq_nb_geometry')
+    win = _PanelWindow("map144 — Noise Blanker", view_action, self, 'iq_nb_geometry')
     win.setMinimumSize(350, 370)
     win.setStyleSheet(f"QLabel {{ font-family: {_FONT}; }}")
     layout = QtWidgets.QVBoxLayout(win)
@@ -308,10 +314,17 @@ def setup_iq_nb_window(self, view_action):
         return r
 
     self.td_plot = _make_td_plot('H')
+    # Raw (pre-blanker) trace added first so it renders behind the cleaned trace.
+    self.td_curve_raw = pg.PlotCurveItem(
+        np.linspace(0.0, 200.0, _td_n, endpoint=False),
+        np.zeros(_td_n, dtype=np.float32),
+        pen=pg.mkPen('#e53935', width=1),   # red — pre-blanker; impulse spikes stand out
+    )
+    self.td_plot.addItem(self.td_curve_raw)
     self.td_curve = pg.PlotCurveItem(
         np.linspace(0.0, 200.0, _td_n, endpoint=False),
         np.zeros(_td_n, dtype=np.float32),
-        pen=pg.mkPen('#1565c0', width=1),
+        pen=pg.mkPen('#1565c0', width=1),   # solid blue — post-blanker (holes show blanking)
     )
     self.td_plot.addItem(self.td_curve)
     self.td_plot.setXRange(0.0, 200.0, padding=0)
@@ -322,10 +335,16 @@ def setup_iq_nb_window(self, view_action):
     self.td_plot.addItem(self.td_thresh_line)
 
     self.td_plot_v = _make_td_plot('V')
+    self.td_curve_raw_v = pg.PlotCurveItem(
+        np.linspace(0.0, 200.0, _td_n, endpoint=False),
+        np.zeros(_td_n, dtype=np.float32),
+        pen=pg.mkPen('#e53935', width=1),   # red — pre-blanker V (match H)
+    )
+    self.td_plot_v.addItem(self.td_curve_raw_v)
     self.td_curve_v = pg.PlotCurveItem(
         np.linspace(0.0, 200.0, _td_n, endpoint=False),
         np.zeros(_td_n, dtype=np.float32),
-        pen=pg.mkPen('#6a1b9a', width=1),
+        pen=pg.mkPen('#1565c0', width=1),   # blue — post-blanker V (match H)
     )
     self.td_plot_v.addItem(self.td_curve_v)
     self.td_plot_v.setXRange(0.0, 200.0, padding=0)
@@ -401,8 +420,9 @@ def setup_iq_nb_window(self, view_action):
         p.setMinimumHeight(100)
         p.setMaximumHeight(140)
         p.setXRange(_nb_freqs[0], _nb_freqs[-1], padding=0)
-        p.setYRange(-120.0, 0.0, padding=0)
+        p.setYRange(-90.0, -20.0, padding=0)   # typical activity range; scroll wheel zooms Y
         p.getViewBox().disableAutoRange()
+        p.setMouseEnabled(x=False, y=True)     # Y scroll/drag to pan; X stays locked to freq axis
         p.getAxis('bottom').hide()
         if show_title:
             p.setTitle('Blanker Spectrum — floor / block', color='k')
@@ -431,13 +451,17 @@ def setup_iq_nb_window(self, view_action):
         return r
 
     self.nb_spec_plot = _make_nb_plot(show_title=True)
+    self.nb_spec_plot.setTitle('Blanker Spectrum — floor / last blanked / threshold', color='k')
     self.nb_floor_curve = pg.PlotCurveItem(
-        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#1b5e20', width=1))
+        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#1b5e20', width=1))    # green: floor avg
+    self.nb_blanked_curve = pg.PlotCurveItem(
+        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#e65100', width=2))    # orange: last blanked block (frozen)
     self.nb_block_curve = pg.PlotCurveItem(
-        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#1565c0', width=1, style=QtCore.Qt.DotLine))
+        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#1565c0', width=1, style=QtCore.Qt.DotLine))  # blue: current block
     self.nb_thresh_curve = pg.PlotCurveItem(
-        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#c62828', width=1, style=QtCore.Qt.DashLine))
+        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#c62828', width=1, style=QtCore.Qt.DashLine)) # red: threshold
     self.nb_spec_plot.addItem(self.nb_floor_curve)
+    self.nb_spec_plot.addItem(self.nb_blanked_curve)
     self.nb_spec_plot.addItem(self.nb_block_curve)
     self.nb_spec_plot.addItem(self.nb_thresh_curve)
     layout.addWidget(self.nb_spec_plot)
@@ -445,11 +469,14 @@ def setup_iq_nb_window(self, view_action):
     self.nb_spec_plot_v = _make_nb_plot(show_title=False)
     self.nb_floor_curve_v = pg.PlotCurveItem(
         _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#1b5e20', width=1))
+    self.nb_blanked_curve_v = pg.PlotCurveItem(
+        _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#e65100', width=2))
     self.nb_block_curve_v = pg.PlotCurveItem(
         _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#6a1b9a', width=1, style=QtCore.Qt.DotLine))
     self.nb_thresh_curve_v = pg.PlotCurveItem(
         _nb_freqs, _nb_zeros.copy(), pen=pg.mkPen('#c62828', width=1, style=QtCore.Qt.DashLine))
     self.nb_spec_plot_v.addItem(self.nb_floor_curve_v)
+    self.nb_spec_plot_v.addItem(self.nb_blanked_curve_v)
     self.nb_spec_plot_v.addItem(self.nb_block_curve_v)
     self.nb_spec_plot_v.addItem(self.nb_thresh_curve_v)
     self.nb_spec_plot_v.hide()
@@ -457,13 +484,31 @@ def setup_iq_nb_window(self, view_action):
     layout.addWidget(_make_nb_ruler())
 
     # Noise blanker controls
-    nb_group = QtWidgets.QGroupBox("Spectral Noise Blanker")
+    nb_group = QtWidgets.QGroupBox("Noise Blanker")
     nb_group.setStyleSheet(_GRP_SS)
     nb_vbox  = QtWidgets.QVBoxLayout(nb_group)
     nb_vbox.setSpacing(3)
 
+    # Backend selector — switches the active blanker at runtime.  Saved to
+    # QSettings under ``nb_backend`` so the choice persists across restarts.
+    from .noise_blanker import available as _nb_available
+    nb_backend_row = QtWidgets.QHBoxLayout()
+    nb_backend_row.addWidget(QtWidgets.QLabel("Backend:"))
+    self.nb_backend_combo = QtWidgets.QComboBox()
+    for _name in _nb_available():
+        self.nb_backend_combo.addItem(_name)
+    _saved_backend = str(_SETTINGS.value('nb_backend', 'Linrad'))
+    _idx = self.nb_backend_combo.findText(_saved_backend)
+    if _idx >= 0:
+        self.nb_backend_combo.setCurrentIndex(_idx)
+    # Apply saved choice to the engine now so the first chunk uses it.
+    self.set_blanker(self.nb_backend_combo.currentText())
+    self.nb_backend_combo.currentTextChanged.connect(self.on_nb_backend_changed)
+    nb_backend_row.addWidget(self.nb_backend_combo, stretch=1)
+    nb_vbox.addLayout(nb_backend_row)
+
     nb_factor_row = QtWidgets.QHBoxLayout()
-    nb_factor_row.addWidget(QtWidgets.QLabel("K (amplitude, K²=power ratio):"))
+    nb_factor_row.addWidget(QtWidgets.QLabel("K H:"))
     self.nb_factor_label = QtWidgets.QLabel(f"{self.nb_factor:.1f}")
     self.nb_factor_label.setStyleSheet(
         "QLabel { color: #1a6b1a; font-family: monospace; min-width: 32px; }"
@@ -477,6 +522,26 @@ def setup_iq_nb_window(self, view_action):
     nb_sl.valueChanged.connect(self.on_nb_factor_changed)
     nb_factor_row.addWidget(nb_sl, stretch=1)
     nb_vbox.addLayout(nb_factor_row)
+
+    # V-channel K slider — independent from H for polarisation-specific
+    # tuning.  Shown always, useful only when dual-pol is active; the
+    # backend silently ignores it in single-pol mode.
+    nb_factor_v_row = QtWidgets.QHBoxLayout()
+    nb_factor_v_row.addWidget(QtWidgets.QLabel("K V:"))
+    self.nb_factor_v_label = QtWidgets.QLabel(
+        f"{getattr(self, 'nb_factor_v', self.nb_factor):.1f}")
+    self.nb_factor_v_label.setStyleSheet(
+        "QLabel { color: #1a6b1a; font-family: monospace; min-width: 32px; }"
+    )
+    nb_factor_v_row.addWidget(self.nb_factor_v_label)
+    nb_sl_v = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+    nb_sl_v.setMinimum(20); nb_sl_v.setMaximum(100)
+    nb_sl_v.setValue(int(round(getattr(self, 'nb_factor_v', self.nb_factor) * 10)))
+    nb_sl_v.setTickPosition(QtWidgets.QSlider.TicksBelow)
+    nb_sl_v.setTickInterval(10)
+    nb_sl_v.valueChanged.connect(self.on_nb_factor_v_changed)
+    nb_factor_v_row.addWidget(nb_sl_v, stretch=1)
+    nb_vbox.addLayout(nb_factor_v_row)
 
     nb_status_row = QtWidgets.QHBoxLayout()
     nb_status_row.addWidget(QtWidgets.QLabel("Blanked:"))
@@ -808,10 +873,526 @@ def setup_rtlsdr_window(self, view_action):
     layout.addStretch()
 
 
+# ── Window 6: SDRangel ───────────────────────────────────────────────────────
+
+def setup_sdrangel_window(self, view_action):
+    """Build the SDRangel interface panel window."""
+    from .ui import _PanelWindow
+    from .visualizer import _SETTINGS
+
+    win = _PanelWindow("map144 — SDRangel", view_action, self, 'sdrangel_geometry')
+    win.setMinimumSize(340, 480)
+    layout = QtWidgets.QVBoxLayout(win)
+    layout.setContentsMargins(8, 8, 8, 8)
+    layout.setSpacing(6)
+    self._sdrangel_win = win
+
+    # ── Connection settings ──
+    conn_grp, conn_form = _form_group("Connection")
+
+    try:
+        _host_saved = str(_SETTINGS.value('sdrangel_host', 'localhost'))
+    except Exception:
+        _host_saved = 'localhost'
+    self._sdrangel_host_edit = QtWidgets.QLineEdit(_host_saved)
+    conn_form.addRow("Host:", self._sdrangel_host_edit)
+
+    try:
+        _rest_port_saved = int(_SETTINGS.value('sdrangel_rest_port', 8091))
+    except (ValueError, TypeError):
+        _rest_port_saved = 8091
+    self._sdrangel_rest_port_spin = QtWidgets.QSpinBox()
+    self._sdrangel_rest_port_spin.setRange(1024, 65535)
+    self._sdrangel_rest_port_spin.setValue(_rest_port_saved)
+    conn_form.addRow("REST Port:", self._sdrangel_rest_port_spin)
+
+    try:
+        _udp_port_saved = int(_SETTINGS.value('sdrangel_udp_port', 9999))
+    except (ValueError, TypeError):
+        _udp_port_saved = 9999
+    self._sdrangel_udp_port_spin = QtWidgets.QSpinBox()
+    self._sdrangel_udp_port_spin.setRange(1024, 65535)
+    self._sdrangel_udp_port_spin.setValue(_udp_port_saved)
+    conn_form.addRow("UDP Port (H):", self._sdrangel_udp_port_spin)
+
+    try:
+        _dev_set_saved = int(_SETTINGS.value('sdrangel_device_set', 0))
+    except (ValueError, TypeError):
+        _dev_set_saved = 0
+    self._sdrangel_dev_set_spin = QtWidgets.QSpinBox()
+    self._sdrangel_dev_set_spin.setRange(0, 7)
+    self._sdrangel_dev_set_spin.setValue(_dev_set_saved)
+    conn_form.addRow("Device Set (H):", self._sdrangel_dev_set_spin)
+
+    try:
+        _lo_offset_saved = float(_SETTINGS.value('sdrangel_lo_offset_khz', 50.0))
+    except (ValueError, TypeError):
+        _lo_offset_saved = 50.0
+    self._sdrangel_lo_offset_spin = QtWidgets.QDoubleSpinBox()
+    self._sdrangel_lo_offset_spin.setRange(0.0, 500.0)
+    self._sdrangel_lo_offset_spin.setDecimals(1)
+    self._sdrangel_lo_offset_spin.setSingleStep(10.0)
+    self._sdrangel_lo_offset_spin.setValue(_lo_offset_saved)
+    conn_form.addRow("LO Offset (kHz):", self._sdrangel_lo_offset_spin)
+
+    try:
+        _exe_saved = str(_SETTINGS.value('sdrangel_exe', ''))
+    except Exception:
+        _exe_saved = ''
+    exe_row = QtWidgets.QHBoxLayout()
+    self._sdrangel_exe_edit = QtWidgets.QLineEdit(_exe_saved)
+    self._sdrangel_exe_edit.setPlaceholderText("(auto-detect)")
+    self._sdrangel_exe_edit.setToolTip(
+        "Full path to the SDRangel executable for auto-start.\n"
+        "Leave blank to search PATH and common install locations."
+    )
+    exe_browse_btn = QtWidgets.QPushButton("…")
+    exe_browse_btn.setMaximumWidth(28)
+    exe_browse_btn.clicked.connect(lambda: _sdrangel_browse_exe(self))
+    exe_row.addWidget(self._sdrangel_exe_edit, stretch=1)
+    exe_row.addWidget(exe_browse_btn)
+    conn_form.addRow("SDRangel Path:", exe_row)
+
+    # B210 hardware settings (used by auto_configure_b210).
+    try:
+        _dev_rate_saved = int(_SETTINGS.value('sdrangel_dev_sample_rate', 192000))
+    except (ValueError, TypeError):
+        _dev_rate_saved = 192000
+    self._sdrangel_dev_rate_spin = QtWidgets.QDoubleSpinBox()
+    self._sdrangel_dev_rate_spin.setRange(0.048, 61.44)
+    self._sdrangel_dev_rate_spin.setSingleStep(1.0)
+    self._sdrangel_dev_rate_spin.setDecimals(3)
+    self._sdrangel_dev_rate_spin.setValue(_dev_rate_saved / 1e6)
+    self._sdrangel_dev_rate_spin.setSuffix(" MHz")
+    conn_form.addRow("Device Rate:", self._sdrangel_dev_rate_spin)
+
+    try:
+        _gain_saved = float(_SETTINGS.value('sdrangel_gain_db', 40.0))
+    except (ValueError, TypeError):
+        _gain_saved = 40.0
+    self._sdrangel_gain_spin = QtWidgets.QDoubleSpinBox()
+    self._sdrangel_gain_spin.setRange(0.0, 76.0)
+    self._sdrangel_gain_spin.setDecimals(0)
+    self._sdrangel_gain_spin.setSingleStep(1.0)
+    self._sdrangel_gain_spin.setValue(_gain_saved)
+    self._sdrangel_gain_spin.setSuffix(" dB")
+    conn_form.addRow("Gain:", self._sdrangel_gain_spin)
+
+    # rx_scale: ingress normalization to match ±1.0 convention.
+    # SDRangel's decimator adds sqrt(dev_rate/out_rate) amplitude; this corrects it.
+    # Auto-computed default at client creation time; tune until levels match B210.
+    try:
+        _rx_scale_saved = float(_SETTINGS.value('sdrangel_rx_scale', 0.0))
+    except (ValueError, TypeError):
+        _rx_scale_saved = 0.0
+    self._sdrangel_rx_scale_spin = QtWidgets.QDoubleSpinBox()
+    self._sdrangel_rx_scale_spin.setRange(0.01, 2.0)
+    self._sdrangel_rx_scale_spin.setDecimals(3)
+    self._sdrangel_rx_scale_spin.setSingleStep(0.005)
+    self._sdrangel_rx_scale_spin.setValue(_rx_scale_saved if _rx_scale_saved > 0 else 0.125)
+    self._sdrangel_rx_scale_spin.setToolTip(
+        "Ingress amplitude correction. SDRangel's decimator adds gain proportional\n"
+        "to sqrt(device_rate / output_rate). Tune until peak levels match the\n"
+        "direct B210 path. 0 = auto-compute from sample rates (first run)."
+    )
+    conn_form.addRow("RX Scale:", self._sdrangel_rx_scale_spin)
+
+    apply_btn = QtWidgets.QPushButton("Apply")
+    apply_btn.clicked.connect(lambda: on_sdrangel_apply_clicked(self))
+    conn_form.addRow(apply_btn)
+    layout.addWidget(conn_grp)
+
+    # ── IF Stream ──
+    stream_grp, stream_form = _form_group("IF Stream")
+    stream_form.addRow("Device Type:",   _stat_label(self, "_sdrangel_hw_type_val"))
+    stream_form.addRow("Device Center:", _stat_label(self, "_sdrangel_freq_val"))
+    stream_form.addRow("Dual-pol:",      _stat_label(self, "_sdrangel_dualpol_val"))
+    _add_stream_rows(stream_form, self, "_sdrangel")
+    stream_form.addRow("Pkt Rate:",      _stat_label(self, "_sdrangel_pkt_rate_val"))
+    layout.addWidget(stream_grp)
+
+    # ── RF 0 (H channel) signal levels ──
+    rfa_grp, rfa_form = _form_group("RF 0 (H)", compact=True)
+    rfa_form.addRow("Noise Floor:", _stat_label(self, "_sdrangel_noise_dbfs_h_val"))
+    rfa_form.addRow("Peak raw:",    _stat_label(self, "_sdrangel_peak_raw_h_val"))
+    rfa_form.addRow("Peak clean:",  _stat_label(self, "_sdrangel_peak_clean_h_val"))
+    self._sdrangel_blanker_bar = _BlankerBar()
+    rfa_form.addRow(self._sdrangel_blanker_bar)
+    layout.addWidget(rfa_grp)
+
+    # ── RF 1 (V channel) signal levels — hidden until dual-pol active ──
+    rfb_grp, rfb_form = _form_group("RF 1 (V)", compact=True)
+    rfb_form.addRow("Noise Floor:", _stat_label(self, "_sdrangel_noise_dbfs_v_val"))
+    rfb_form.addRow("Peak raw:",    _stat_label(self, "_sdrangel_peak_raw_v_val"))
+    rfb_form.addRow("Peak clean:",  _stat_label(self, "_sdrangel_peak_clean_v_val"))
+    self._sdrangel_blanker_bar_v = _BlankerBar()
+    rfb_form.addRow(self._sdrangel_blanker_bar_v)
+    self._sdrangel_rf1_grp = rfb_grp
+    rfb_grp.hide()
+    layout.addWidget(rfb_grp)
+
+    # ── Service buttons ──
+    udp_btn = QtWidgets.QPushButton("Configure UDP Sink")
+    udp_btn.setToolTip(
+        "Find (or auto-create) and configure the UDPSink channel(s).\n"
+        "Sets destination, sample rate, and LO frequency offset."
+    )
+    udp_btn.clicked.connect(lambda: _sdrangel_configure_udp_sink(self))
+    layout.addWidget(udp_btn)
+
+    save_layout_btn = QtWidgets.QPushButton("Save SDRangel Layout")
+    save_layout_btn.setToolTip(
+        "Save SDRangel's current device set layout as the MAP144 preset.\n"
+        "Next time MAP144 starts, SDRangel will be restored to this exact\n"
+        "layout including sub-window positions and channel configuration.\n"
+        "Also exports a backup file to ~/.config/map144/."
+    )
+    save_layout_btn.clicked.connect(lambda: _sdrangel_save_layout(self))
+    layout.addWidget(save_layout_btn)
+    _stat_label(self, "_sdrangel_layout_status_val", init="—", color="#555555")
+    layout.addWidget(self._sdrangel_layout_status_val)
+
+    ssb_btn = QtWidgets.QPushButton("Setup SSB / WSJT-X Service")
+    ssb_btn.setToolTip(
+        "Find or create SSBDemod channel(s) and a virtual audio device\n"
+        "so WSJT-X can tune to the calling frequency.\n"
+        "Linux: creates a PipeWire/PulseAudio null sink 'MAP144-WSJT-X'.\n"
+        "WSJT-X → select 'Monitor of MAP144-WSJT-X' as sound card."
+    )
+    ssb_btn.clicked.connect(lambda: _sdrangel_setup_ssb_service(self))
+    layout.addWidget(ssb_btn)
+    _stat_label(self, "_sdrangel_ssb_status_val", init="—", color="#555555")
+    layout.addWidget(self._sdrangel_ssb_status_val)
+
+    # ── SDRangel configuration snapshot ──
+    snap_grp  = QtWidgets.QGroupBox("SDRangel Configuration")
+    snap_vlay = QtWidgets.QVBoxLayout(snap_grp)
+    snap_vlay.setContentsMargins(6, 4, 6, 4)
+    snap_vlay.setSpacing(4)
+
+    self._sdrangel_state_text = QtWidgets.QPlainTextEdit()
+    self._sdrangel_state_text.setReadOnly(True)
+    self._sdrangel_state_text.setPlaceholderText("Click Refresh to query SDRangel state…")
+    mono = self._sdrangel_state_text.font()
+    mono.setFamily("monospace")
+    mono.setPointSize(9)
+    self._sdrangel_state_text.setFont(mono)
+    self._sdrangel_state_text.setMinimumHeight(130)
+    self._sdrangel_state_text.setMaximumHeight(240)
+    snap_vlay.addWidget(self._sdrangel_state_text)
+
+    refresh_btn = QtWidgets.QPushButton("Refresh")
+    refresh_btn.setToolTip("Query SDRangel REST API and update the configuration snapshot.")
+    refresh_btn.clicked.connect(lambda: _sdrangel_probe_state(self))
+    snap_vlay.addWidget(refresh_btn)
+    layout.addWidget(snap_grp)
+
+    layout.addStretch()
+
+
+def _sdrangel_browse_exe(self):
+    """Open a file browser to select the SDRangel executable."""
+    path, _ = QtWidgets.QFileDialog.getOpenFileName(
+        None, "Select SDRangel Executable", "/opt",
+        "Executables (sdrangel sdrangel.exe *);;All files (*)"
+    )
+    if path:
+        self._sdrangel_exe_edit.setText(path)
+
+
+def on_sdrangel_apply_clicked(self):
+    """Apply SDRangel connection settings: save to QSettings and recreate the clients."""
+    from .visualizer import _SETTINGS
+
+    host       = self._sdrangel_host_edit.text().strip() or 'localhost'
+    rest_port  = self._sdrangel_rest_port_spin.value()
+    udp_port   = self._sdrangel_udp_port_spin.value()
+    device_set = self._sdrangel_dev_set_spin.value()
+    lo_offset  = self._sdrangel_lo_offset_spin.value()
+    exe_path   = self._sdrangel_exe_edit.text().strip()
+    dev_rate   = int(self._sdrangel_dev_rate_spin.value() * 1e6)
+    gain_db    = self._sdrangel_gain_spin.value()
+    rx_scale   = self._sdrangel_rx_scale_spin.value()
+
+    _SETTINGS.setValue('sdrangel_host',              host)
+    _SETTINGS.setValue('sdrangel_rest_port',         rest_port)
+    _SETTINGS.setValue('sdrangel_udp_port',          udp_port)
+    _SETTINGS.setValue('sdrangel_device_set',        device_set)
+    _SETTINGS.setValue('sdrangel_lo_offset_khz',     lo_offset)
+    _SETTINGS.setValue('sdrangel_exe',               exe_path)
+    _SETTINGS.setValue('sdrangel_dev_sample_rate',   dev_rate)
+    _SETTINGS.setValue('sdrangel_gain_db',           gain_db)
+    _SETTINGS.setValue('sdrangel_rx_scale',          rx_scale)
+
+    # Stop only the UDP recv threads — do NOT terminate SDRangel itself.
+    # _stop_sdrangel_source (which kills the process) is only for switching
+    # to a different source type.  Here we just release the UDP sockets so
+    # the new clients can bind to the same ports, then let the drain loop
+    # call _start_sdrangel_source to reconnect with the updated settings.
+    for _sc in (getattr(self, 'sdrangel_client', None),
+                getattr(self, 'sdrangel_client_v', None)):
+        if _sc is not None:
+            try:
+                _sc.stop()
+            except Exception:
+                pass
+    self.sdrangel_client   = None
+    self.sdrangel_client_v = None
+    self._sdrangel_started = False   # force drain loop to call _start_sdrangel_source
+
+    try:
+        from .sdrangel_source import SDRAngelSource
+        self.sdrangel_client = SDRAngelSource(
+            host             = host,
+            rest_port        = rest_port,
+            udp_port         = udp_port,
+            device_set       = device_set,
+            calling_freq_mhz = self.calling_freq_mhz,
+            lo_offset_khz    = lo_offset,
+            target_rate      = self.sample_rate,
+            exe_path         = exe_path or None,
+            dev_sample_rate  = dev_rate,
+            gain_db          = gain_db,
+            stream_index     = 0,
+            rx_scale         = rx_scale if rx_scale > 0 else None,
+        )
+        _udp_port_v = udp_port - 1
+        _dev_set_v  = device_set + 1
+        self.sdrangel_client_v = SDRAngelSource(
+            host             = host,
+            rest_port        = rest_port,
+            udp_port         = _udp_port_v,
+            device_set       = _dev_set_v,
+            calling_freq_mhz = self.calling_freq_mhz,
+            lo_offset_khz    = lo_offset,
+            target_rate      = self.sample_rate,
+            exe_path         = exe_path or None,
+            dev_sample_rate  = dev_rate,
+            gain_db          = gain_db,
+            stream_index     = 1,
+            rx_scale         = rx_scale if rx_scale > 0 else None,
+        )
+        print("[sdrangel] H+V clients recreated with new settings", flush=True)
+    except Exception as exc:
+        print(f"[sdrangel] client recreation failed: {exc}", flush=True)
+        self.sdrangel_client   = None
+        self.sdrangel_client_v = None
+
+
+def _sdrangel_probe_state(self):
+    """Query SDRangel REST API and update the configuration snapshot text panel."""
+    sc = getattr(self, 'sdrangel_client', None)
+    if sc is None:
+        txt = getattr(self, '_sdrangel_state_text', None)
+        if txt:
+            txt.setPlainText("No client — select SDRangel source first.")
+        return
+    # Runs on the Qt thread; probe_full_state makes a few REST calls (~100 ms).
+    text = sc.probe_full_state()
+    txt  = getattr(self, '_sdrangel_state_text', None)
+    if txt:
+        txt.setPlainText(text)
+
+
+def _sdrangel_save_layout(self):
+    """Save SDRangel's current window layout for use on next restart.
+
+    SDRangel only writes window positions to its config file when it exits.
+    This function quits SDRangel gracefully (so it flushes geometry), copies
+    the config file, then sets the flag so MAP144 relaunches SDRangel with the
+    saved layout.  Data flow resumes automatically after relaunch.
+    """
+    import os
+    from .sdrangel_source import _terminate_sdrangel, _save_sdrangel_layout
+
+    _setlbl(self, "_sdrangel_layout_status_val", "Saving — quitting SDRangel…")
+
+    import map144_app.sdrangel_source as _ss
+    _proc = _ss._sdrangel_proc
+    print(f"[sdrangel] save_layout: _sdrangel_proc={_proc}  pid={getattr(_proc,'pid',None)}",
+          flush=True)
+
+    # Stop UDP recv threads so sockets are free for the relaunch.
+    for _sc in (getattr(self, 'sdrangel_client', None),
+                getattr(self, 'sdrangel_client_v', None)):
+        if _sc is not None:
+            try:
+                _sc.stop()
+            except Exception:
+                pass
+
+    # Gracefully quit SDRangel — it writes geometry to its conf on exit.
+    sc = getattr(self, 'sdrangel_client', None)
+    print(f"[sdrangel] save_layout: sdrangel_client={sc}", flush=True)
+    if sc is not None:
+        _terminate_sdrangel(sc.host, sc.rest_port)
+    else:
+        if _proc is not None:
+            _terminate_sdrangel('localhost', 8091)
+        else:
+            print("[sdrangel] save_layout: no proc and no client — cannot quit SDRangel",
+                  flush=True)
+
+    import time as _time
+    _time.sleep(0.5)  # brief pause to let SDRangel finish writing conf
+
+    # Check conf file timestamp before copy.
+    _conf = _ss._sdrangel_conf_live_path()
+    print(f"[sdrangel] save_layout: conf={_conf}  exists={os.path.isfile(_conf or '')}",
+          flush=True)
+    if _conf:
+        import time as _t
+        print(f"[sdrangel] save_layout: conf mtime={_t.ctime(os.path.getmtime(_conf))}",
+              flush=True)
+
+    # Copy the now-flushed conf file.
+    _save_sdrangel_layout()
+    dst = os.path.expanduser('~/.config/map144/sdrangel_layout.conf')
+    if os.path.isfile(dst):
+        print(f"[sdrangel] Layout saved → {dst}", flush=True)
+        _setlbl(self, "_sdrangel_layout_status_val", "Saved — SDRangel relaunching…")
+    else:
+        _setlbl(self, "_sdrangel_layout_status_val", "Save failed — check log")
+        return
+
+    # Recreate clients and let the drain loop relaunch SDRangel.
+    self.sdrangel_client   = None
+    self.sdrangel_client_v = None
+    self._sdrangel_started = False
+    from .runtime import _connect_sdrangel_client
+    _connect_sdrangel_client(self)
+
+
+def _sdrangel_configure_udp_sink(self):
+    """Call configure_udp_sink on the active SDRangel client(s)."""
+    sc   = getattr(self, 'sdrangel_client',   None)
+    sc_v = getattr(self, 'sdrangel_client_v', None)
+    if sc is None:
+        print("[sdrangel] No client — cannot configure UDP Sink", flush=True)
+        return
+    try:
+        sc.configure_udp_sink()
+        print("[sdrangel] UDP Sink (H) configured", flush=True)
+    except Exception as exc:
+        print(f"[sdrangel] configure_udp_sink (H) error: {exc}", flush=True)
+    if sc_v is not None:
+        try:
+            sc_v.configure_udp_sink()
+            print("[sdrangel] UDP Sink (V) configured", flush=True)
+        except Exception as exc:
+            print(f"[sdrangel] configure_udp_sink (V) error: {exc}", flush=True)
+
+
+def _sdrangel_setup_ssb_service(self):
+    """Find/create SSBDemod + virtual audio devices for WSJT-X."""
+    from .runtime import _sdrangel_ensure_ssb_service
+    result = _sdrangel_ensure_ssb_service(self)
+    parts = []
+    if result.get('audio_h'):
+        parts.append(f"H→'{result['audio_h']}'")
+    if result.get('audio_v'):
+        parts.append(f"V→'{result['audio_v']}'")
+    msg = "SSB service: " + (", ".join(parts) if parts else "configured (no virtual audio)")
+    _setlbl(self, '_sdrangel_ssb_status_val', msg)
+    # Colour the status green if at least one sink was created.
+    lbl = getattr(self, '_sdrangel_ssb_status_val', None)
+    if lbl is not None:
+        color = "#1a6b1a" if parts else "#8a3a00"
+        lbl.setStyleSheet(f"QLabel {{ color: {color}; font-family: monospace; }}")
+
+
+def _update_sdrangel_window(self, sig_str, noise_str, rate_str, drops_str):
+    import time as _time
+    sc   = getattr(self, 'sdrangel_client',   None)
+    sc_v = getattr(self, 'sdrangel_client_v', None)
+    is_dual = sc_v is not None and getattr(self, 'dual_pol', False)
+
+    hw = sc.device_hw_type if sc is not None else "—"
+    _setlbl(self, '_sdrangel_hw_type_val', hw)
+
+    if hasattr(self, '_sdrangel_freq_val'):
+        if sc is not None:
+            self._sdrangel_freq_val.setText(f"{sc.center_freq_mhz_actual:.6f} MHz")
+        else:
+            self._sdrangel_freq_val.setText("—")
+
+    _setlbl(self, '_sdrangel_dualpol_val',
+            "Yes (H+V)" if is_dual else ("Yes (V offline)" if sc_v is not None else "No"))
+
+    # Use source-level drop count rather than the generic pipeline drop counter.
+    _drop_str = f"{sc.drop_count}" if sc is not None else "—"
+    _set_stream_vals(self, "_sdrangel", rate_str, sig_str, noise_str, _drop_str)
+    _set_queue_label(self, '_sdrangel_queue_val', sc.sample_queue if sc is not None else None)
+
+    now = _time.monotonic()
+    cur_count  = getattr(sc, 'recv_count', 0) if sc is not None else 0
+    prev_count = getattr(self, '_sdrangel_prev_recv_count', cur_count)
+    prev_time  = getattr(self, '_sdrangel_prev_recv_time',  now)
+    dt = now - prev_time
+    if dt >= 0.5:
+        pps = (cur_count - prev_count) / dt if dt > 0 else 0.0
+        self._sdrangel_prev_recv_count = cur_count
+        self._sdrangel_prev_recv_time  = now
+        _setlbl(self, '_sdrangel_pkt_rate_val',
+                f"{pps:.0f} pkt/s" if pps > 0 else ("— pkt/s" if sc is not None else "—"))
+    elif not hasattr(self, '_sdrangel_prev_recv_count'):
+        self._sdrangel_prev_recv_count = cur_count
+        self._sdrangel_prev_recv_time  = now
+        _setlbl(self, '_sdrangel_pkt_rate_val', "—")
+
+    # RF 0 (H) signal levels — use the shared IQ magnitude buffer.
+    _ndb = _noise_floor_db(self)
+    _peak_raw_db   = _compute_peak_db(self, '_td_mag_buf_raw')
+    _peak_clean_db = _compute_peak_db(self, '_td_mag_buf')
+    _peak_raw_str, _pr_color = _compute_peak_dbfs(self, '_td_mag_buf_raw')
+    _peak_clean_str, _pc_color = _compute_peak_dbfs(self, '_td_mag_buf')
+    _, noise_str_h = _compute_dbfs(self)
+    _setlbl(self, '_sdrangel_noise_dbfs_h_val', noise_str_h)
+    lbl = getattr(self, '_sdrangel_peak_raw_h_val', None)
+    if lbl is not None:
+        lbl.setText(_peak_raw_str); lbl.setStyleSheet(
+            f"QLabel {{ color: {_pr_color}; font-family: monospace; }}")
+    lbl = getattr(self, '_sdrangel_peak_clean_h_val', None)
+    if lbl is not None:
+        lbl.setText(_peak_clean_str); lbl.setStyleSheet(
+            f"QLabel {{ color: {_pc_color}; font-family: monospace; }}")
+    bar = getattr(self, '_sdrangel_blanker_bar', None)
+    if bar is not None:
+        bar.update_values(_ndb, _peak_clean_db, _peak_raw_db)
+
+    # RF 1 (V) signal levels — show group when dual-pol active.
+    rf1_grp = getattr(self, '_sdrangel_rf1_grp', None)
+    if rf1_grp is not None:
+        if is_dual and rf1_grp.isHidden():
+            rf1_grp.show()
+        elif not is_dual and not rf1_grp.isHidden():
+            rf1_grp.hide()
+    if is_dual:
+        _peak_raw_v_db   = _compute_peak_db(self, '_td_mag_buf_raw_v')
+        _peak_clean_v_db = _compute_peak_db(self, '_td_mag_buf_v')
+        _peak_raw_v_str, _prv_color = _compute_peak_dbfs(self, '_td_mag_buf_raw_v')
+        _peak_clean_v_str, _pcv_color = _compute_peak_dbfs(self, '_td_mag_buf_v')
+        _ndb_v = _noise_floor_db(self, channel='v')
+        _, noise_str_v = _compute_dbfs(self, channel='v')
+        _setlbl(self, '_sdrangel_noise_dbfs_v_val', noise_str_v)
+        lbl = getattr(self, '_sdrangel_peak_raw_v_val', None)
+        if lbl is not None:
+            lbl.setText(_peak_raw_v_str); lbl.setStyleSheet(
+                f"QLabel {{ color: {_prv_color}; font-family: monospace; }}")
+        lbl = getattr(self, '_sdrangel_peak_clean_v_val', None)
+        if lbl is not None:
+            lbl.setText(_peak_clean_v_str); lbl.setStyleSheet(
+                f"QLabel {{ color: {_pcv_color}; font-family: monospace; }}")
+        bar_v = getattr(self, '_sdrangel_blanker_bar_v', None)
+        if bar_v is not None:
+            bar_v.update_values(_ndb_v, _peak_clean_v_db, _peak_raw_v_db)
+
+
 # ── USRP live control handlers ────────────────────────────────────────────────
 
 def on_usrp_gain_changed(self, value):
     from .visualizer import _SETTINGS
+    from .processing  import reset_detection_baseline
     self._usrp_gain_db = float(value)
     if hasattr(self, '_usrp_gain_label'):
         self._usrp_gain_label.setText(f"{value:.0f} dB")
@@ -822,10 +1403,14 @@ def on_usrp_gain_changed(self, value):
             uc._usrp.set_rx_gain(float(value), 0)
         except Exception:
             pass
+    # A gain change shifts every channel's power; the percentile baseline
+    # lags ~7 s and would false-trigger the sustained-signal lockout.
+    reset_detection_baseline(self)
 
 
 def on_usrp_antenna_changed(self, text):
     from .visualizer import _SETTINGS
+    from .processing  import reset_detection_baseline
     _SETTINGS.setValue('usrp_antenna', text)
     uc = getattr(self, 'usrp_client', None)
     if uc is not None and getattr(uc, '_usrp', None) is not None:
@@ -834,11 +1419,13 @@ def on_usrp_antenna_changed(self, text):
             uc.antenna = text
         except Exception:
             pass
+    reset_detection_baseline(self)
 
 
 
 def on_usrp_antenna_ch1_changed(self, text):
     from .visualizer import _SETTINGS
+    from .processing  import reset_detection_baseline
     _SETTINGS.setValue('usrp_antenna_ch1', text)
     uc = getattr(self, 'usrp_client', None)
     if uc is not None and getattr(uc, '_usrp', None) is not None and getattr(uc, 'dual_channel', False):
@@ -846,10 +1433,12 @@ def on_usrp_antenna_ch1_changed(self, text):
             uc._usrp.set_rx_antenna(text, 1)
         except Exception:
             pass
+    reset_detection_baseline(self)
 
 
 def on_usrp_gain_ch1_changed(self, value):
     from .visualizer import _SETTINGS
+    from .processing  import reset_detection_baseline
     self._usrp_gain_db_ch1 = float(value)
     if hasattr(self, '_usrp_gain_label_ch1'):
         self._usrp_gain_label_ch1.setText(f"{value:.0f} dB")
@@ -860,16 +1449,18 @@ def on_usrp_gain_ch1_changed(self, value):
             uc._usrp.set_rx_gain(float(value), 1)
         except Exception:
             pass
+    reset_detection_baseline(self)
 
 
 # ── Auto show/hide radio windows on source change ─────────────────────────────
 
-_RADIO_WINDOWS = ('_flex_win', '_usrp_win', '_airspy_win', '_rtlsdr_win')
+_RADIO_WINDOWS = ('_flex_win', '_usrp_win', '_airspy_win', '_rtlsdr_win', '_sdrangel_win')
 _SOURCE_WINDOW  = {
-    'radio':  '_flex_win',
-    'usrp':   '_usrp_win',
-    'airspy': '_airspy_win',
-    'rtlsdr': '_rtlsdr_win',
+    'radio':    '_flex_win',
+    'usrp':     '_usrp_win',
+    'airspy':   '_airspy_win',
+    'rtlsdr':   '_rtlsdr_win',
+    'sdrangel': '_sdrangel_win',
 }
 
 
@@ -903,7 +1494,7 @@ def show_source_window(self, source_mode):
 
 def update_source_windows(self):
     """Update all visible source windows. Called from update_displays at 10 Hz."""
-    sig_str, noise_str = _compute_dbfs(self)
+    sig_str, noise_str = _compute_dbfs(self, channel='h')
     rate_str  = f"{self.sample_rate / 1000:.0f} kHz"
     drops_str = "—"   # per-source drop tracking not yet implemented for SDR sources
 
@@ -923,8 +1514,10 @@ def update_source_windows(self):
         _update_usrp_window(self, sig_str, noise_str, rate_str, drops_str)
     if getattr(self, '_airspy_win', None) is not None and self._airspy_win.isVisible():
         _update_airspy_window(self, sig_str, noise_str, rate_str, drops_str)
-    if getattr(self, '_rtlsdr_win', None) is not None and self._rtlsdr_win.isVisible():
+    if getattr(self, '_rtlsdr_win',    None) is not None and self._rtlsdr_win.isVisible():
         _update_rtlsdr_window(self, sig_str, noise_str, rate_str, drops_str)
+    if getattr(self, '_sdrangel_win', None) is not None and self._sdrangel_win.isVisible():
+        _update_sdrangel_window(self, sig_str, noise_str, rate_str, drops_str)
 
 
 def _update_iq_nb_window(self):
@@ -965,15 +1558,21 @@ def _update_iq_nb_window(self):
         display, span_n = _td_display(self._td_mag_buf, self._td_mag_pos)
         x_axis = np.linspace(0.0, span_ms, span_n, endpoint=False)
         self.td_plot.setXRange(0.0, span_ms, padding=0)
+        if hasattr(self, 'td_curve_raw'):
+            raw_display, _ = _td_display(self._td_mag_buf_raw, self._td_mag_pos_raw)
+            self.td_curve_raw.setData(x_axis, raw_display)
         self.td_curve.setData(x_axis, display)
 
-        nb_floor = getattr(self, '_nb_floor', None)
-        if nb_floor is not None:
-            nb_k = float(getattr(self, 'nb_factor', 6))
-            thresh = nb_k * float(nb_floor)
-            self.td_thresh_line.setValue(thresh)
-            if _dual and hasattr(self, 'td_thresh_line_v'):
-                self.td_thresh_line_v.setValue(thresh)
+        nb_floor_h = getattr(self, '_nb_floor', None)
+        if nb_floor_h is not None:
+            nb_k_h = float(getattr(self, 'nb_factor', 6))
+            self.td_thresh_line.setValue(nb_k_h * float(nb_floor_h))
+        if _dual and hasattr(self, 'td_thresh_line_v'):
+            nb_floor_v = getattr(self, '_nb_floor_v', None) or nb_floor_h
+            if nb_floor_v is not None:
+                nb_k_v = float(getattr(self, 'nb_factor_v',
+                                       getattr(self, 'nb_factor', 6)))
+                self.td_thresh_line_v.setValue(nb_k_v * float(nb_floor_v))
 
         if _dual and hasattr(self, 'td_curve_v'):
             display_v, span_n_v = _td_display(self._td_mag_buf_v, self._td_mag_pos_v)
@@ -982,6 +1581,9 @@ def _update_iq_nb_window(self):
             else:
                 x_axis_v = x_axis
             self.td_plot_v.setXRange(0.0, span_ms, padding=0)
+            if hasattr(self, 'td_curve_raw_v'):
+                raw_display_v, _ = _td_display(self._td_mag_buf_raw_v, self._td_mag_pos_raw_v)
+                self.td_curve_raw_v.setData(x_axis_v, raw_display_v)
             self.td_curve_v.setData(x_axis_v, display_v)
 
         _td_ruler = getattr(self, 'td_ruler', None)
@@ -994,10 +1596,11 @@ def _update_iq_nb_window(self):
     # showed up as 32% of wall time in the profiler during noise pulse events.
     if hasattr(self, 'nb_floor_curve') and self._noise_floor_ctr % 5 == 0:
         nb_k  = float(getattr(self, 'nb_factor', 6.0))
-        ref   = 20.0 * np.log10(NB_FFT_SIZE)
+        ref   = 10.0 * np.log10(NB_FFT_SIZE)   # 10*log10(N): normalises per-bin power to dBFS
         _freqs = np.fft.fftshift(np.fft.fftfreq(NB_FFT_SIZE, 1.0 / 48000)) / 1000.0
 
-        def _update_nb_curves(spec_avg, last_P, floor_c, block_c, thresh_c):
+        def _update_nb_curves(spec_avg, last_P, last_blanked_P,
+                              floor_c, blanked_c, block_c, thresh_c):
             if spec_avg is not None:
                 floor_db = np.fft.fftshift(
                     10.0 * np.log10(np.maximum(spec_avg, 1e-30)) - ref
@@ -1009,19 +1612,38 @@ def _update_iq_nb_window(self):
                     10.0 * np.log10(np.maximum(last_P, 1e-30)) - ref
                 ).astype(np.float32)
                 block_c.setData(_freqs, block_db)
+            if last_blanked_P is not None:
+                blanked_db = np.fft.fftshift(
+                    10.0 * np.log10(np.maximum(last_blanked_P, 1e-30)) - ref
+                ).astype(np.float32)
+                blanked_c.setData(_freqs, blanked_db)
 
         _update_nb_curves(
             getattr(self, '_nb_spec_avg', None), getattr(self, '_nb_last_P', None),
-            self.nb_floor_curve, self.nb_block_curve, self.nb_thresh_curve,
+            getattr(self, '_nb_last_blanked_P', None),
+            self.nb_floor_curve, self.nb_blanked_curve,
+            self.nb_block_curve, self.nb_thresh_curve,
         )
         if _dual and hasattr(self, 'nb_floor_curve_v'):
             _update_nb_curves(
                 getattr(self, '_nb_spec_avg_v', None), getattr(self, '_nb_last_P_v', None),
-                self.nb_floor_curve_v, self.nb_block_curve_v, self.nb_thresh_curve_v,
+                getattr(self, '_nb_last_blanked_P_v', None),
+                self.nb_floor_curve_v, self.nb_blanked_curve_v,
+                self.nb_block_curve_v, self.nb_thresh_curve_v,
             )
 
-    # Status row
+    # Status row.  Decay the blanker counters when they grow past ~5 s of
+    # samples so the displayed "% blanked" reflects recent behaviour
+    # (responds quickly to K/gain changes) instead of the session-wide
+    # average.  Halving both total and blanked preserves the ratio but
+    # caps the effective window — new samples then weigh ~equally with
+    # past ~5 s worth, so tweaks become visible within a second or two.
     if hasattr(self, '_nb_count_val'):
+        _rate = float(getattr(self, 'sample_rate', 48000)) or 48000.0
+        _window_n = int(5.0 * _rate) * (2 if getattr(self, 'dual_pol', False) else 1)
+        if getattr(self, '_nb_total_count', 0) > _window_n:
+            self._nb_total_count   //= 2
+            self._nb_blanked_count //= 2
         _nb_t = getattr(self, '_nb_total_count', 0)
         _nb_b = getattr(self, '_nb_blanked_count', 0)
         _nb_pct = (100.0 * _nb_b / _nb_t) if _nb_t > 0 else 0.0
@@ -1209,6 +1831,10 @@ def _update_flex_window(self, sig_str, noise_str, rate_str, drops_str):
 
 def _update_usrp_window(self, sig_str, noise_str, rate_str, drops_str):
     import time as _time
+    # Per-channel noise floor text — V channel has its own _nb_floor_v
+    # since Tier 2.  Computed here so the caller doesn't need to know
+    # about V-channel plumbing.
+    _, noise_str_v = _compute_dbfs(self, channel='v')
     uc = getattr(self, 'usrp_client', None)
     if hasattr(self, '_usrp_freq_val'):
         freq = uc.center_freq_mhz_actual if uc is not None else self.center_freq_mhz
@@ -1262,9 +1888,10 @@ def _update_usrp_window(self, sig_str, noise_str, rate_str, drops_str):
 
     # Signal: use recv-loop RMS directly — reliable regardless of whether
     # process_iq_data is consuming the queue.
-    # Noise floor: from noise blanker envelope on ch0 (ch1 stub pending).
-    _setlbl(self, '_usrp_noise_dbfs_val',      noise_str)
-    _setlbl(self, '_usrp_noise_dbfs_ch1_val', noise_str)
+    # Noise floor: per-channel, now that Linrad/NR0V maintain independent
+    # _nb_floor and _nb_floor_v estimates.
+    _setlbl(self, '_usrp_noise_dbfs_val',     noise_str)
+    _setlbl(self, '_usrp_noise_dbfs_ch1_val', noise_str_v)
     for _attr, _buf in (
         ('_usrp_peak_raw_dbfs_val',     '_td_mag_buf_raw'),    # pre-blanker H
         ('_usrp_peak_dbfs_val',         '_td_mag_buf'),         # post-blanker H
@@ -1277,15 +1904,15 @@ def _update_usrp_window(self, sig_str, noise_str, rate_str, drops_str):
         if _lbl is not None:
             _lbl.setStyleSheet(f"QLabel {{ color: {_pc}; font-family: monospace; }}")
 
-    # Stacked bar: noise floor / peak-clean / peak-raw
-    _ndb = _noise_floor_db(self)
-    for _bar_attr, _buf_clean, _buf_raw in (
-        ('_usrp_blanker_bar',     '_td_mag_buf',   '_td_mag_buf_raw'),
-        ('_usrp_blanker_bar_ch1', '_td_mag_buf_v', '_td_mag_buf_raw_v'),
+    # Stacked bar: noise floor / peak-clean / peak-raw — per-channel floor.
+    for _bar_attr, _buf_clean, _buf_raw, _ch in (
+        ('_usrp_blanker_bar',     '_td_mag_buf',   '_td_mag_buf_raw',   'h'),
+        ('_usrp_blanker_bar_ch1', '_td_mag_buf_v', '_td_mag_buf_raw_v', 'v'),
     ):
         _bar = getattr(self, _bar_attr, None)
         if _bar is not None:
-            _bar.update_values(_ndb, _compute_peak_db(self, _buf_clean),
+            _bar.update_values(_noise_floor_db(self, channel=_ch),
+                               _compute_peak_db(self, _buf_clean),
                                _compute_peak_db(self, _buf_raw))
 
     # Actual gain readback from hardware (once per second — every 10 update cycles)

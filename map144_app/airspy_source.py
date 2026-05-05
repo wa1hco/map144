@@ -269,6 +269,18 @@ class AirspyHFSource:
             self._dev = ctypes.c_void_p(None)
         self._cb_ref = None
 
+    def retune(self, center_freq_mhz: float):
+        """Retune to a new center frequency while streaming."""
+        self.center_freq_mhz = center_freq_mhz
+        if not self._dev:
+            return
+        ret = _lib.airspyhf_set_freq_double(self._dev, ctypes.c_double(center_freq_mhz * 1e6))
+        if ret != 0:
+            print(f"[airspy] retune to {center_freq_mhz:.4f} MHz failed: {ret}", flush=True)
+            return
+        self.center_freq_mhz_actual = center_freq_mhz
+        print(f"[airspy] retuned to {center_freq_mhz:.4f} MHz", flush=True)
+
     # ── Internal callback (called from libairspyhf thread) ────────────────
 
     def _callback(self, transfer_ptr) -> int:

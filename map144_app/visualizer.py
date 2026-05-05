@@ -25,7 +25,11 @@ from .ui import (
     on_max_level_changed,
     on_detect_min_level_changed,
     on_detect_max_level_changed,
+    on_sync_detect_min_level_changed,
+    on_sync_detect_max_level_changed,
     on_nb_factor_changed,
+    on_nb_factor_v_changed,
+    on_nb_backend_changed,
     on_td_scale_changed,
     on_td_span_changed,
     on_select_source_radio,
@@ -33,6 +37,9 @@ from .ui import (
     on_select_source_airspy,
     on_select_source_rtlsdr,
     on_select_source_usrp,
+    on_select_source_sdrangel,
+    on_band_changed,
+    _retune_active_source,
     _on_about,
     _on_fast_graph_click,
     _open_analysis_window,
@@ -40,7 +47,10 @@ from .ui import (
     _on_browse_captures,
 )
 from .source_windows import on_usrp_gain_changed, on_usrp_antenna_changed, on_usrp_gain_ch1_changed, on_usrp_antenna_ch1_changed
-from .runtime import setup_radio_client, _connect_radio_client, run_radio_source, _get_tuned_frequency_mhz, closeEvent
+from .runtime import (setup_radio_client, _connect_radio_client, run_radio_source,
+                      _get_tuned_frequency_mhz, closeEvent,
+                      _connect_sdrangel_client, _start_sdrangel_source, _stop_sdrangel_source,
+                      _sdrangel_ensure_ssb_service)
 from .processing import N_SNR_HIST, CH_DETECT_SIZE, _METRIC_HIST_DEPTH
 from .displays import update_displays
 
@@ -53,14 +63,21 @@ class MAP144Visualizer(Engine, QtWidgets.QMainWindow):
     on_max_level_changed = on_max_level_changed
     on_detect_min_level_changed = on_detect_min_level_changed
     on_detect_max_level_changed = on_detect_max_level_changed
+    on_sync_detect_min_level_changed = on_sync_detect_min_level_changed
+    on_sync_detect_max_level_changed = on_sync_detect_max_level_changed
     on_nb_factor_changed = on_nb_factor_changed
+    on_nb_factor_v_changed = on_nb_factor_v_changed
+    on_nb_backend_changed = on_nb_backend_changed
     on_td_scale_changed = on_td_scale_changed
     on_td_span_changed  = on_td_span_changed
     on_select_source_radio = on_select_source_radio
     on_select_source_wav = on_select_source_wav
     on_select_source_airspy = on_select_source_airspy
     on_select_source_rtlsdr = on_select_source_rtlsdr
-    on_select_source_usrp = on_select_source_usrp
+    on_select_source_usrp     = on_select_source_usrp
+    on_select_source_sdrangel = on_select_source_sdrangel
+    on_band_changed           = on_band_changed
+    _retune_active_source = _retune_active_source
     _on_about             = _on_about
     _on_fast_graph_click  = _on_fast_graph_click
     _open_analysis_window = _open_analysis_window
@@ -70,9 +87,13 @@ class MAP144Visualizer(Engine, QtWidgets.QMainWindow):
     on_usrp_antenna_changed  = on_usrp_antenna_changed
     on_usrp_gain_ch1_changed     = on_usrp_gain_ch1_changed
     on_usrp_antenna_ch1_changed  = on_usrp_antenna_ch1_changed
-    setup_radio_client = setup_radio_client
-    _connect_radio_client = _connect_radio_client
-    run_radio_source = run_radio_source
+    setup_radio_client        = setup_radio_client
+    _connect_radio_client     = _connect_radio_client
+    _connect_sdrangel_client      = _connect_sdrangel_client
+    _start_sdrangel_source        = _start_sdrangel_source
+    _stop_sdrangel_source         = _stop_sdrangel_source
+    _sdrangel_ensure_ssb_service  = _sdrangel_ensure_ssb_service
+    run_radio_source          = run_radio_source
     _get_tuned_frequency_mhz = _get_tuned_frequency_mhz
     update_displays = update_displays
     closeEvent = closeEvent
@@ -80,18 +101,28 @@ class MAP144Visualizer(Engine, QtWidgets.QMainWindow):
     def __init__(self, center_freq_mhz=50.260, sample_rate=48000, fft_size=2048,
                  bind_client_id=None, bind_client_handle=None):
         QtWidgets.QMainWindow.__init__(self)
-        Engine.__init__(self, center_freq_mhz=center_freq_mhz, sample_rate=sample_rate,
-                        fft_size=fft_size,
+        try:
+            _saved_freq = float(_SETTINGS.value('calling_freq_mhz', center_freq_mhz))
+        except (ValueError, TypeError):
+            _saved_freq = center_freq_mhz
+        Engine.__init__(self, center_freq_mhz=_saved_freq, calling_freq_mhz=_saved_freq,
+                        sample_rate=sample_rate, fft_size=fft_size,
                         bind_client_id=bind_client_id or bind_client_handle)
 
         self.min_level = int(_SETTINGS.value('min_level', -90))
         self.max_level = int(_SETTINGS.value('max_level', -30))
         self.detect_min_level = float(_SETTINGS.value('detect_min_level_f', -5.0))
         self.detect_max_level = float(_SETTINGS.value('detect_max_level_f', 20.0))
+        self.sync_detect_min_level = float(_SETTINGS.value('sync_detect_min_level_f', -5.0))
+        self.sync_detect_max_level = float(_SETTINGS.value('sync_detect_max_level_f', 20.0))
         try:
             self.nb_factor = float(_SETTINGS.value('nb_factor', 6.0))
         except (ValueError, TypeError):
             self.nb_factor = 6.0
+        try:
+            self.nb_factor_v = float(_SETTINGS.value('nb_factor_v', self.nb_factor))
+        except (ValueError, TypeError):
+            self.nb_factor_v = self.nb_factor
 
         print(f"Center requested: {self.center_freq_mhz:.6f} MHz", flush=True)
 

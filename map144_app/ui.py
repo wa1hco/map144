@@ -48,6 +48,19 @@ import pyqtgraph as pg
 
 from .widgets import ClickableImageItem
 
+# MSK144 calling frequencies (US convention) and compatible source modes.
+# All frequencies are North American (US) convention per WSJT-X defaults.
+# Airspy HF+ tops out at ~31 MHz so it appears in no entry here.
+# Flex Radio follows the panadapter and is limited to its hardware band plan
+# (used exclusively for 6m in this installation).
+MSK144_BANDS = [
+    # (display label,    freq MHz,  compatible source_mode values)
+    ("6m   50.260 MHz",   50.260, {'usrp', 'rtlsdr', 'radio', 'sdrangel'}),
+    ("2m  144.150 MHz",  144.150, {'usrp', 'rtlsdr', 'sdrangel'}),
+    ("1¼m 222.090 MHz",  222.090, {'usrp', 'rtlsdr', 'sdrangel'}),
+    ("70cm 432.360 MHz", 432.360, {'usrp', 'rtlsdr', 'sdrangel'}),
+]
+
 
 def _get_version_string():
     """Return a version string from git: hash, date, and subject line."""
@@ -106,7 +119,7 @@ def setup_ui(self):
     from .visualizer import _SETTINGS
     from .source_windows import (
         setup_iq_nb_window, setup_flex_window, setup_usrp_window,
-        setup_airspy_window, setup_rtlsdr_window,
+        setup_airspy_window, setup_rtlsdr_window, setup_sdrangel_window,
     )
     from .reporting_window import setup_reporting_window
     from .screenshot_window import setup_screenshot_window
@@ -156,6 +169,12 @@ def setup_ui(self):
     self.source_action_group.addAction(self.source_rtlsdr_action)
     file_menu.addAction(self.source_rtlsdr_action)
 
+    self.source_sdrangel_action = QtWidgets.QAction("SDRangel", self)
+    self.source_sdrangel_action.setCheckable(True)
+    self.source_sdrangel_action.triggered.connect(self.on_select_source_sdrangel)
+    self.source_action_group.addAction(self.source_sdrangel_action)
+    file_menu.addAction(self.source_sdrangel_action)
+
     self.source_wav_action = QtWidgets.QAction("WAV File", self)
     self.source_wav_action.setCheckable(True)
     self.source_wav_action.triggered.connect(self.on_select_source_wav)
@@ -176,19 +195,45 @@ def setup_ui(self):
 
     fg_action          = QtWidgets.QAction("Fast Graph",          self)
     det_action         = QtWidgets.QAction("Tone Detection SNR",   self)
-    iq_nb_action       = QtWidgets.QAction("IQ / Noise Blanker",  self)
+    sync_det_action    = QtWidgets.QAction("Sync Detection",       self)
+    iq_nb_action       = QtWidgets.QAction("Noise Blanker",  self)
     reporting_action   = QtWidgets.QAction("Reporting",            self)
     analysis_action    = QtWidgets.QAction("Analysis",             self)
     flex_action        = QtWidgets.QAction("Flex Radio",           self)
     usrp_action        = QtWidgets.QAction("USRP B210",            self)
     airspy_action      = QtWidgets.QAction("Airspy HF+",           self)
     rtlsdr_action      = QtWidgets.QAction("RTL-SDR",              self)
-    for act in (fg_action, det_action, iq_nb_action, reporting_action,
+    sdrangel_action    = QtWidgets.QAction("SDRangel",             self)
+    for act in (fg_action, det_action, sync_det_action, iq_nb_action, reporting_action,
                 analysis_action,
-                flex_action, usrp_action, airspy_action, rtlsdr_action):
+                flex_action, usrp_action, airspy_action, rtlsdr_action, sdrangel_action):
         act.setCheckable(True)
         act.setChecked(True)
         view_menu.addAction(act)
+
+    # ── Band selector toolbar ─────────────────────────────────────────────────
+    from .visualizer import _SETTINGS as _VS
+    band_toolbar = self.addToolBar("Band")
+    band_toolbar.setMovable(False)
+    band_toolbar.setFloatable(False)
+    band_toolbar.addWidget(QtWidgets.QLabel("  Band: "))
+    self._band_combo = QtWidgets.QComboBox()
+    for _bl, _, _ in MSK144_BANDS:
+        self._band_combo.addItem(_bl)
+    # Restore saved selection (match by frequency)
+    try:
+        _saved_band_freq = float(_VS.value('calling_freq_mhz', 50.260))
+    except (ValueError, TypeError):
+        _saved_band_freq = 50.260
+    _saved_band_idx = next(
+        (i for i, (_, f, _s) in enumerate(MSK144_BANDS) if abs(f - _saved_band_freq) < 0.001),
+        0,
+    )
+    self._band_combo.blockSignals(True)
+    self._band_combo.setCurrentIndex(_saved_band_idx)
+    self._band_combo.blockSignals(False)
+    self._band_combo.currentIndexChanged.connect(self.on_band_changed)
+    band_toolbar.addWidget(self._band_combo)
 
     # ── Colour map (shared by all image items) ────────────────────────────────
     pg.setConfigOptions(antialias=True)
@@ -337,6 +382,61 @@ def setup_ui(self):
         padding=0,
     )
     self.ch_detect_plot_v.hide()
+
+    # ── Coherent sync-correlator detection heatmap (parallel to squared-FFT) ──
+    # Same axes (frequency vertical, time horizontal) and same circle overlay
+    # showing decode progress; the difference is the underlying detector — this
+    # one shows ``_sync_snr_history_*`` (matched-filter sync correlation in dB
+    # above the rolling 25th-percentile baseline).  Lives in its own panel
+    # window so the user can A/B against the existing squared-FFT heatmap.
+    _sync_title = (f"Coherent Sync-Word Detection  (threshold {DETECT_THRESH_DB:.0f} dB above baseline)"
+                   f"   circles: cyan=SPD  green=jt9  red=running  orange=no_decode")
+    self.sync_detect_plot = pg.PlotWidget(title="H — " + _sync_title)
+    self.sync_detect_plot.setLabel('left', 'Dial offset (kHz)')
+    self.sync_detect_plot.setAspectLocked(False)
+    self.sync_detect_img = pg.ImageItem(axisOrder='col-major')
+    self.sync_detect_plot.addItem(self.sync_detect_img)
+    self.sync_detect_img.setColorMap(colormap)
+    self.sync_detect_curve_cyan   = pg.PlotCurveItem(pen=pg.mkPen((0, 220, 220),  width=1.5))
+    self.sync_detect_curve_green  = pg.PlotCurveItem(pen=pg.mkPen('g',            width=1.5))
+    self.sync_detect_curve_red    = pg.PlotCurveItem(pen=pg.mkPen('r',            width=1.5))
+    self.sync_detect_curve_orange = pg.PlotCurveItem(pen=pg.mkPen((255, 140, 0),  width=1.5))
+    self.sync_detect_plot.addItem(self.sync_detect_curve_cyan)
+    self.sync_detect_plot.addItem(self.sync_detect_curve_green)
+    self.sync_detect_plot.addItem(self.sync_detect_curve_red)
+    self.sync_detect_plot.addItem(self.sync_detect_curve_orange)
+    self.sync_detect_plot.setXRange(0, 15.5, padding=0)
+    self.sync_detect_plot.getAxis('bottom').hide()
+    self.sync_detect_plot.setYRange(
+        self._detect_freq_min_khz - 0.5,
+        self._detect_freq_min_khz + self._detect_freq_span_khz + 0.5,
+        padding=0,
+    )
+
+    self.sync_detect_plot_v = pg.PlotWidget(title="V — " + _sync_title)
+    self.sync_detect_plot_v.setLabel('left', 'Dial offset (kHz)')
+    self.sync_detect_plot_v.getAxis('bottom').hide()
+    self.sync_detect_plot_v.setAspectLocked(False)
+    self.sync_detect_img_v = pg.ImageItem(axisOrder='col-major')
+    self.sync_detect_plot_v.addItem(self.sync_detect_img_v)
+    self.sync_detect_img_v.setColorMap(colormap)
+    self.sync_detect_curve_cyan_v   = pg.PlotCurveItem(pen=pg.mkPen((0, 220, 220), width=1.5))
+    self.sync_detect_curve_green_v  = pg.PlotCurveItem(pen=pg.mkPen('g',           width=1.5))
+    self.sync_detect_curve_red_v    = pg.PlotCurveItem(pen=pg.mkPen('r',           width=1.5))
+    self.sync_detect_curve_orange_v = pg.PlotCurveItem(pen=pg.mkPen((255, 140, 0), width=1.5))
+    self.sync_detect_plot_v.addItem(self.sync_detect_curve_cyan_v)
+    self.sync_detect_plot_v.addItem(self.sync_detect_curve_green_v)
+    self.sync_detect_plot_v.addItem(self.sync_detect_curve_red_v)
+    self.sync_detect_plot_v.addItem(self.sync_detect_curve_orange_v)
+    self.sync_detect_plot_v.setXRange(0, 15.5, padding=0)
+    self.sync_detect_plot_v.setYRange(
+        self._detect_freq_min_khz - 0.5,
+        self._detect_freq_min_khz + self._detect_freq_span_khz + 0.5,
+        padding=0,
+    )
+    self.sync_detect_plot_v.hide()
+    self.sync_detect_plot.getViewBox().disableAutoRange()
+
     # Do NOT setXLink here — PyQtGraph's link is bidirectional and would
     # override explicit setXRange calls on realtime_plot.
     self.realtime_plot.getViewBox().disableAutoRange()
@@ -456,6 +556,25 @@ def setup_ui(self):
     det_layout.addWidget(_make_time_ruler())
     det_layout.addWidget(detect_sliders)
 
+    # ── Panel window: Sync-correlator Detection (parallel to tone detection) ──
+    sync_detect_sliders = _make_slider_bar(
+        "Sync Detection Color Scale",
+        "sync_detect_min_level_label",  (-20, 60),  self.sync_detect_min_level,
+        "sync_detect_max_level_label",  (2,  100),  self.sync_detect_max_level,
+        self.on_sync_detect_min_level_changed, self.on_sync_detect_max_level_changed, 10,
+        scale=2,
+    )
+    self._sync_detect_win = _PanelWindow(
+        "MapMSK144 — Coherent Sync Detection", sync_det_action, self, 'sync_detect_geometry')
+    self._sync_detect_win.setMinimumSize(400, 250)
+    sync_det_layout = QtWidgets.QVBoxLayout(self._sync_detect_win)
+    sync_det_layout.setContentsMargins(0, 0, 0, 0)
+    sync_det_layout.setSpacing(0)
+    sync_det_layout.addWidget(self.sync_detect_plot,   stretch=1)
+    sync_det_layout.addWidget(self.sync_detect_plot_v, stretch=1)
+    sync_det_layout.addWidget(_make_time_ruler())
+    sync_det_layout.addWidget(sync_detect_sliders)
+
     # ── Panel windows: source-specific ───────────────────────────────────────
     setup_iq_nb_window(self,      iq_nb_action)
     setup_reporting_window(self,  reporting_action)
@@ -463,6 +582,7 @@ def setup_ui(self):
     setup_usrp_window(self,       usrp_action)
     setup_airspy_window(self,     airspy_action)
     setup_rtlsdr_window(self,     rtlsdr_action)
+    setup_sdrangel_window(self,   sdrangel_action)
     setup_screenshot_window(self, screenshot_action)
 
     # ── Wire View menu actions ────────────────────────────────────────────────
@@ -471,6 +591,9 @@ def setup_ui(self):
     )
     det_action.triggered.connect(
         lambda checked: self._detect_win.show() if checked else self._detect_win.hide()
+    )
+    sync_det_action.triggered.connect(
+        lambda checked: self._sync_detect_win.show() if checked else self._sync_detect_win.hide()
     )
     iq_nb_action.triggered.connect(
         lambda checked: self._iq_nb_win.show() if checked else self._iq_nb_win.hide()
@@ -493,6 +616,9 @@ def setup_ui(self):
     rtlsdr_action.triggered.connect(
         lambda checked: self._rtlsdr_win.show() if checked else self._rtlsdr_win.hide()
     )
+    sdrangel_action.triggered.connect(
+        lambda checked: self._sdrangel_win.show() if checked else self._sdrangel_win.hide()
+    )
     screenshot_action.triggered.connect(
         lambda checked: self._screenshot_win.show() if checked else self._screenshot_win.hide()
     )
@@ -502,12 +628,14 @@ def setup_ui(self):
         (self,                 'window_geometry',     None),
         (self._fast_graph_win, 'fast_graph_geometry', QtCore.QRect(480, 50,  850, 650)),
         (self._detect_win,     'detect_geometry',     QtCore.QRect(480, 710, 850, 350)),
+        (self._sync_detect_win,'sync_detect_geometry',QtCore.QRect(480, 1075,850, 350)),
         (self._iq_nb_win,      'iq_nb_geometry',      QtCore.QRect(50,  870, 380, 420)),
         (self._reporting_win,  'reporting_geometry',  QtCore.QRect(820, 870, 380, 500)),
         (self._flex_win,       'flex_geometry',       QtCore.QRect(450, 870, 360, 500)),
         (self._usrp_win,       'usrp_geometry',       QtCore.QRect(450, 870, 360, 440)),
         (self._airspy_win,     'airspy_geometry',     QtCore.QRect(450, 870, 360, 340)),
         (self._rtlsdr_win,     'rtlsdr_geometry',     QtCore.QRect(450, 870, 360, 340)),
+        (self._sdrangel_win,   'sdrangel_geometry',   QtCore.QRect(450, 100, 360, 400)),
         (self._screenshot_win, 'screenshot_geometry', QtCore.QRect(50,  50,  340, 440)),
     ]
     for win, key, default_rect in _win_settings:
@@ -522,19 +650,22 @@ def setup_ui(self):
     # when a source is selected.
     fg_visible  = _SETTINGS.value('fast_graph_visible', True,  type=bool)
     det_visible = _SETTINGS.value('detect_visible',     True,  type=bool)
+    sync_det_visible = _SETTINGS.value('sync_detect_visible', True, type=bool)
     iq_nb_visible      = _SETTINGS.value('iq_nb_visible',       True,  type=bool)
     reporting_visible  = _SETTINGS.value('reporting_visible',    True,  type=bool)
     fg_action.setChecked(fg_visible)
     det_action.setChecked(det_visible)
+    sync_det_action.setChecked(sync_det_visible)
     iq_nb_action.setChecked(iq_nb_visible)
     reporting_action.setChecked(reporting_visible)
     if fg_visible:         self._fast_graph_win.show()
     if det_visible:        self._detect_win.show()
+    if sync_det_visible:   self._sync_detect_win.show()
     if iq_nb_visible:      self._iq_nb_win.show()
     if reporting_visible:  self._reporting_win.show()
 
     # Radio windows start hidden
-    for win in (self._flex_win, self._usrp_win, self._airspy_win, self._rtlsdr_win):
+    for win in (self._flex_win, self._usrp_win, self._airspy_win, self._rtlsdr_win, self._sdrangel_win):
         win.hide()
         if win._view_action is not None:
             win._view_action.setChecked(False)
@@ -579,17 +710,25 @@ def setup_ui(self):
     # Keep status bar for transient messages only (capture saves, errors, etc.)
     self.statusBar().showMessage('Initializing...')
 
+    # Apply initial band state: enable/disable source menu actions for saved band.
+    self.on_band_changed(_saved_band_idx)
+
     # ── Restore last source mode ──────────────────────────────────────────────
+    # Defer to a singleShot(0) so the event loop runs first: windows paint,
+    # the SIGINT-tickling update_timer ticks, and a slow source connect
+    # (e.g. Flex ~37 s) doesn't freeze the UI or block Ctrl-C.
     _last_mode = _SETTINGS.value('source_mode', 'idle', type=str)
     _last_wav  = _SETTINGS.value('selected_wav_path', '', type=str)
     if _last_mode == 'radio':
-        self.on_select_source_radio()
+        QtCore.QTimer.singleShot(0, self.on_select_source_radio)
     elif _last_mode == 'usrp':
-        self.on_select_source_usrp()
+        QtCore.QTimer.singleShot(0, self.on_select_source_usrp)
     elif _last_mode == 'airspy':
-        self.on_select_source_airspy()
+        QtCore.QTimer.singleShot(0, self.on_select_source_airspy)
     elif _last_mode == 'rtlsdr':
-        self.on_select_source_rtlsdr()
+        QtCore.QTimer.singleShot(0, self.on_select_source_rtlsdr)
+    elif _last_mode == 'sdrangel':
+        QtCore.QTimer.singleShot(0, self.on_select_source_sdrangel)
     elif _last_mode == 'wav':
         # Do not auto-start WAV playback on restart — user must explicitly
         # choose a file.  Auto-playing can cause a crash when a previous
@@ -632,9 +771,50 @@ def on_detect_max_level_changed(self, value):
     self.ch_detect_img.setLevels([self.detect_min_level, self.detect_max_level])
 
 
+def on_sync_detect_min_level_changed(self, value):
+    self.sync_detect_min_level = value * 0.5
+    self.sync_detect_min_level_label.setText(f"Min: {self.sync_detect_min_level:.1f} dB")
+    if hasattr(self, 'sync_detect_img'):
+        self.sync_detect_img.setLevels([self.sync_detect_min_level, self.sync_detect_max_level])
+    if hasattr(self, 'sync_detect_img_v'):
+        self.sync_detect_img_v.setLevels([self.sync_detect_min_level, self.sync_detect_max_level])
+
+
+def on_sync_detect_max_level_changed(self, value):
+    self.sync_detect_max_level = value * 0.5
+    self.sync_detect_max_level_label.setText(f"Max: {self.sync_detect_max_level:.1f} dB")
+    if hasattr(self, 'sync_detect_img'):
+        self.sync_detect_img.setLevels([self.sync_detect_min_level, self.sync_detect_max_level])
+    if hasattr(self, 'sync_detect_img_v'):
+        self.sync_detect_img_v.setLevels([self.sync_detect_min_level, self.sync_detect_max_level])
+
+
 def on_nb_factor_changed(self, value):
     self.nb_factor = value * 0.1
     self.nb_factor_label.setText(f"{self.nb_factor:.1f}")
+    from .visualizer import _SETTINGS
+    from .processing  import reset_detection_baseline
+    _SETTINGS.setValue('nb_factor', self.nb_factor)
+    # Large K steps change blanker throughput materially → detection
+    # baseline can lag and falsely trigger the sustained-signal lockout.
+    reset_detection_baseline(self)
+
+
+def on_nb_factor_v_changed(self, value):
+    self.nb_factor_v = value * 0.1
+    if hasattr(self, 'nb_factor_v_label'):
+        self.nb_factor_v_label.setText(f"{self.nb_factor_v:.1f}")
+    from .visualizer import _SETTINGS
+    from .processing  import reset_detection_baseline
+    _SETTINGS.setValue('nb_factor_v', self.nb_factor_v)
+    reset_detection_baseline(self)
+
+
+def on_nb_backend_changed(self, name):
+    """User picked a blanker backend — apply and persist."""
+    from .visualizer import _SETTINGS
+    self.set_blanker(name)
+    _SETTINGS.setValue('nb_backend', name)
 
 
 def on_td_scale_changed(self, value):
@@ -717,6 +897,89 @@ def on_select_source_wav(self):
     self.source_wav_action.setChecked(True)
     show_source_window(self, "wav")   # hides all radio windows
     self._receiver_label.setText("Simulation")
+    # WAV has embedded freq metadata — band combo doesn't apply
+    if hasattr(self, '_band_combo'):
+        self._band_combo.setEnabled(False)
+
+
+def on_select_source_sdrangel(self):
+    from .runtime import _connect_sdrangel_client
+    from .source_windows import show_source_window
+    _connect_sdrangel_client(self)
+    self.source_mode = "sdrangel"
+    self.selected_wav_path = None
+    self.source_sdrangel_action.setChecked(True)
+    show_source_window(self, "sdrangel")
+    self._receiver_label.setText("SDRangel")
+
+
+def _retune_active_source(self, freq_mhz: float):
+    """Retune the currently streaming source to freq_mhz, if it supports it."""
+    mode = getattr(self, 'source_mode', 'idle')
+    if mode == 'usrp':
+        uc = getattr(self, 'usrp_client', None)
+        if uc is not None and getattr(self, '_usrp_started', False):
+            uc.retune(freq_mhz)
+    elif mode == 'rtlsdr':
+        rc = getattr(self, 'rtlsdr_client', None)
+        if rc is not None and getattr(self, '_rtlsdr_started', False):
+            rc.retune(freq_mhz)
+    elif mode == 'airspy':
+        ac = getattr(self, 'airspy_client', None)
+        if ac is not None and getattr(self, '_airspy_started', False):
+            ac.retune(freq_mhz)
+    elif mode == 'sdrangel':
+        sc = getattr(self, 'sdrangel_client', None)
+        if sc is not None and getattr(self, '_sdrangel_started', False):
+            # UDP Sink output is centered on calling_freq; no center_freq override needed.
+            sc.retune(freq_mhz)
+    # Flex (radio): center is controlled by the radio hardware — no retune
+
+
+def on_band_changed(self, idx: int):
+    """Handle band combo selection: update freq, filter source menu, retune if active."""
+    from .visualizer import _SETTINGS as _VS
+    _label, freq, supported = MSK144_BANDS[idx]
+
+    # Update engine state
+    self.calling_freq_mhz = freq
+    self.center_freq_mhz  = freq
+    self._rebuild_channelizer_state()
+    self.display_center_freq_mhz = -1.0   # force freq-axis refresh on next display update
+
+    # Enable only sources that can reach this band; disable the rest.
+    # WAV is always available (file may contain any band).
+    self.source_radio_action.setEnabled('radio'      in supported)
+    self.source_usrp_action.setEnabled('usrp'        in supported)
+    self.source_airspy_action.setEnabled('airspy'    in supported)
+    self.source_rtlsdr_action.setEnabled('rtlsdr'    in supported)
+    self.source_sdrangel_action.setEnabled('sdrangel' in supported)
+
+    # If the active source is now unsupported, uncheck it visually
+    # (user must explicitly switch; we don't auto-stop the hardware).
+    mode = getattr(self, 'source_mode', 'idle')
+    _mode_action = {
+        'radio':    getattr(self, 'source_radio_action',    None),
+        'usrp':     getattr(self, 'source_usrp_action',     None),
+        'airspy':   getattr(self, 'source_airspy_action',   None),
+        'rtlsdr':   getattr(self, 'source_rtlsdr_action',   None),
+        'sdrangel': getattr(self, 'source_sdrangel_action', None),
+    }
+    if mode in _mode_action and mode not in supported:
+        act = _mode_action[mode]
+        if act is not None:
+            act.setChecked(False)
+
+    # Retune the active source if it supports the new band
+    if mode in supported:
+        _retune_active_source(self, freq)
+
+    # Re-enable band combo (may have been disabled by WAV mode)
+    if hasattr(self, '_band_combo') and mode != 'wav':
+        self._band_combo.setEnabled(True)
+
+    # Persist
+    _VS.setValue('calling_freq_mhz', freq)
 
 
 def _on_about(self):

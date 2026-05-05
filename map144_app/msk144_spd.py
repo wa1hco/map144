@@ -53,6 +53,7 @@ import wave
 from pathlib import Path
 
 import numpy as np
+from numba import njit
 from scipy.signal import hilbert
 
 from .msk144_decode import msk144decodeframe as _msk144decodeframe
@@ -141,6 +142,100 @@ _T_FULL_4NSPM = np.arange(4 * NSPM, dtype=np.float64) / FS  # (3456,)
 
 # ── Sync correlator ───────────────────────────────────────────────────────────
 
+@njit(cache=True, fastmath=True, nogil=True)
+def _sync_correlate_njit(c: np.ndarray, cb_conj: np.ndarray):
+    """Numba-compiled inner loop of :func:`_sync_correlate`.
+
+    Doubled-buffer trick (ct2 = [c, c]) avoids the modular ``if i1 >= nspm``
+    branch in the inner loop, which lets numba unroll/SIMD-vectorise more
+    aggressively.  ``nogil=True`` releases the GIL for the duration so the
+    main pipeline thread doesn't contend with paint events and decoder
+    threads while this runs.
+    """
+    nspm = c.shape[0]
+    tpl  = cb_conj.shape[0]   # = 42
+    # Doubled buffer: ct2[i] == ct2[i+nspm] == c[i % nspm].  Inner loop can
+    # then index ct2[ish+k] with no bounds check (ish < nspm, k < 42, so
+    # ish+k+336 < nspm+378 < 2*nspm).
+    ct2 = np.empty(2 * nspm, dtype=np.complex64)
+    for i in range(nspm):
+        ct2[i]        = c[i]
+        ct2[i + nspm] = c[i]
+
+    xcc  = np.empty(nspm, dtype=np.float32)
+    xmax = np.float32(0.0)
+    ish_best = 0
+    for ish in range(nspm):
+        acc_re = np.float32(0.0)
+        acc_im = np.float32(0.0)
+        for k in range(tpl):
+            v1 = ct2[ish + k]
+            v2 = ct2[ish + k + 336]
+            sum_re = v1.real + v2.real
+            sum_im = v1.imag + v2.imag
+            cb_re  = cb_conj[k].real
+            cb_im  = cb_conj[k].imag
+            # complex multiply: (sum_re + j sum_im) * (cb_re + j cb_im)
+            acc_re += sum_re * cb_re - sum_im * cb_im
+            acc_im += sum_re * cb_im + sum_im * cb_re
+        mag = np.float32((acc_re * acc_re + acc_im * acc_im) ** 0.5)
+        xcc[ish] = mag
+        if mag > xmax:
+            xmax = mag
+            ish_best = ish
+    return xcc, xmax, ish_best
+
+
+@njit(cache=True, fastmath=True, nogil=True)
+def _sync_correlate_batch_njit(c_batch: np.ndarray, cb_conj: np.ndarray):
+    """Numba-compiled inner loop of :func:`_sync_correlate_batch`.
+
+    Per-channel doubled-buffer + branchless inner loop, same trick as
+    ``_sync_correlate_njit``.  Outer loop over channels remains serial to
+    avoid competing with the decoder thread pool for cores during noise
+    bursts.
+    """
+    n_ch, nspm = c_batch.shape
+    tpl  = cb_conj.shape[0]
+    xcc_batch    = np.empty((n_ch, nspm), dtype=np.float32)
+    xmax_arr     = np.empty(n_ch,         dtype=np.float32)
+    ish_best_arr = np.empty(n_ch,         dtype=np.int32)
+
+    # One doubled buffer, reused across channels.  Allocated inside the @njit
+    # function so it lives on the stack-equivalent and incurs no Python heap
+    # alloc per call.
+    ct2 = np.empty(2 * nspm, dtype=np.complex64)
+
+    for ch in range(n_ch):
+        for i in range(nspm):
+            ct2[i]        = c_batch[ch, i]
+            ct2[i + nspm] = c_batch[ch, i]
+
+        local_xmax = np.float32(0.0)
+        local_ish  = 0
+        for ish in range(nspm):
+            acc_re = np.float32(0.0)
+            acc_im = np.float32(0.0)
+            for k in range(tpl):
+                v1 = ct2[ish + k]
+                v2 = ct2[ish + k + 336]
+                sum_re = v1.real + v2.real
+                sum_im = v1.imag + v2.imag
+                cb_re  = cb_conj[k].real
+                cb_im  = cb_conj[k].imag
+                acc_re += sum_re * cb_re - sum_im * cb_im
+                acc_im += sum_re * cb_im + sum_im * cb_re
+            mag = np.float32((acc_re * acc_re + acc_im * acc_im) ** 0.5)
+            xcc_batch[ch, ish] = mag
+            if mag > local_xmax:
+                local_xmax = mag
+                local_ish  = ish
+        xmax_arr[ch]     = local_xmax
+        ish_best_arr[ch] = local_ish
+
+    return xcc_batch, xmax_arr, ish_best_arr
+
+
 def _sync_correlate(c: np.ndarray) -> tuple[np.ndarray, float, int]:
     """Correlate a complex NSPM-sample frame with the MSK144 sync template.
 
@@ -148,10 +243,9 @@ def _sync_correlate(c: np.ndarray) -> tuple[np.ndarray, float, int]:
 
         cc(ish) = dot_product(ct2(1+ish:42+ish) + ct2(337+ish:378+ish), cb(1:42))
 
-    Fortran ``dot_product(a, b)`` for complex arrays = Σ conj(a_i) * b_i.
-
     Both sync positions (offset 0 and 336, 0-indexed) are combined before the
-    dot product, not after — this is the key to sensitivity.
+    dot product, not after — this is the key to sensitivity.  The actual
+    inner loop is ``_sync_correlate_njit`` (numba-compiled).
 
     Parameters
     ----------
@@ -163,18 +257,48 @@ def _sync_correlate(c: np.ndarray) -> tuple[np.ndarray, float, int]:
     xmax     : float  — peak magnitude
     ish_best : int    — 0-based shift index of the peak
     """
-    ct2 = np.concatenate([c, c])   # (2*NSPM,) doubled for circular shifts
+    if c.dtype != np.complex64:
+        c = np.ascontiguousarray(c, dtype=np.complex64)
+    xcc, xmax, ish_best = _sync_correlate_njit(c, _SYNC_CB_CONJ)
+    return xcc, float(xmax), int(ish_best)
 
-    # sliding_window_view creates strided views — no copy, sequential memory access.
-    # Equivalent to ct2[_SC_IDX1] + ct2[_SC_IDX2] but avoids the two (NSPM,42)
-    # random-access fancy-index copies; reads are cache-friendly sliding windows.
-    wins1    = np.lib.stride_tricks.sliding_window_view(ct2,       42)[:NSPM]  # (NSPM, 42) view
-    wins2    = np.lib.stride_tricks.sliding_window_view(ct2[336:], 42)[:NSPM]  # (NSPM, 42) view
-    combined = wins1 + wins2                           # (NSPM, 42) — one allocation
 
-    xcc      = np.abs(combined @ _SYNC_CB_CONJ).astype(np.float32)
-    ish_best = int(xcc.argmax())
-    return xcc, float(xcc[ish_best]), ish_best
+def _sync_correlate_batch(c_batch: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorised batched version of :func:`_sync_correlate`.
+
+    Wraps the numba-compiled ``_sync_correlate_batch_njit`` inner loop with a
+    dtype check.  Replaces the previous BLAS matmul implementation; numba's
+    hand-rolled loop is faster at our (n_ch=48, NSPM=864, tpl=42) scale because
+    it eliminates per-call BLAS setup overhead, GIL contention with the
+    decoder pool, and complex64-wrapper object allocation.
+
+    Parameters
+    ----------
+    c_batch : complex64 array, shape (n_ch, NSPM)
+
+    Returns
+    -------
+    xcc      : float32 array, shape (n_ch, NSPM) — correlation magnitude per shift
+    xmax     : float32 array, shape (n_ch,)     — per-channel peak magnitude
+    ish_best : int32   array, shape (n_ch,)     — per-channel shift index of peak
+    """
+    n_ch, nspm = c_batch.shape
+    if nspm != NSPM:
+        raise ValueError(f"_sync_correlate_batch expects last dim = NSPM ({NSPM}), got {nspm}")
+    if c_batch.dtype != np.complex64:
+        c_batch = np.ascontiguousarray(c_batch, dtype=np.complex64)
+    return _sync_correlate_batch_njit(c_batch, _SYNC_CB_CONJ)
+
+
+# Numba JIT compilation is lazy: the first call to each ``_sync_correlate_*_njit``
+# function triggers compilation (a few seconds to ~1 min depending on CPU and
+# whether fastmath optimisations have to be re-derived).  ``cache=True`` writes
+# the compiled code to disk on first run, so subsequent runs load it instantly.
+# We DON'T call the functions at module import: that would block ``./map144.py``
+# from launching until the JIT finishes, with no visible feedback to the user.
+# Letting compilation happen on the first detection hop keeps startup fast — the
+# delay falls inside the source-startup window before audio actually flows, so
+# it's invisible in normal operation.
 
 
 # ── Frequency search + coherent averaging ────────────────────────────────────

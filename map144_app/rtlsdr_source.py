@@ -254,6 +254,16 @@ class NesdrSmartSource:
             self._dev = ctypes.c_void_p(None)
         self._cb_ref = None
 
+    def retune(self, center_freq_mhz: float):
+        """Retune to a new center frequency while streaming."""
+        self.center_freq_mhz = center_freq_mhz
+        if not self._dev:
+            return
+        _lib.rtlsdr_set_center_freq(self._dev, ctypes.c_uint32(int(center_freq_mhz * 1e6)))
+        actual_hz = _lib.rtlsdr_get_center_freq(self._dev)
+        self.center_freq_mhz_actual = actual_hz / 1e6
+        print(f"[rtlsdr] retuned to {self.center_freq_mhz_actual:.4f} MHz", flush=True)
+
     # ── Internal ──────────────────────────────────────────────────────────
 
     def _async_loop(self):

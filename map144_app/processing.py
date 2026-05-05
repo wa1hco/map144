@@ -6,7 +6,7 @@
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# but WITHOUT ANY WARRANTY; wit hout even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 #
@@ -95,6 +95,17 @@ from .channelizer import (
 )
 from .channel_plan import NYQUIST_EDGE_CHANNEL_SKIP
 from .detection import extract_and_decode
+from .msk144_spd import (
+    _sync_correlate as _msk144_sync_correlate,
+    _sync_correlate_batch as _msk144_sync_correlate_batch,
+    NSPM as _SYNC_NSPM,
+)
+
+# Step 1 of sensitivity-improvement plan — coherent MSK144 sync-word
+# correlator running in parallel with the squared-FFT detector.  Feature flag
+# so the change is bisectable (flip to False to recover the legacy path).
+ENABLE_SYNC_DETECT = True
+SYNC_DETECT_THRESH_DB = 3.0    # dB above 25th-percentile sync-magnitude baseline
 
 DETECT_THRESH_DB   = 3.0        # dB above 25th-percentile noise baseline
 DETECT_MERGE_GAP_S = 0.5        # suppress re-trigger on the same channel within this window (s).
@@ -110,7 +121,12 @@ NB_BROADBAND_FRAC  = 0.30       # fraction of hot bins required to declare broad
 NB_SPEC_AVG_TC     = 2.0        # per-bin spectrum averaging time constant (seconds)
 NB_WIDEBAND_AVGNUM = 200        # EMA length for wideband median floor (~1 s at 5.3 ms/block)
 _NB_LOWLEVEL_ALPHA = 0.02       # EMA weight for clean-fraction tracker (matches Linrad)
-_NB_TAPER_N        = 24         # Hann taper half-width in samples (24 → 0.5 ms at 48 kHz)
+_NB_TAPER_N        = 2          # Hann taper half-width in samples (2 → 42 µs at 48 kHz)
+                                # A 3-sample impulse becomes 7 samples blanked (2.3×).
+                                # Raise if blanking edges cause spectral artifacts.
+NB_SHORT_IMPULSE_THRESH = 5    # FFT blocks where ≤ this many samples exceed the TD threshold
+                                # are treated as short impulses; block-blanking is skipped and
+                                # the sample-precise TD mask is used instead.
 # Alias for readability — value lives in ``channel_plan`` (UI + detect share it).
 _EDGE_CH_SKIP      = NYQUIST_EDGE_CHANNEL_SKIP
 _DC_CH_SKIP        = 3          # skip channels within N of DC (ch 0) — LO leakage / DC offset zone
@@ -149,7 +165,12 @@ _COINCIDENCE_SPAN_CH = 8        # spread gate: if a single cluster spans > this 
                                  # channels; impulse noise spans 10+ kHz = 10+ channels).
 _CH_DETECT_HOP     = CH_DETECT_SIZE // 2   # 50 % overlap hop
 # Enough slots to cover one full 15-second window at the channeliser hop rate
-N_SNR_HIST = int(15 * CH_SAMPLE_RATE / _CH_DETECT_HOP) + 2   # ≈ 705
+N_SNR_HIST = int(15 * CH_SAMPLE_RATE / _CH_DETECT_HOP)        # = 703 (exact integer hops)
+# 703 hops × (256 / 12000) s/hop = 14.997 s (3 ms shy of 15 s, well below display
+# resolution).  Choosing this clean integer ratio means write_idx = hop_count %
+# N_SNR_HIST advances by exactly 1 per hop with no rounding noise — no gap-fill,
+# no wipe-and-refill cycle needed.  The 15-s boundary is a display / TX-RX
+# concept; internal DSP state (rolling baselines, AGC) is unaffected.
 
 # Pre-computed Hann taper kernel for soft-blanking (avoids rectangular-hole sinc spread)
 _NB_TAPER_KERNEL = np.hanning(2 * _NB_TAPER_N + 1).astype(np.float32)
@@ -157,6 +178,40 @@ _NB_TAPER_KERNEL /= _NB_TAPER_KERNEL.max()   # normalise peak to 1.0
 
 # Pre-computed constants for the detection hot loop (computed once at import time)
 _DETECT_WINDOW = np.hanning(CH_DETECT_SIZE).astype(np.float32)
+
+
+def reset_detection_baseline(engine):
+    """Clear the 25th-percentile history and sustained-signal counters.
+
+    Call whenever an operator-controlled input shifts channel power by
+    more than the baseline can track quickly (gain change, antenna
+    swap, large K step).  Without this the old pct25 trails 30+ s
+    behind the new level, every channel reports "above threshold",
+    and the 2-s sustained-signal gate falsely locks all 48 channels
+    out for 30 s.
+
+    Clears per-channel hop counters, rolling history, cached
+    percentile, and any in-flight cooldown lockouts.
+    """
+    for suffix in ('', '_v'):
+        if hasattr(engine, f'_metric_hist_buf{suffix}'):
+            getattr(engine, f'_metric_hist_buf{suffix}').fill(0.0)
+        if hasattr(engine, f'_metric_hist_cnt{suffix}'):
+            setattr(engine, f'_metric_hist_cnt{suffix}', 0)
+        if hasattr(engine, f'_metric_hist_idx{suffix}'):
+            setattr(engine, f'_metric_hist_idx{suffix}', 0)
+        # Delete the cached percentile so the detection path re-computes
+        # from the fresh history on the very next chunk.  Setting to None
+        # instead would leave the attribute present but unusable: the
+        # detection path only recomputes when ``not hasattr(self, '_pct25*')``
+        # or every 10 chunks, and the intervening calls would divide by None.
+        for attr in (f'_pct25{suffix}', f'_pct25_ctr{suffix}'):
+            if hasattr(engine, attr):
+                delattr(engine, attr)
+    if hasattr(engine, '_ch_above_thresh'):
+        engine._ch_above_thresh = {}
+    if hasattr(engine, '_detect_cooldowns'):
+        engine._detect_cooldowns = {}
 # Use unshifted fftfreq so _LO_MASK/_HI_MASK index directly into the raw FFT
 # output — no np.fft.fftshift (which calls np.roll) needed in the hot loop.
 _SQ_FREQ       = np.fft.fftfreq(CH_DETECT_SIZE, 1.0 / CH_SAMPLE_RATE)
@@ -164,6 +219,51 @@ _LO_MASK       = (_SQ_FREQ >= -_SQ_TONE_HZ - _SQ_NTOL_HZ) & \
                   (_SQ_FREQ <= -_SQ_TONE_HZ + _SQ_NTOL_HZ)
 _HI_MASK       = (_SQ_FREQ >=  _SQ_TONE_HZ - _SQ_NTOL_HZ) & \
                   (_SQ_FREQ <=  _SQ_TONE_HZ + _SQ_NTOL_HZ)
+
+
+def _compute_sync_metric_db(sync_window,
+                            hist_buf, hist_idx_attr, hist_cnt_attr,
+                            pct25_attr, pct25_ctr_attr, engine) -> np.ndarray:
+    """Per-channel coherent sync-correlation peak in dB above 25th-percentile.
+
+    ``sync_window`` is shape (N_CHANNELS, NSPM) — the most recent NSPM samples
+    at the head of _ch_buf.  The channelizer already places signal energy at
+    DC in each channel's output (see channelizer.py docstring), which is the
+    convention ``_sync_correlate`` expects, so no pre-mix is needed.  The peak
+    magnitude per channel is normalised against a rolling 25th-percentile
+    baseline, producing a dB metric directly comparable to the squared-FFT
+    pair_metric.
+
+    Uses the batched ``_sync_correlate_batch`` (one BLAS matmul over all
+    channels) instead of a Python ``for ch in range(48)`` loop — the loop
+    version was the largest single hot spot in py-spy profiling (~25 % of
+    total CPU on a 6-core i5 during noise bursts).
+    """
+    sync_window_c64 = np.ascontiguousarray(sync_window, dtype=np.complex64)
+    _, peaks, _ = _msk144_sync_correlate_batch(sync_window_c64)
+
+    # Rolling 25th-percentile baseline of sync magnitudes (one row per hop).
+    idx = getattr(engine, hist_idx_attr)
+    cnt = getattr(engine, hist_cnt_attr)
+    hist_buf[idx] = peaks
+    setattr(engine, hist_idx_attr, (idx + 1) % _METRIC_HIST_DEPTH)
+    if cnt < _METRIC_HIST_DEPTH:
+        setattr(engine, hist_cnt_attr, cnt + 1)
+        cnt += 1
+    hist = hist_buf[:cnt] if cnt < _METRIC_HIST_DEPTH else hist_buf
+
+    pct25_ctr = getattr(engine, pct25_ctr_attr, 0) + 1
+    setattr(engine, pct25_ctr_attr, pct25_ctr)
+    pct25 = getattr(engine, pct25_attr, None)
+    if pct25_ctr % 10 == 0 or pct25 is None:
+        hist_s = hist[::_METRIC_HIST_STRIDE]
+        k      = max(0, int(len(hist_s) * 0.25))
+        tmp    = hist_s.copy()
+        tmp.partition(k, axis=0)
+        pct25  = np.maximum(tmp[k], 1e-30)
+        setattr(engine, pct25_attr, pct25)
+
+    return (10.0 * np.log10(np.maximum(peaks / pct25, 1e-30))).astype(np.float32)
 
 
 def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
@@ -212,158 +312,47 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
     # Pre-compute packet time from embedded timestamp so it is available for
     # the detection section (which runs before the waterfall section where
     # _pkt_time is normally computed).
+    #
+    # **Sample-clock anchoring** (see project_sample_clock_anchoring memory):
+    # Scrolling displays (waterfall, detection heatmaps) must index by a
+    # sample-counter-derived time, never by wall-clock-at-processing time.
+    # When the radio provides a valid VITA-49 sample-clock timestamp
+    # (timestamp_int >= 1e9), we use it directly — perfectly monotonic.
+    # When it doesn't (Flex TSI=0, RTL-SDR, Airspy without GPS lock), the
+    # legacy fallback ``time.time()`` injects per-chunk wall-clock jitter
+    # that lands on the heatmap row index → randomly-placed dark vertical
+    # lines.  Instead, anchor once at the first chunk and derive each
+    # subsequent chunk's time from the sample counter.  Result is a
+    # monotonic per-sample timeline regardless of OS scheduling jitter.
     _pkt_time_early = float(timestamp_int) + float(timestamp_frac) * 1e-12
     _is_wav_early   = getattr(self, 'source_mode', '') == 'wav'
     if not _is_wav_early and timestamp_int < 1_000_000_000:
-        # Hardware clock not GPS-locked yet; fall back to wall clock.
-        _pkt_time_early = time.time()
-
-
-    # ── 0. Wideband FFT noise blanker (Linrad-style) ─────────────────────────
-    # Divide input into NB_FFT_SIZE blocks.  For each block, FFT and compute
-    # per-bin power normalised by a per-bin running average.  If the fraction
-    # of bins whose normalised power exceeds nb_factor² is greater than
-    # NB_BROADBAND_FRAC, the block is a broadband impulse and is blanked.
-    #
-    # A narrowband signal (meteor burst ≈ 2 kHz, beacon ≈ 500 Hz) elevates
-    # only a few of the NB_FFT_SIZE bins — well below NB_BROADBAND_FRAC.
-    # A broadband impulse (lightning, power-line click) elevates nearly all
-    # bins simultaneously — well above NB_BROADBAND_FRAC.
-    # The per-bin average is only updated from non-blanked blocks, so impulses
-    # cannot inflate the threshold.
-    nb_factor        = float(getattr(self, 'nb_factor', NB_FACTOR))
-    metric_threshold = nb_factor * nb_factor   # amplitude ratio → power ratio
-    mag              = np.abs(raw).astype(np.float32)
-
-    # Initialise per-bin averages from the first available block.
-    # Use the MEDIAN of per-bin powers (replicated flat) rather than the actual
-    # per-bin values.  A single-block impulse at 50 dB above noise raises the mean
-    # ~1000× but moves the median only ~2×, so the threshold starts near the true
-    # noise level even if the very first chunk contains an impulse.
-    if self._nb_spec_avg is None:
-        first = raw[:NB_FFT_SIZE] if len(raw) >= NB_FFT_SIZE else raw
-        X0 = np.fft.fft(first, n=NB_FFT_SIZE)
-        P0 = np.abs(X0).astype(np.float64) ** 2
-        median_P0 = max(float(np.median(P0)), 1e-30)
-        self._nb_spec_avg = np.full(NB_FFT_SIZE, median_P0, dtype=np.float64)
-        rms = float((median_P0 / NB_FFT_SIZE) ** 0.5)
-        self._nb_env   = max(rms, 1e-9)
-        self._nb_floor = self._nb_env
-
-    n_blocks = len(raw) // NB_FFT_SIZE
-    alpha    = 1.0 - np.exp(-NB_FFT_SIZE / (NB_SPEC_AVG_TC * self.sample_rate))
-
-    # Per-sample blanking mask: 1.0 = blank, 0.0 = keep.
-    blank_mask = np.zeros(len(raw), dtype=np.float32)
-    self._nb_total_count += len(raw)
-
-    for i in range(n_blocks):
-        s = i * NB_FFT_SIZE
-        e = s + NB_FFT_SIZE
-
-        # ── Block RMS running median (robust primary broadband gate) ─────────
-        # Updated unconditionally (impulse and noise blocks alike) so it converges
-        # to the true noise RMS even during heavy impulse activity.  Immune to the
-        # inflation catch-22 that can disable the per-bin hot-bin test.
-        # Step-up/step-down toward the median at rate 1/NB_WIDEBAND_AVGNUM (~1 s).
-        block_rms = float(np.sqrt(np.mean(mag[s:e] ** 2)))
-        if self._nb_blkrms_median is None:
-            # Initialise from the per-sample magnitude median of this first block.
-            # Unlike block_rms (which is inflated ~28× by even 2 impulse samples at
-            # 50 dB above noise), the median of 256 |x[n]| values is unaffected by
-            # 2 outliers — they sit above the median and don't move it.  Starting
-            # near the true noise level lets the running median converge quickly
-            # upward from noise blocks and detect impulses from the first block on.
-            self._nb_blkrms_median = max(float(np.median(mag[s:e])), 1e-12)
+        _t0 = getattr(self, '_iq_t0_wall', None)
+        if _t0 is not None:
+            # Subsequent chunk: derive from sample counter.  _iq_abs_sample
+            # is the count *before* this chunk has been added, so this is
+            # the wall-clock for the first sample of this chunk.
+            _pkt_time_early = _t0 + self._iq_abs_sample / self.sample_rate
         else:
-            _brm_step = max(self._nb_blkrms_median, 1e-12) / NB_WIDEBAND_AVGNUM
-            if block_rms > self._nb_blkrms_median:
-                self._nb_blkrms_median += _brm_step
-            else:
-                self._nb_blkrms_median = max(self._nb_blkrms_median - _brm_step, 1e-12)
-        is_broadband_rms = block_rms > nb_factor * self._nb_blkrms_median
+            # Very first chunk after start/reset: anchor to wall clock once.
+            _pkt_time_early = time.time()
 
-        X = np.fft.fft(raw[s:e])
-        P = np.abs(X).astype(np.float64) ** 2
 
-        # Normalise each bin by its running average and count hot bins.
-        # Method-form .sum() bypasses numpy's _wrapreduction wrapper overhead.
-        n_hot        = int((P > metric_threshold * self._nb_spec_avg).sum())
-        is_broadband_fft = n_hot > NB_BROADBAND_FRAC * NB_FFT_SIZE
-        is_broadband = is_broadband_rms or is_broadband_fft
-
-        if is_broadband:
-            blank_mask[s:e] = 1.0
-            self._nb_blanked_count += NB_FFT_SIZE
-            _bl = getattr(self, '_nb_blank_log', None)
-            if _bl is not None:
-                _bl.append(getattr(self, '_nb_log_t0', 0.0) + s / self.sample_rate)
-        else:
-            # Update per-bin averages only from clean blocks.
-            self._nb_spec_avg = (1.0 - alpha) * self._nb_spec_avg + alpha * P
-
-        # Keep last block for the spectrum display.
-        self._nb_last_P   = P
-        self._nb_last_hot = n_hot
-
-        # ── Wideband median noise floor estimator ────────────────────────────
-        # Median across bins is robust to narrowband spurs (they occupy only a
-        # few bins; the median ignores them).  clean_frac tracks what fraction
-        # of bins are below the blanker threshold — when it falls below 0.1 the
-        # band is too corrupted to update the estimate (Linrad SELLIM condition).
-        block_median = float(np.median(P))
-        clean_frac   = float((P <= metric_threshold * self._nb_spec_avg).sum()) / NB_FFT_SIZE
-        self._nb_lowlevel_frac = ((1.0 - _NB_LOWLEVEL_ALPHA) * self._nb_lowlevel_frac
-                                  + _NB_LOWLEVEL_ALPHA * clean_frac)
-        if self._nb_lowlevel_frac >= 0.1:
-            avgnum = float(getattr(self, 'nb_avgnum', NB_WIDEBAND_AVGNUM))
-            alpha_wb = 1.0 / max(avgnum, 1.0)
-            if self._nb_wideband_floor is None:
-                self._nb_wideband_floor = block_median
-            else:
-                self._nb_wideband_floor = ((1.0 - alpha_wb) * self._nb_wideband_floor
-                                           + alpha_wb * block_median)
-
-    # Partial block at end of chunk passes through unchanged (no blanking decision).
-
-    # ── Time-domain amplitude blanker (sub-block impulse detection) ──────────
-    # Catches any impulses missed by the block-level FFT gate (e.g. if the running
-    # median hasn't converged yet at startup).  Uses _nb_blkrms_median as the
-    # reference — immune to threshold inflation because the median is updated
-    # unconditionally from all blocks and is robust to minority outliers.
-    _td_ref    = self._nb_blkrms_median if self._nb_blkrms_median is not None else self._nb_floor
-    _td_thresh = nb_factor * _td_ref
-    _td_hot    = mag > _td_thresh
-    _td_new    = _td_hot & (blank_mask == 0.0)   # count only newly flagged samples
-    if _td_hot.any():
-        blank_mask[_td_hot] = 1.0
-        self._nb_blanked_count += int(_td_new.sum())
-
-    # Soft-blank: Hann-taper the edges of each blanked region so the abrupt
-    # transition to zero does not create rectangular-hole sinc sidelobes.
-    if blank_mask.any():
-        soft_blank = np.minimum(
-            _nd_convolve1d(blank_mask, _NB_TAPER_KERNEL, mode='constant', cval=0.0),
-            1.0,
-        )
-        cleaned   = (raw   * (1.0 - soft_blank)).astype(np.complex64)
-        cleaned_v = (raw_v * (1.0 - soft_blank)).astype(np.complex64) if dual_pol else None
-    else:
-        cleaned   = raw.copy()
-        cleaned_v = raw_v.copy() if dual_pol else None
-
-    # Update display estimates from per-bin averages.
-    # _nb_floor: noise floor amplitude implied by the median per-bin power.
-    # _nb_env:   running mean of non-blanked sample amplitudes (signal level).
-    # Method-form .mean() / .any() / .sum() bypass numpy's _wrapreduction wrapper.
-    rms = float((self._nb_spec_avg.mean() / NB_FFT_SIZE) ** 0.5)
-    self._nb_floor = max(rms, 1e-9)
-    not_blanked = blank_mask == 0.0
-    if not_blanked.any():
-        n_ok      = int(not_blanked.sum())
-        alpha_env = 1.0 - np.exp(-n_ok / (2.0 * self.sample_rate))
-        chunk_env = float(mag[not_blanked].mean())
-        self._nb_env = (1.0 - alpha_env) * self._nb_env + alpha_env * chunk_env
+    # ── 0. Noise blanker (Linrad / Bypass / NR0V-Wideband) ────────────────────
+    # Backend is selected via ``self.blanker`` (set in engine.__init__, runtime-
+    # switchable).  Each backend operates on the engine's ``_nb_*`` state so
+    # display and reset paths continue to work without change.  Dual-pol
+    # backends return independent H and V blanking masks; single-pipeline
+    # backends return only blank_mask (H) and leave blank_mask_v None, in
+    # which case the H mask is applied to V for backward compatibility.
+    _nb_result   = self.blanker.process(self, raw, raw_v, dual_pol)
+    cleaned      = _nb_result.cleaned_h
+    cleaned_v    = _nb_result.cleaned_v
+    blank_mask   = _nb_result.blank_mask
+    mag          = _nb_result.mag_h
+    blank_mask_v = _nb_result.blank_mask_v if _nb_result.blank_mask_v is not None else blank_mask
+    mag_v_disp   = (_nb_result.mag_v if _nb_result.mag_v is not None else
+                    (np.abs(raw_v).astype(np.float32) if dual_pol and raw_v is not None else None))
 
 
     # ── 1. Write cleaned IQ into the circular ring buffer ────────────────────
@@ -380,6 +369,35 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         self._iq_ring[pos:]                 = _ring_chunk[:first_n]
         self._iq_ring[:chunk_len - first_n] = _ring_chunk[first_n:]
     self._iq_ring_pos    = (pos + chunk_len) % ring_size
+    # Anchor wall-clock for IQ ring sample 0 — see project_sample_clock_anchoring.
+    # Set ONCE per session (or after a reset that nulls it).  Re-anchoring per
+    # chunk would re-introduce wall-clock jitter into _iq_t0_wall and undo the
+    # whole point of sample-clock anchoring.
+    #
+    # The drift threshold for re-anchoring needs to be high enough that normal
+    # source-side timestamp jitter never trips it.  Flex's per-packet timestamp
+    # (computed in the source thread as ``_t_start + _abs_samps/_hw_rate``) can
+    # oscillate ±1–2 s under CPU contention because ``_t_start`` is anchored
+    # once at acquisition start with a `time.time()` reading that itself has
+    # OS-scheduling jitter and NTP-correction events.  A 1-s threshold caused
+    # constant re-anchoring during noise bursts; each re-anchor jumped
+    # ``_iq_t0_wall`` enough to spuriously cross a 15-s boundary in the
+    # heatmap-display logic and triggered a wipe.
+    #
+    # 30 s is well above any normal jitter (Flex packets stay within ±2 s) but
+    # well below the "stream is broken" regime — a real source-restart or DAX
+    # stream reset would manifest as tens of seconds of discontinuity.  The
+    # PERIOD_SLIP fix can absorb a few seconds of drift without misassigning
+    # decodes (15 s period, plenty of slack).
+    _projected = (self._iq_t0_wall + self._iq_abs_sample / self.sample_rate
+                  if self._iq_t0_wall is not None else None)
+    if self._iq_t0_wall is None:
+        self._iq_t0_wall = _pkt_time_early - self._iq_abs_sample / self.sample_rate
+    elif abs(_pkt_time_early - _projected) > 30.0:
+        # Major discontinuity — re-anchor and log so the cause is visible.
+        self._iq_t0_wall = _pkt_time_early - self._iq_abs_sample / self.sample_rate
+        logger.warning("Re-anchored _iq_t0_wall: drift %.2f s from projected",
+                       _pkt_time_early - _projected)
     self._iq_abs_sample += chunk_len
 
     # ── 1a. Update time-domain magnitude display buffers (post- and pre-blanker) ──
@@ -400,26 +418,17 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
     _write_td_buf(self._td_mag_buf,     '_td_mag_pos',     _td_mag)
     _write_td_buf(self._td_mag_buf_raw, '_td_mag_pos_raw', mag)     # pre-blanker H
 
-    # ── 1b. V-channel time-domain magnitude + NB spectrum (dual-pol display) ────
+    # ── 1b. V-channel time-domain magnitude display buffers ──────────────────
+    # Per-channel V detection state (_nb_spec_avg_v, _nb_last_P_v, …) is
+    # now owned by the blanker backend (see LinradBlanker._process_channel
+    # with suffix='_v').  Only the display-only post/pre-blanker magnitude
+    # circular buffers are updated here, using the V mag provided in the
+    # BlankerResult so NR0V's delay-aligned pre-blanker trace stays aligned.
     if dual_pol and cleaned_v is not None:
         _td_mag_v = np.abs(cleaned_v).astype(np.float32)            # post-blanker V
         _write_td_buf(self._td_mag_buf_v,     '_td_mag_pos_v',     _td_mag_v)
-        _write_td_buf(self._td_mag_buf_raw_v, '_td_mag_pos_raw_v', np.abs(raw_v).astype(np.float32))
-
-        # Per-bin V-channel spectrum tracking (floor + last block, for display).
-        # Blanking decisions remain H-only; V updates only on non-blanked H blocks.
-        if self._nb_spec_avg_v is None:
-            first_v = raw_v[:NB_FFT_SIZE] if len(raw_v) >= NB_FFT_SIZE else raw_v
-            X0_v = np.fft.fft(first_v, n=NB_FFT_SIZE)
-            self._nb_spec_avg_v = np.maximum(np.abs(X0_v).astype(np.float64) ** 2, 1e-30)
-        for _i in range(n_blocks):
-            _sv = _i * NB_FFT_SIZE
-            _ev = _sv + NB_FFT_SIZE
-            Xv = np.fft.fft(raw_v[_sv:_ev])
-            Pv = np.abs(Xv).astype(np.float64) ** 2
-            self._nb_last_P_v = Pv
-            if not blank_mask[_sv]:   # update floor only from clean H blocks
-                self._nb_spec_avg_v = (1.0 - alpha) * self._nb_spec_avg_v + alpha * Pv
+        if mag_v_disp is not None:
+            _write_td_buf(self._td_mag_buf_raw_v, '_td_mag_pos_raw_v', mag_v_disp)
 
     # ── 2. Channelise into 48 × 12 kHz channels (H, and V if dual-pol) ─────────
     # Dual-pol: pass both H and V in one call so the NCO phase matrix (the most
@@ -471,15 +480,31 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
             self._ch_buf_v[:, self._ch_buf_v_end:self._ch_buf_v_end + new_n] = ch_out_v
             self._ch_buf_v_end += new_n
 
-    # Anchor the SNR write index to wall clock once per call, then increment
-    # by 1 per hop inside the loop.  Calling time.time() inside the loop gives
-    # the same value for consecutive hops (they execute in microseconds, not
-    # the 21.3 ms of audio each hop represents), so all hops in one call would
-    # overwrite the same row — producing the "every other frame missing" effect.
+        # Sync correlator's dedicated rolling ring — FIFO shift-and-append so
+        # the most recent NSPM samples per channel are always available
+        # regardless of _ch_buf's drain state.  See engine.py for the rationale.
+        if ENABLE_SYNC_DETECT:
+            _sb_n = self._sync_buf.shape[1]   # = NSPM
+            if new_n >= _sb_n:
+                self._sync_buf[:] = ch_out[:, -_sb_n:]
+            else:
+                self._sync_buf[:, :_sb_n - new_n] = self._sync_buf[:, new_n:]
+                self._sync_buf[:, _sb_n - new_n:] = ch_out
+            if dual_pol:
+                if new_n >= _sb_n:
+                    self._sync_buf_v[:] = ch_out_v[:, -_sb_n:]
+                else:
+                    self._sync_buf_v[:, :_sb_n - new_n] = self._sync_buf_v[:, new_n:]
+                    self._sync_buf_v[:, _sb_n - new_n:] = ch_out_v
+
+    # Anchor wall-clock time of _ch_buf[0] once per call.  This is no longer
+    # used for the per-hop write index (the hop counter handles that), but it
+    # is still used inside the loop as ``current_wall_time`` for the 15-s
+    # boundary marker-lifecycle check.
     if self.source_mode == "wav":
         # _wav_time_cursor is the end of the previous call's buffer.  Subtract
         # the carry-over samples already in _ch_buf so the anchor points to
-        # _ch_buf[0], placing each hop at its correct sample-accurate time.
+        # _ch_buf[0].
         _loop_wall = float(getattr(self, "_wav_time_cursor", 0.0)) \
                      - _ch_buf_carry / CH_SAMPLE_RATE
     else:
@@ -487,9 +512,6 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         # is anchored to the same GPS clock as the spectrogram.  Subtract the
         # carry-over channelised samples so the anchor is at _ch_buf[0].
         _loop_wall = _pkt_time_early - _ch_buf_carry / CH_SAMPLE_RATE
-    _snr_write_idx = round(
-        (_loop_wall % self.history_secs) * CH_SAMPLE_RATE / _CH_DETECT_HOP
-    )
 
     while self._ch_buf_end >= CH_DETECT_SIZE and not getattr(self, '_tx_settle_remaining', 0):
         ch_block   = self._ch_buf[:, :CH_DETECT_SIZE]            # (48, 512) H channel
@@ -560,28 +582,105 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         else:
             pair_metric_v = pair_metric_h   # single-pol: V mirrors H (unused)
 
+        # ── Coherent sync-word detector (additive Step 1) ────────────────────
+        # Per-channel correlation of the leading NSPM-sample window of _ch_buf
+        # against the MSK144 16-chip sync template.  Coherent integration over
+        # 8 ms of known waveform buys ~6 dB over the squared-domain power
+        # detector at low SNR.  Output magnitude is normalised by a per-channel
+        # 25th-percentile baseline (mirrors the squared-FFT path) so the dB
+        # metric is comparable, then pair_metric takes the max of the two paths.
+        # The window is read fresh per hop, so the metric tracks the current
+        # ch_block (not stalely fixed at chunk boundaries).
+        # Save the squared-only metrics so we can attribute each surviving
+        # trigger to "sq", "sync", or "both" downstream — useful for verifying
+        # the sync detector is firing at all and for diagnostic console output.
+        sq_metric_h_only = pair_metric_h.copy()
+        sq_metric_v_only = pair_metric_v.copy()
+        sync_metric_h = None
+        sync_metric_v = None
+
+        if ENABLE_SYNC_DETECT:
+            # _sync_buf is FIFO-updated per chunk and always holds the most
+            # recent NSPM samples, so the correlator can run on every hop
+            # regardless of _ch_buf's drain state.  No cache fallback needed
+            # (which previously produced stale-row banding under live Flex
+            # operation where _ch_buf_end never reaches NSPM).
+            sync_metric_h = _compute_sync_metric_db(
+                self._sync_buf,
+                self._sync_metric_hist_buf, '_sync_metric_hist_idx',
+                '_sync_metric_hist_cnt', '_sync_pct25', '_sync_pct25_ctr',
+                self,
+            )
+            pair_metric_h = np.maximum(pair_metric_h, sync_metric_h)
+
+            if ch_block_v is not None:
+                sync_metric_v = _compute_sync_metric_db(
+                    self._sync_buf_v,
+                    self._sync_metric_hist_buf_v, '_sync_metric_hist_idx_v',
+                    '_sync_metric_hist_cnt_v', '_sync_pct25_v', '_sync_pct25_ctr_v',
+                    self,
+                )
+                pair_metric_v = np.maximum(pair_metric_v, sync_metric_v)
+
         # Trigger on either channel; display the max for the combined heatmap
         pair_metric = np.maximum(pair_metric_h, pair_metric_v)
 
-        # Time-indexed SNR write — first hop anchored to wall clock above;
-        # subsequent hops in this call increment by 1 (each hop = 21.3 ms).
+        # ── Display-only 15-s boundary handling ──────────────────────────────
+        # Blank the heatmaps and reset the hop counter at each 15-s wall-clock
+        # boundary cross (and at session start, when _ch_snr_boundary's initial
+        # value differs from the current period number).  Internal DSP state
+        # (rolling baselines, AGC, percentile estimators) is NOT reset — those
+        # run continuously and the 15-s boundary doesn't apply to them.
+        # The hop counter (rather than a sample-clock-to-row map) is what fills
+        # rows: each hop fires exactly when the buffer drained 256 samples, so
+        # consecutive hops always fill consecutive rows.  This eliminates the
+        # rare edge case where a sample-clock map could place the first hop
+        # after a boundary at row 1 (or higher) and leave row 0 dark for an
+        # entire period — visible as a persistent vertical dark line.
         ch_boundary = int(current_wall_time / self.history_secs)
         if ch_boundary != self._ch_snr_boundary:
             self._ch_snr_history_h[:] = -999.0
             self._ch_snr_history_v[:] = -999.0
-            self._ch_snr_boundary     = ch_boundary
+            self._sync_snr_history_h[:] = -999.0
+            self._sync_snr_history_v[:] = -999.0
+            self._ch_snr_hop_count = 0
+            self._ch_snr_boundary  = ch_boundary
             marker_list = getattr(self, '_jt9_markers', None)
             if marker_list is not None:
                 marker_list.clear()
-            # Do NOT reset _ch_above_thresh here — the coincidence gate must
-            # survive the display window boundary so a signal that starts just
-            # before the boundary still triggers a jt9 launch after it.
-            _snr_write_idx = 0
-        self._ch_snr_write_idx = min(max(_snr_write_idx, 0), N_SNR_HIST - 1)
-        if 0 <= self._ch_snr_write_idx < N_SNR_HIST:
-            self._ch_snr_history_h[self._ch_snr_write_idx, :] = pair_metric_h
-            self._ch_snr_history_v[self._ch_snr_write_idx, :] = pair_metric_v
-        _snr_write_idx += 1
+            # Do NOT reset _ch_above_thresh — the coincidence gate must survive
+            # the display window boundary so a signal that starts just before
+            # the boundary still triggers a jt9 launch after it.
+
+        # Hop-counter row index — guaranteed contiguous across hops.
+        self._ch_snr_write_idx = self._ch_snr_hop_count % N_SNR_HIST
+        self._ch_snr_history_h[self._ch_snr_write_idx, :] = pair_metric_h
+        self._ch_snr_history_v[self._ch_snr_write_idx, :] = pair_metric_v
+        if sync_metric_h is not None:
+            self._sync_snr_history_h[self._ch_snr_write_idx, :] = sync_metric_h
+        if sync_metric_v is not None:
+            self._sync_snr_history_v[self._ch_snr_write_idx, :] = sync_metric_v
+        # ── DIAGNOSTIC: heatmap state at selected hops (DEBUG-level) ──────────
+        # Enable with logging.getLogger("map144_app.processing").setLevel(DEBUG)
+        # — useful when investigating detection-plot rendering vs. metric scale
+        # vs. baseline staleness.  Six samples per WAV play; negligible cost.
+        if (logger.isEnabledFor(logging.DEBUG)
+                and self._ch_snr_hop_count in (0, 5, 50, 200, 500, 700)):
+            _arr = self._ch_snr_history_h
+            _sa  = self._sync_snr_history_h if sync_metric_h is not None else None
+            logger.debug(
+                "heatmap-diag hop=%d pair_h max=%.2f dB argmax_ch=%d "
+                "row_just_written max=%.2f full_arr min=%.2f max=%.2f "
+                "nonzero_rows=%d sync max=%.2f boundary=%d",
+                self._ch_snr_hop_count,
+                float(pair_metric_h.max()), int(np.argmax(pair_metric_h)),
+                float(_arr[self._ch_snr_write_idx].max()),
+                float(_arr.min()), float(_arr.max()),
+                int(np.any(_arr != 0.0, axis=1).sum()),
+                float(_sa.max()) if _sa is not None else float('nan'),
+                int(self._ch_snr_boundary),
+            )
+        self._ch_snr_hop_count += 1
 
         # Tick down cooldowns
         self._detect_cooldowns = {
@@ -694,6 +793,26 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
             if abs(int(ch_k) - _nyquist_ch) <= _EDGE_CH_SKIP:
                 continue
 
+            # Detector attribution: which path put this channel above threshold?
+            # Examine BOTH the squared-FFT and sync metrics (max of H/V if dual-pol)
+            # against DETECT_THRESH_DB.  Result is one of "sq", "sync", "sq+sync".
+            _sq_above = (max(sq_metric_h_only[ch_k],
+                             sq_metric_v_only[ch_k] if ch_block_v is not None
+                             else -np.inf) > DETECT_THRESH_DB)
+            _sync_above = False
+            if sync_metric_h is not None:
+                _sync_h = sync_metric_h[ch_k]
+                _sync_v = (sync_metric_v[ch_k]
+                           if (sync_metric_v is not None and ch_block_v is not None)
+                           else -np.inf)
+                _sync_above = max(_sync_h, _sync_v) > DETECT_THRESH_DB
+            if _sq_above and _sync_above:
+                det_source = 'sq+sync'
+            elif _sync_above:
+                det_source = 'sync'
+            else:
+                det_source = 'sq'
+
             # Estimate fc from peak bin locations in each window (linear domain)
             lo_freq   = float(_SQ_FREQ[_LO_MASK][np.argmax(power_lin[ch_k][_LO_MASK])])
             hi_freq   = float(_SQ_FREQ[_HI_MASK][np.argmax(power_lin[ch_k][_HI_MASK])])
@@ -739,6 +858,7 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                           ring_gen, ring_gen_fn,
                           getattr(self, 'display_center_freq_mhz', self.center_freq_mhz),
                           detect_ts, None, dual_pol),
+                    kwargs={'det_source': det_source},
                     daemon=True,
                 )
                 t._fc_hz = fc_hz
@@ -799,12 +919,22 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
     # WAV files use a 0-based cursor (seconds from file start) — their timestamps are
     # intentionally small and must NOT be replaced by wall-clock time.
     # For live radio sources, a small timestamp_int (< year 2001 Unix epoch) means the
-    # hardware clock is not yet locked to UTC (power-on counter, GPS not synced, etc.);
-    # fall back to wall-clock so the spectrogram is placed correctly instead of cycling
-    # in a 0–1 s window.
+    # hardware clock is not yet locked to UTC (Flex TSI=0, RTL-SDR, Airspy without GPS).
+    # Fall back to the sample-clock-anchored time (_iq_t0_wall + abs_sample/sr), NOT
+    # to time.time() — the latter introduces wall-clock jitter that makes _sbuf_t0
+    # jump between chunks during CPU bursts, which makes row_idx jump, which fires
+    # the spec_staging gap-fill and produces visible 200 ms bands of repeated
+    # spectrum content.  See project_sample_clock_anchoring memory.
     _is_wav = getattr(self, 'source_mode', '') == 'wav'
     if not _is_wav and timestamp_int < 1_000_000_000:
-        _pkt_time = time.time()
+        _t0 = getattr(self, '_iq_t0_wall', None)
+        if _t0 is not None:
+            # _iq_abs_sample at this point already includes this chunk's samples
+            # (incremented earlier in process_iq_data), so _sbuf_end_before pointing
+            # at the same absolute sample count yields a consistent _sbuf_t0.
+            _pkt_time = _t0 + (self._iq_abs_sample - new_n) / self.sample_rate
+        else:
+            _pkt_time = time.time()
     # Time of _sbuf[0] = packet's first-sample time minus already-buffered samples
     self._sbuf_t0 = _pkt_time - _sbuf_end_before / self.sample_rate
 
@@ -816,103 +946,120 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
     _wf_hop     = self.fft_size // 2   # constant; moved out of the loop
 
     while self._sbuf_end >= self.fft_size:
-        if _fg_visible:
-            block = self._sbuf[:self.fft_size]
+        try:
+            if _fg_visible:
+                block = self._sbuf[:self.fft_size]
 
-            X         = np.fft.fftshift(np.fft.fft(block * fft_window))
-            magnitude = np.abs(X) / (self.fft_size * window_gain)
-            power_db  = 20.0 * np.log10(magnitude / full_scale + 1e-12)
+                X         = np.fft.fftshift(np.fft.fft(block * fft_window))
+                magnitude = np.abs(X) / (self.fft_size * window_gain)
+                power_db  = 20.0 * np.log10(magnitude / full_scale + 1e-12)
 
-            # Sample-accurate time for this block: _sbuf_t0 is the time of _sbuf[0],
-            # which is always the first sample of the current block since the buffer
-            # slides by exactly one hop after each block is processed below.
-            current_wall_time = self._sbuf_t0
-            time_in_window = current_wall_time % self.history_secs
+                # Sample-accurate time for this block: _sbuf_t0 is the time of _sbuf[0],
+                # which is always the first sample of the current block since the buffer
+                # slides by exactly one hop after each block is processed below.
+                current_wall_time = self._sbuf_t0
+                time_in_window = current_wall_time % self.history_secs
 
-            # ── Accumulated spectrogram ───────────────────────────────────────
-            # Each block is written at the row corresponding to its receive time so
-            # the column position matches wall-clock time modulo the 15-second window,
-            # matching the WSJTX Fast Graph convention.
-            spec_boundary = int(current_wall_time / self.history_secs)
-            if spec_boundary != self.spec_boundary:
-                self.spectrogram_data    = self.spec_staging.copy()
-                self.spec_staging_filled = True
-                self.accumulated_noise_floor = np.percentile(self.spec_staging, 10, axis=0)
-                self.spec_staging        = np.full((self.max_history, self.fft_size), -130.0)
-                self.spec_boundary       = spec_boundary
-                self.next_boundary = current_wall_time + (
-                    self.history_secs - (current_wall_time % self.history_secs)
-                )
-                self._prev_staging_idx = None   # reset gap-fill cursor at window boundary
-                if dual_pol:
-                    self.spectrogram_data_v = self.spec_staging_v.copy()
-                    self.spec_staging_v     = np.full((self.max_history, self.fft_size), -130.0)
+                # ── Accumulated spectrogram ───────────────────────────────────────
+                # Each block is written at the row corresponding to its receive time so
+                # the column position matches wall-clock time modulo the 15-second window,
+                # matching the WSJTX Fast Graph convention.
+                spec_boundary = int(current_wall_time / self.history_secs)
+                if spec_boundary != self.spec_boundary:
+                    self.spectrogram_data    = self.spec_staging.copy()
+                    self.spec_staging_filled = True
+                    self.accumulated_noise_floor = np.percentile(self.spec_staging, 10, axis=0)
+                    self.spec_staging        = np.full((self.max_history, self.fft_size), -130.0)
+                    self.spec_boundary       = spec_boundary
+                    self.next_boundary = current_wall_time + (
+                        self.history_secs - (current_wall_time % self.history_secs)
+                    )
+                    self._prev_staging_idx = None   # reset gap-fill cursor at window boundary
+                    if dual_pol:
+                        self.spectrogram_data_v = self.spec_staging_v.copy()
+                        self.spec_staging_v     = np.full((self.max_history, self.fft_size), -130.0)
 
-            # Compute the row index for this block once — accumulated and realtime
-            # spectrograms share the same time_in_window so the index is identical.
-            # Use round() not int(): FP reconstruction of the VITA timestamp is
-            # systematically a few tens of picoseconds low, giving values like
-            # 46.99999999 that int() would floor to 46 instead of 47.
-            row_idx = min(max(round(time_in_window * self.blocks_per_sec), 0), self.max_history - 1)
+                # Compute the row index for this block once — accumulated and realtime
+                # spectrograms share the same time_in_window so the index is identical.
+                # Use round() not int(): FP reconstruction of the VITA timestamp is
+                # systematically a few tens of picoseconds low, giving values like
+                # 46.99999999 that int() would floor to 46 instead of 47.
+                row_idx = min(max(round(time_in_window * self.blocks_per_sec), 0), self.max_history - 1)
 
-            # ── Gap fill: repeat last spectrum into any skipped rows ──────────
-            # Skipped rows arise from batched packet delivery — the VITA timestamps
-            # correctly place each block, so gaps are real.  Filling prevents dark
-            # vertical stripes.  Cursors are reset at each 15 s boundary above /
-            # below so gap-fill never bridges across windows.
-            _prev_staging = self._prev_staging_idx
-            if _prev_staging is not None and row_idx > _prev_staging + 1:
-                self.spec_staging[_prev_staging + 1:row_idx] = power_db
-            self._prev_staging_idx = row_idx
-            self.spec_staging[row_idx] = power_db
-
-            # ── Real-time spectrogram ─────────────────────────────────────────
-            realtime_boundary = int(current_wall_time / self.history_secs)
-            if realtime_boundary != self._realtime_boundary:
-                # Allocate new arrays before replacing the references so the display
-                # thread reads either the complete old array or the complete new one,
-                # never a partially-reset one.
-                self.realtime_data      = np.full((self.max_history, self.fft_size), -130.0)
-                self._realtime_boundary = realtime_boundary
-                self._prev_rt_idx       = None   # reset gap-fill cursor
-                if dual_pol:
-                    self.realtime_data_v = np.full((self.max_history, self.fft_size), -130.0)
-
-            _prev_rt = self._prev_rt_idx
-            if _prev_rt is not None and row_idx > _prev_rt + 1:
-                self.realtime_data[_prev_rt + 1:row_idx] = power_db
-            self._prev_rt_idx = row_idx
-            self.realtime_data[row_idx] = power_db
-            self.realtime_filled = True
-            self._realtime_dirty = True
-
-            # ── V-channel waterfall (dual-pol only) ───────────────────────────
-            if dual_pol and self._sbuf_v_end >= self.fft_size:
-                block_v    = self._sbuf_v[:self.fft_size]
-                X_v        = np.fft.fftshift(np.fft.fft(block_v * fft_window))
-                power_db_v = 20.0 * np.log10(
-                    np.abs(X_v) / (self.fft_size * window_gain) / full_scale + 1e-12
-                )
+                # ── Gap fill: repeat last spectrum into any skipped rows ──────────
+                # Skipped rows arise from batched packet delivery — the VITA timestamps
+                # correctly place each block, so gaps are real.  Filling prevents dark
+                # vertical stripes.  Cursors are reset at each 15 s boundary above /
+                # below so gap-fill never bridges across windows.
+                _prev_staging = self._prev_staging_idx
                 if _prev_staging is not None and row_idx > _prev_staging + 1:
-                    self.spec_staging_v[_prev_staging + 1:row_idx] = power_db_v
-                self.spec_staging_v[row_idx] = power_db_v
-                if _prev_rt is not None and row_idx > _prev_rt + 1:
-                    self.realtime_data_v[_prev_rt + 1:row_idx] = power_db_v
-                self.realtime_data_v[row_idx] = power_db_v
+                    _gap = row_idx - _prev_staging - 1
+                    # Diagnostic: gaps > 2 rows (~43 ms) are worth investigating;
+                    # with sample-clock-anchored _sbuf_t0 these should not happen
+                    # in steady state.  Log size + recent timing context.
+                    if _gap > 2:
+                        logger.info(
+                            "spec_staging gap-fill: %d rows (~%.0f ms) at row_idx=%d "
+                            "_sbuf_t0=%.6f _sbuf_end_before=%d",
+                            _gap, _gap * 1000.0 / self.blocks_per_sec,
+                            row_idx, self._sbuf_t0, _sbuf_end_before,
+                        )
+                    self.spec_staging[_prev_staging + 1:row_idx] = power_db
+                self._prev_staging_idx = row_idx
+                self.spec_staging[row_idx] = power_db
 
-        # Slide sample buffer left by one hop (in-place copy, no allocation)
-        remaining = self._sbuf_end - _wf_hop
-        if remaining > 0:
-            self._sbuf[:remaining] = self._sbuf[_wf_hop:self._sbuf_end]
-        self._sbuf_end = max(0, remaining)
-        if dual_pol and self._sbuf_v_end >= _wf_hop:
-            remaining_v = self._sbuf_v_end - _wf_hop
-            if remaining_v > 0:
-                self._sbuf_v[:remaining_v] = self._sbuf_v[_wf_hop:self._sbuf_v_end]
-            self._sbuf_v_end = remaining_v
-        # Advance the time anchor by exactly one hop so the next block's
-        # current_wall_time is sample-accurate without calling time.time().
-        self._sbuf_t0 += _wf_hop / self.sample_rate
+                # ── Real-time spectrogram ─────────────────────────────────────────
+                realtime_boundary = int(current_wall_time / self.history_secs)
+                if realtime_boundary != self._realtime_boundary:
+                    # Allocate new arrays before replacing the references so the display
+                    # thread reads either the complete old array or the complete new one,
+                    # never a partially-reset one.
+                    self.realtime_data      = np.full((self.max_history, self.fft_size), -130.0)
+                    self._realtime_boundary = realtime_boundary
+                    self._prev_rt_idx       = None   # reset gap-fill cursor
+                    if dual_pol:
+                        self.realtime_data_v = np.full((self.max_history, self.fft_size), -130.0)
+
+                _prev_rt = self._prev_rt_idx
+                if _prev_rt is not None and row_idx > _prev_rt + 1:
+                    self.realtime_data[_prev_rt + 1:row_idx] = power_db
+                self._prev_rt_idx = row_idx
+                self.realtime_data[row_idx] = power_db
+                self.realtime_filled = True
+                self._realtime_dirty = True
+
+                # ── V-channel waterfall (dual-pol only) ───────────────────────────
+                if dual_pol and self._sbuf_v_end >= self.fft_size:
+                    block_v    = self._sbuf_v[:self.fft_size]
+                    X_v        = np.fft.fftshift(np.fft.fft(block_v * fft_window))
+                    power_db_v = 20.0 * np.log10(
+                        np.abs(X_v) / (self.fft_size * window_gain) / full_scale + 1e-12
+                    )
+                    if _prev_staging is not None and row_idx > _prev_staging + 1:
+                        self.spec_staging_v[_prev_staging + 1:row_idx] = power_db_v
+                    self.spec_staging_v[row_idx] = power_db_v
+                    if _prev_rt is not None and row_idx > _prev_rt + 1:
+                        self.realtime_data_v[_prev_rt + 1:row_idx] = power_db_v
+                    self.realtime_data_v[row_idx] = power_db_v
+
+        except Exception as _wf_exc:
+            import logging as _lg
+            _lg.getLogger(__name__).warning("waterfall FFT error (skipping block): %s", _wf_exc)
+
+        finally:
+            # Slide always runs — even on exception — so _sbuf_end never overflows.
+            remaining = self._sbuf_end - _wf_hop
+            if remaining > 0:
+                self._sbuf[:remaining] = self._sbuf[_wf_hop:self._sbuf_end]
+            self._sbuf_end = max(0, remaining)
+            if dual_pol and self._sbuf_v_end >= _wf_hop:
+                remaining_v = self._sbuf_v_end - _wf_hop
+                if remaining_v > 0:
+                    self._sbuf_v[:remaining_v] = self._sbuf_v[_wf_hop:self._sbuf_v_end]
+                self._sbuf_v_end = remaining_v
+            # Advance the time anchor by exactly one hop so the next block's
+            # current_wall_time is sample-accurate without calling time.time().
+            self._sbuf_t0 += _wf_hop / self.sample_rate
 
     # Keep _wav_time_cursor in sync for the WAV source step (it uses this to
     # timestamp the next packet it will send into process_iq_data).

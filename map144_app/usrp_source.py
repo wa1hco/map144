@@ -228,6 +228,27 @@ class USRPSource:
 
         channels = [0, 1] if self.dual_channel else [0]
 
+        # B210 has one daughterboard with two front-ends (A:A → TX/RX port,
+        # A:B → RX2 port).  UHD's default subdev_spec enables only A:A; if
+        # we request channels=[0, 1] without expanding the subdev_spec, UHD
+        # silently delivers channel 0 samples in both output slots — the H
+        # and V streams look identical.  Expand the subdev_spec in dual
+        # mode so channel 0 maps to A:A and channel 1 maps to A:B.
+        # Log at print() level so misconfigurations are immediately visible
+        # without turning up the log verbosity.
+        if self.dual_channel:
+            try:
+                self._usrp.set_rx_subdev_spec(_uhd.usrp.SubdevSpec("A:A A:B"))
+            except Exception as exc:
+                print(f"[usrp] set_rx_subdev_spec('A:A A:B') FAILED: {exc}", flush=True)
+                print("[usrp] dual-channel mode will deliver duplicated ch0 data", flush=True)
+            try:
+                current = self._usrp.get_rx_subdev_spec(0)
+                print(f"[usrp] rx_subdev_spec now: '{current}' "
+                      f"(num_rx_channels={self._usrp.get_rx_num_channels()})", flush=True)
+            except Exception as exc:
+                print(f"[usrp] get_rx_subdev_spec readback failed: {exc}", flush=True)
+
         for ch in channels:
             self._usrp.set_rx_rate(_HW_RATE, ch)
             lo_tune_hz = self.center_freq_mhz * 1e6 - self.lo_offset_hz
@@ -313,6 +334,33 @@ class USRPSource:
             self._thread.join(timeout=3.0)
             self._thread = None
         self._usrp = None
+
+    def retune(self, center_freq_mhz: float):
+        """Retune to a new center frequency while streaming.
+
+        Updates both channels when dual_channel is active.  Resets the NCO
+        phase accumulators so the downconversion stays coherent after the LO
+        settles.  Safe to call from the Qt main thread while the recv loop runs.
+        """
+        self.center_freq_mhz = center_freq_mhz
+        if self._usrp is None:
+            return
+        channels = [0, 1] if self.dual_channel else [0]
+        tune_result = None
+        for ch in channels:
+            lo_tune_hz = center_freq_mhz * 1e6 - self.lo_offset_hz
+            try:
+                tune_result = self._usrp.set_rx_freq(
+                    _uhd.types.TuneRequest(lo_tune_hz), ch
+                )
+            except Exception as exc:
+                logger.warning("[usrp] retune ch%d to %.3f MHz failed: %s", ch, center_freq_mhz, exc)
+                return
+        if tune_result is not None:
+            self.center_freq_mhz_actual = (tune_result.actual_rf_freq + self.lo_offset_hz) / 1e6
+        self._nco_phase  = 0.0
+        self._nco_phase1 = 0.0
+        logger.debug("[usrp] retuned to %.4f MHz", self.center_freq_mhz_actual)
 
     # ── Internal receive loop (runs in daemon thread) ─────────────────────
 

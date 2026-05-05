@@ -1477,6 +1477,237 @@ def _apply_pol_split(signal: np.ndarray, pol_scenario: str, rng,
     return rH, rV, pol_meta
 
 
+# ── Ramp-mode helpers (calibrated SNR sweep) ─────────────────────────────────
+
+RAMP_AUDIO_RATE = 12000        # WSJT-X expects 12 kHz mono
+RAMP_IQ_RATE    = 48000        # MAP144 channelizer input rate
+RAMP_AUDIO_CENTER_HZ = 1500.0  # WSJT-X USB audio centre
+
+
+def _write_audio_wav(path: Path, samples: np.ndarray, sample_rate: int) -> None:
+    """Write a mono real-audio WAV (PCM int16) — the format WSJT-X File→Open
+    and headless ``jt9 -m`` accept directly.  Peak-normalised to 0.95 full scale
+    only if necessary (signal already exceeds ±1.0); otherwise written at unity
+    gain so that calibrated noise floors are preserved."""
+    peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+    scale = 0.95 / peak if peak > 1.0 else 1.0
+    pcm = np.clip(samples * scale, -1.0, 1.0)
+    pcm_i16 = (pcm * 32767.0).astype(np.int16)
+    with wave.open(str(path), 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_i16.tobytes())
+
+
+def _make_msk144_burst_real(msg: str, sample_rate: int, n_frames: int = 1) -> np.ndarray:
+    """Return ``n_frames`` MSK144 frames at unit-amplitude COMPLEX baseband, 0 Hz.
+
+    Phase continuity across frame boundaries is preserved by tiling the chip
+    sequence first and modulating the full stream in one pass — tiling the
+    already-modulated waveform would introduce a phase jump at every 72 ms
+    boundary that the matched-filter decoder cannot correlate through.
+    Caller multiplies by the desired carrier and amplitude.
+    """
+    result = subprocess.run(['msk144code', msg], capture_output=True, text=True, check=True)
+    sym_lines = [l for l in result.stdout.strip().splitlines()
+                 if set(l.strip()) <= {'0', '1'} and len(l.strip()) >= 60]
+    if len(sym_lines) < 2:
+        raise RuntimeError(f"msk144code output unexpected for {msg!r}")
+    bits = [int(b) for line in sym_lines[:2] for b in line.strip()]
+    if len(bits) != 144:
+        raise RuntimeError(f"Expected 144 symbols, got {len(bits)}")
+    chips = np.array([1 if b else -1 for b in bits], dtype=np.float64)
+    if n_frames > 1:
+        chips = np.tile(chips, n_frames)
+    return _modulate_msk144(chips, sample_rate)   # unit-amplitude complex
+
+
+def _run_ramp_mode(args) -> None:
+    """SNR-ramp emit path.
+
+    Builds a 12 kHz mono real-audio buffer (the canonical, SNR-calibrated test
+    signal that WSJT-X / headless ``jt9 --msk144`` ingests directly) containing
+    N MSK144 pings at monotonically increasing SNRs in a 2500 Hz reference
+    bandwidth.
+
+    The 48 kHz complex-IQ output is the **signal** taken from a noise-free copy
+    of the audio buffer (Hilbert → resample → optional frequency shift) PLUS a
+    **fresh full-band complex AWGN** floor that fills the entire ±24 kHz IQ
+    Nyquist band.  This matches what an on-air receiver actually delivers to
+    MAP144's channelizer; deriving IQ noise via Hilbert from the 12 kHz audio
+    would give a 6 kHz-wide noise blob whose ``|·|²`` (the squared-FFT
+    detection step) splatters into the rest of the IF band and triggers
+    spurious detections in channels with no real signal.  See
+    https://… (this comment block) for the calibration derivation.
+
+    Calibration: SNR-in-2500-Hz matches between files
+    -------------------------------------------------
+    Audio (real 12 kHz mono):
+        signal mean power      = A_audio² / 2          (real cos)
+        noise power in 2500 Hz = σ_a²  · 2500 / 6000   (one-sided over fs/2)
+        SNR_audio = (A²/2) / (σ_a² · 2500/6000) = (3·A²) / (2500·σ_a²)
+
+    IQ (complex 48 kHz, fresh full-band AWGN, signal via Hilbert+resample):
+        signal mean power      = A_audio²              (Hilbert doubles |·|²)
+        noise power in 2500 Hz = σ_iq² · 2500 / 48000  (two-sided over full IQ)
+        SNR_iq   = A² / (σ_iq² · 2500/48000) = (48000·A²) / (2500·σ_iq²)
+
+    Setting SNR_iq = SNR_audio yields ``σ_iq² = 16·σ_a²``, i.e. **σ_iq = 4·σ_a**.
+
+    Each ping carries a self-describing ``A...`` message encoding its intended
+    SNR; the truth JSON sidecar lists the full plan for the scoring step.
+    """
+    if args.ramp_snr_max < args.ramp_snr_min:
+        raise SystemExit("--ramp-snr-max must be >= --ramp-snr-min")
+    n_steps = int(round((args.ramp_snr_max - args.ramp_snr_min) / args.ramp_snr_step)) + 1
+    if n_steps <= 0:
+        raise SystemExit("ramp produces zero pings — check --ramp-snr-min/-max/-step")
+
+    snr_seq = [args.ramp_snr_min + k * args.ramp_snr_step for k in range(n_steps)]
+    delays  = [args.ramp_t0 + k * args.ramp_spacing for k in range(n_steps)]
+    if delays[-1] >= args.duration - 0.1:
+        raise SystemExit(
+            f"Ramp does not fit in {args.duration:.1f} s: last ping at {delays[-1]:.2f} s. "
+            f"Reduce --ramp-snr-step or --ramp-spacing, or extend --duration.")
+
+    rng = np.random.default_rng(args.seed)
+    n_audio = int(args.duration * RAMP_AUDIO_RATE)
+    n_iq    = int(args.duration * RAMP_IQ_RATE)
+
+    # Audio noise floor: full-scale ±1.0 in the WAV.  noise_floor_dbfs sets the
+    # per-bin floor at the receiver's display FFT (4096 bins over 0..fs/2).
+    # Per-sample sigma_audio is back-derived from the per-bin level.
+    display_fft_size = 4096
+    noise_floor_amp = 10.0 ** (args.noise_floor_dbfs / 20.0)
+    sigma_audio = float(np.sqrt(display_fft_size) * noise_floor_amp)
+    sigma_iq    = 4.0 * sigma_audio   # see docstring derivation
+
+    # ── Build noise-only audio (real, 12 kHz) and signal-only audio side ────
+    audio_noise = rng.normal(0.0, sigma_audio, size=n_audio).astype(np.float32)
+    audio_signal = np.zeros(n_audio, dtype=np.float32)
+    BW = MSK144_SNR_BW_HZ
+    fs = float(RAMP_AUDIO_RATE)
+
+    truth = []
+    for k, (snr_db, delay_s) in enumerate(zip(snr_seq, delays)):
+        # Self-describing message: freq-field always 0 in ramp mode (IQ offset
+        # is in the sidecar, not the message).  SNR + decisecond-time encoded.
+        time_ds = int(round(min(max(delay_s, 0.5), args.duration - 0.5) * 10))
+        snr_int = int(round(snr_db))
+        msg = encode_ping_message(freq_khz=0, time_ds=time_ds, snr_db=snr_int)
+
+        # Unit-amplitude complex MSK144 baseband, then up-shift to 1500 Hz
+        # and take Re{} to get a real audio burst at the WSJT-X centre.
+        burst_c = _make_msk144_burst_real(msg, RAMP_AUDIO_RATE, n_frames=args.ramp_frames)
+        t = np.arange(len(burst_c), dtype=np.float64) / fs
+        burst_real = np.real(burst_c * np.exp(1j * 2.0 * np.pi * RAMP_AUDIO_CENTER_HZ * t))
+
+        # Real-signal amplitude for target SNR over the 2500 Hz reference,
+        # given the real AWGN at sigma_audio per sample (see docstring).
+        snr_lin = 10.0 ** (snr_db / 10.0)
+        amp = 2.0 * sigma_audio * np.sqrt(snr_lin * BW / fs)
+        burst_real = (burst_real * amp).astype(np.float32)
+
+        delay_n = int(round(delay_s * fs))
+        end_n   = min(delay_n + len(burst_real), n_audio)
+        audio_signal[delay_n:end_n] += burst_real[:end_n - delay_n]
+
+        truth.append({
+            'message':       msg,
+            't_offset_s':    round(delay_s, 4),
+            'snr_db_input':  round(float(snr_db), 2),
+            'audio_freq_hz': RAMP_AUDIO_CENTER_HZ,
+            'iq_freq_hz':    RAMP_AUDIO_CENTER_HZ + args.iq_offset_hz,
+        })
+
+    audio_buf = audio_noise + audio_signal
+
+    # ── Build IQ: flat full-band complex AWGN at 48 kHz + signal-only path ──
+    from scipy import signal as _scipy_signal
+    iq_noise_re = rng.normal(0.0, sigma_iq / np.sqrt(2.0), size=n_iq)
+    iq_noise_im = rng.normal(0.0, sigma_iq / np.sqrt(2.0), size=n_iq)
+    iq_buf = (iq_noise_re + 1j * iq_noise_im).astype(np.complex64)
+
+    # Signal-only path: Hilbert(real audio signal) → resample to 48 kHz → shift.
+    # Hilbert doubles |·|² of the signal which the calibration above accounts
+    # for; resample_poly is band-limited interpolation that preserves SNR.
+    analytic_sig = _scipy_signal.hilbert(audio_signal).astype(np.complex64)
+    iq_signal = _scipy_signal.resample_poly(
+        analytic_sig, up=RAMP_IQ_RATE, down=RAMP_AUDIO_RATE).astype(np.complex64)
+    if args.iq_offset_hz != 0.0:
+        t_iq = np.arange(len(iq_signal), dtype=np.float64) / RAMP_IQ_RATE
+        iq_signal = (iq_signal * np.exp(1j * 2.0 * np.pi * args.iq_offset_hz * t_iq)).astype(np.complex64)
+    # Length-match (resample can be off by 1 sample) and add.
+    n_add = min(len(iq_buf), len(iq_signal))
+    iq_buf[:n_add] += iq_signal[:n_add]
+
+    # ── Output paths ─────────────────────────────────────────────────────────
+    _ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+    _stem = f"ramp_{_ts}_{n_steps}sig_{int(round(args.ramp_snr_min)):+d}to{int(round(args.ramp_snr_max)):+d}dB"
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    audio_path = out_dir / f"{_stem}_audio.wav"
+    iq_path    = out_dir / f"{_stem}_iq.wav"
+    truth_path = out_dir / f"{_stem}_truth.json"
+
+    _write_audio_wav(audio_path, audio_buf, RAMP_AUDIO_RATE)
+    write_iq_wav(iq_path, iq_buf, RAMP_IQ_RATE, scale=1.0)
+
+    truth_doc = {
+        'generated_at':     _ts,
+        'duration_s':       float(args.duration),
+        'audio_rate_hz':    RAMP_AUDIO_RATE,
+        'iq_rate_hz':       RAMP_IQ_RATE,
+        'iq_offset_hz':     float(args.iq_offset_hz),
+        'noise_floor_dbfs': float(args.noise_floor_dbfs),
+        'snr_reference_bw_hz': MSK144_SNR_BW_HZ,
+        'pings':            truth,
+    }
+    truth_path.write_text(json.dumps(truth_doc, indent=2))
+
+    # MAP144's built-in WAV-comparison thread (see runtime._run_wav_comparison)
+    # looks for ``<wav>.json`` next to the WAV and expects a ``placements`` list
+    # in the schema used by the ``--count N`` path.  Write that sidecar too so
+    # MAP144 emits its comparison report automatically at end of WAV playback.
+    iq_manifest_path = iq_path.with_suffix('.json')
+    iq_manifest = {
+        'generated_at':      datetime.now(timezone.utc).isoformat(),
+        'output_wav':        str(iq_path),
+        'channels':          1,
+        'channel_format':    'single (I=L, Q=R)',
+        'output_rate':       RAMP_IQ_RATE,
+        'duration_s':        float(args.duration),
+        'noise_floor_dbfs':  float(args.noise_floor_dbfs),
+        'no_noise':          False,
+        'atten_db':          0.0,
+        'mode':              'ramp',
+        'iq_offset_hz':      float(args.iq_offset_hz),
+        'snr_reference_bw_hz': MSK144_SNR_BW_HZ,
+        'placements': [
+            {
+                'msg':       p['message'],
+                'center_hz': p['iq_freq_hz'],
+                'delay_s':   p['t_offset_s'],
+                # MAP144's _run_wav_comparison report uses ``f"{v:>+4d}"`` on
+                # ``snr_db`` (see runtime._snr_str); the existing --count path
+                # always writes int.  Cast to match that schema.
+                'snr_db':    int(round(p['snr_db_input'])),
+                'width_ms':  0,
+            }
+            for p in truth
+        ],
+    }
+    iq_manifest_path.write_text(json.dumps(iq_manifest, indent=2))
+
+    print(f"Ramp: {n_steps} pings, SNR {args.ramp_snr_min:+.1f} → {args.ramp_snr_max:+.1f} dB"
+          f"  step {args.ramp_snr_step:.1f} dB  spacing {args.ramp_spacing:.2f} s")
+    print(f"  audio (WSJT-X / jt9): {audio_path}")
+    print(f"  IQ    (MAP144):       {iq_path}  (offset {args.iq_offset_hz:+.0f} Hz)")
+    print(f"  manifest (MAP144):    {iq_manifest_path}")
+    print(f"  truth (score_ramp):   {truth_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -1545,7 +1776,39 @@ def main() -> None:
                         help='Skip output spectrogram plot')
     parser.add_argument('--output-dir', default='MSK144/simulations',
                         help='Directory for output files')
+
+    # ── Ramp mode (calibrated SNR sweep for WSJT-X vs MAP144 comparison) ──
+    parser.add_argument('--ramp', action='store_true',
+                        help='Calibrated SNR-ramp mode: emit a 12 kHz mono real-audio WAV '
+                             '(for WSJT-X File→Open / headless jt9), a 48 kHz complex-IQ WAV '
+                             '(for MAP144 replay), and a JSON truth sidecar.  Overrides --count.')
+    parser.add_argument('--ramp-snr-min', type=float, default=-15.0,
+                        help='Lowest SNR (dB, WSJT-X 2500 Hz reference) in the ramp')
+    parser.add_argument('--ramp-snr-max', type=float, default=0.0,
+                        help='Highest SNR (dB, WSJT-X 2500 Hz reference) in the ramp')
+    parser.add_argument('--ramp-snr-step', type=float, default=1.0,
+                        help='SNR step in dB; pings = floor((max-min)/step) + 1')
+    parser.add_argument('--ramp-spacing', type=float, default=0.9,
+                        help='Seconds between consecutive ping starts.  Default 0.9 s lets a '
+                             '16-step ramp fit in 15 s with margin on both ends.')
+    parser.add_argument('--ramp-t0', type=float, default=0.5,
+                        help='Time of first ping in seconds (≥ 0.5 s leaves pre-burst noise '
+                             'window for SPD-style estimators).')
+    parser.add_argument('--ramp-frames', type=int, default=5,
+                        help='Number of 72 ms MSK144 frames per ping at constant amplitude. '
+                             '5 frames (~360 ms) gives MDS ≈ −6 dB on jt9, close to the '
+                             'published WSJT-X MSK144 sensitivity.  Single-frame (1) is too '
+                             'short for the matched-filter decoder and shifts MDS by ~10 dB.')
+    parser.add_argument('--iq-offset-hz', type=float, default=0.0,
+                        help='Frequency offset (Hz) added to the IQ render only.  The audio '
+                             'render always places the signal at 1500 Hz (WSJT-X convention). '
+                             'Use this to stress MAP144 corner cases (channelizer edges, BPF '
+                             'skirts) without changing what WSJT-X sees.')
+
     args = parser.parse_args()
+
+    if args.ramp:
+        return _run_ramp_mode(args)
 
     from datetime import datetime as _dt
     _ts = _dt.now().strftime('%Y%m%d_%H%M%S')

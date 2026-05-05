@@ -412,6 +412,54 @@ def update_displays(self):
             self.ch_detect_img_v.setRect(_hm_rect)
             _detect_plot_v.setXRange(0, float(self.history_secs) + 0.5, padding=0)
 
+    # ── Sync-detector heatmap (parallel panel; same axes / scale) ────────────
+    _sync_win = getattr(self, '_sync_detect_win', None)
+    if _sync_win is None or _sync_win.isVisible():
+        _sync_plot = getattr(self, 'sync_detect_plot', None)
+        if _sync_plot is not None:
+            _hm_rect = QtCore.QRectF(
+                0.0, self._detect_freq_min_khz,
+                float(self.history_secs), self._detect_freq_span_khz,
+            )
+            sync_h = np.fft.fftshift(self._sync_snr_history_h, axes=1)
+            _dw  = max(_sync_plot.width(), 1)
+            _rep = max(1, -(-_dw // sync_h.shape[0]))
+            _sync_levels = [getattr(self, 'sync_detect_min_level', self.detect_min_level),
+                            getattr(self, 'sync_detect_max_level', self.detect_max_level)]
+            self.sync_detect_img.setImage(
+                np.repeat(sync_h, _rep, axis=0),
+                autoLevels=False,
+                levels=_sync_levels,
+            )
+            self.sync_detect_img.setRect(_hm_rect)
+            _sync_plot.setXRange(0, float(self.history_secs) + 0.5, padding=0)
+
+            _sync_plot_v = getattr(self, 'sync_detect_plot_v', None)
+            if _dual and _sync_plot_v is not None:
+                sync_v = np.fft.fftshift(self._sync_snr_history_v, axes=1)
+                _dw_v  = max(_sync_plot_v.width(), 1)
+                _rep_v = max(1, -(-_dw_v // sync_v.shape[0]))
+                self.sync_detect_img_v.setImage(
+                    np.repeat(sync_v, _rep_v, axis=0),
+                    autoLevels=False,
+                    levels=_sync_levels,
+                )
+                self.sync_detect_img_v.setRect(_hm_rect)
+                _sync_plot_v.setXRange(0, float(self.history_secs) + 0.5, padding=0)
+                if not _sync_plot_v.isVisible():
+                    _sync_plot_v.show()
+            elif _sync_plot_v is not None and _sync_plot_v.isVisible():
+                _sync_plot_v.hide()
+
+    # Re-anchor the squared-FFT detection block so the sync-marker overlay
+    # below still sees a valid `_hm_rect` and `markers` list — restore the
+    # outer-block context that is otherwise scoped to the squared-FFT branch.
+    if _detect_win is None or _detect_win.isVisible():
+        _hm_rect = QtCore.QRectF(
+            0.0, self._detect_freq_min_khz,
+            float(self.history_secs), self._detect_freq_span_khz,
+        )
+
         # ── jt9 launch markers ────────────────────────────────────────────────
         # Green   = decoded successfully
         # Red     = launched, jt9 still running
@@ -487,6 +535,35 @@ def update_displays(self):
                     (self.ch_detect_curve_orange_v, nod_v),
                 ):
                     curve.setData(*_circle_path(mlist), connect='finite') if mlist else curve.setData(x=[], y=[])
+
+            # Mirror the same circle overlay onto the sync-detector heatmap so
+            # the user sees the same decode-progress markers (cyan/green/red/
+            # orange) over both detector views.  Markers don't depend on the
+            # underlying detector — they reflect the launch/decode lifecycle.
+            _sync_plot   = getattr(self, 'sync_detect_plot',   None)
+            _sync_plot_v = getattr(self, 'sync_detect_plot_v', None)
+            if _sync_plot is not None:
+                for curve_name, mlist in (
+                    ('sync_detect_curve_cyan',   spd_h),
+                    ('sync_detect_curve_green',  jt9_h),
+                    ('sync_detect_curve_red',    run_h),
+                    ('sync_detect_curve_orange', nod_h),
+                ):
+                    curve = getattr(self, curve_name, None)
+                    if curve is None:
+                        continue
+                    curve.setData(*_circle_path(mlist), connect='finite') if mlist else curve.setData(x=[], y=[])
+                if _dual and _sync_plot_v is not None:
+                    for curve_name, mlist in (
+                        ('sync_detect_curve_cyan_v',   spd_v),
+                        ('sync_detect_curve_green_v',  jt9_v),
+                        ('sync_detect_curve_red_v',    run_v),
+                        ('sync_detect_curve_orange_v', nod_v),
+                    ):
+                        curve = getattr(self, curve_name, None)
+                        if curve is None:
+                            continue
+                        curve.setData(*_circle_path(mlist), connect='finite') if mlist else curve.setData(x=[], y=[])
 
     utc_time = datetime.datetime.now(datetime.UTC).strftime("%H:%M:%S")
     self.utc_clock_label.setText(f"UTC: {utc_time}")

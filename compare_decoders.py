@@ -17,6 +17,7 @@ Save PNGs and exit without GUI:
 import argparse
 import json
 import re
+import signal
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -33,7 +34,7 @@ from PyQt5 import QtCore, QtWidgets
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-WSJTX_ALL       = Path.home() / ".local/share/WSJT-X - Local/ALL.TXT"
+WSJTX_ALL       = Path.home() / ".local/share/WSJT-X - flex/ALL.TXT"
 MAP144_LOG      = Path(__file__).parent / "MSK144/detections/decodes.jsonl"
 MAP144_LAUNCHES = Path(__file__).parent / "MSK144/detections/launches.jsonl"
 
@@ -1061,6 +1062,16 @@ def main():
 
     # ── GUI path ──────────────────────────────────────────────────────────────
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+
+    # Ctrl-C from the terminal: Qt's event loop ignores Python signals while it
+    # is running C++ code, so we restore the default SIGINT handler (which raises
+    # KeyboardInterrupt → exit) and tick a no-op QTimer every 200 ms to give
+    # control back to the Python interpreter often enough for the signal to fire.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    _sigint_timer = QtCore.QTimer()
+    _sigint_timer.start(200)
+    _sigint_timer.timeout.connect(lambda: None)
+
     win = CompareGUI(initial_date=args.date)
     win.show()
     sys.exit(app.exec_())

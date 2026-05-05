@@ -42,7 +42,8 @@ class Engine:
         self.sample_rate = sample_rate
         self.fft_size = fft_size
         self.bind_client_id = bind_client_id
-        self.nb_factor = nb_factor
+        self.nb_factor   = nb_factor   # K threshold, H channel
+        self.nb_factor_v = nb_factor   # K threshold, V channel (dual-pol)
         self.history_secs = 15
         self.blocks_per_sec = self.sample_rate / (self.fft_size // 2)
         self.max_history = int(round(self.history_secs * self.blocks_per_sec))
@@ -64,6 +65,9 @@ class Engine:
         self._airspy_started = False
         self.rtlsdr_client = None
         self._rtlsdr_started = False
+        self.sdrangel_client   = None
+        self.sdrangel_client_v = None
+        self._sdrangel_started = False
 
         # Overlap-add buffer for waterfall FFT (H, and V for dual-pol)
         _sbuf_cap = self.fft_size * 6
@@ -89,9 +93,25 @@ class Engine:
         # amplitude threshold; immune to the per-bin average inflation problem.
         self._nb_blkrms_median = None
 
-        # Noise blanker state — V channel (dual-pol display only; blanking uses H mask)
-        self._nb_spec_avg_v = None
-        self._nb_last_P_v   = None
+        # Noise blanker state — V channel (dual-pol, independent detection).
+        # Mirrors every per-channel field above with a ``_v`` suffix so the
+        # Linrad and NR0V backends can run parallel H and V detection
+        # pipelines without hidden state sharing.
+        self._nb_env_v            = None
+        self._nb_floor_v          = None
+        self._nb_wideband_floor_v = None
+        self._nb_lowlevel_frac_v  = 0.75
+        self._nb_spec_avg_v       = None
+        self._nb_last_P_v         = None
+        self._nb_last_hot_v       = 0
+        self._nb_blkrms_median_v  = None
+        self._nb_last_blanked_P_v = None
+
+        # Selected noise-blanker backend.  State above is owned by the engine
+        # so display/reset paths are unchanged across backends; the backend
+        # itself is swappable at runtime via ``set_blanker(name)``.
+        from .noise_blanker import LinradBlanker
+        self.blanker = LinradBlanker()
 
         # Time-domain magnitude display buffer (200 ms circular) — H and V
         # _td_mag_buf*     : post-blanker (cleaned signal, for waveform display)
@@ -176,6 +196,42 @@ class Engine:
         self._metric_hist_idx_v = 0
         self._metric_hist_cnt_v = 0
 
+        # Coherent-sync detector state (Step 1 of sensitivity-improvement plan).
+        # Runs in parallel with the squared-FFT detector; pair_metric is the
+        # max of (squared-domain dB, sync-correlator dB) so a hit on either
+        # path triggers the cluster gate.  Coherent integration over the
+        # 16-chip MSK144 sync buys ~6 dB over the squared-domain ±1 kHz tone
+        # detector at low SNR (closes the 6 dB gap measured against WSJT-X
+        # in the ramp-test framework).
+        # Dedicated per-channel rolling ring of NSPM samples for the sync
+        # correlator.  Updated each input chunk (FIFO shift-and-append) so it
+        # always holds the most recent 72 ms regardless of how the per-channel
+        # detection buffer (_ch_buf) is being drained.  This is essential for
+        # live sources with small chunks (Flex VITA packets, ~60 channelized
+        # samples per call): _ch_buf never accumulates NSPM samples before the
+        # hop loop drains it, so reading directly from _ch_buf would skip the
+        # sync correlator entirely under live operation — leaving stale
+        # cached metrics that render as horizontal bands in the sync heatmap.
+        # The channelizer already places signal energy at DC in each channel
+        # output, so no pre-mix is needed before correlation.
+        from .msk144_spd import NSPM as _SYNC_NSPM
+        self._sync_buf       = np.zeros((N_CHANNELS, _SYNC_NSPM), dtype=np.complex64)
+        self._sync_buf_v     = np.zeros((N_CHANNELS, _SYNC_NSPM), dtype=np.complex64)
+        self._sync_metric_hist_buf   = np.zeros((_METRIC_HIST_DEPTH, N_CHANNELS), dtype=np.float32)
+        self._sync_metric_hist_idx   = 0
+        self._sync_metric_hist_cnt   = 0
+        self._sync_metric_hist_buf_v = np.zeros((_METRIC_HIST_DEPTH, N_CHANNELS), dtype=np.float32)
+        self._sync_metric_hist_idx_v = 0
+        self._sync_metric_hist_cnt_v = 0
+        # Per-hop sync metric history for the dedicated sync-detector heatmap
+        # (mirrors _ch_snr_history_h/v which the squared-FFT detector writes).
+        # Same axes: rows = hops, cols = channels; row index is the hop count
+        # modulo N_SNR_HIST.  Hop counter resets to 0 at each 15-s boundary
+        # cross so a fresh period always starts filling at row 0.
+        self._sync_snr_history_h = np.full((N_SNR_HIST, N_CHANNELS), -999.0, dtype=np.float32)
+        self._sync_snr_history_v = np.full((N_SNR_HIST, N_CHANNELS), -999.0, dtype=np.float32)
+        self._ch_snr_hop_count = 0
+
         # Pre-computed FFT window
         self._fft_window = np.hanning(self.fft_size).astype(np.float32)
         self._window_gain = float(np.sqrt(np.mean(self._fft_window ** 2)))
@@ -194,6 +250,10 @@ class Engine:
         self._iq_ring = np.zeros((_ring_n, 2), dtype=np.complex64)
         self._iq_ring_pos = 0
         self._iq_abs_sample = 0
+        # Wall-clock for ring sample 0; refreshed each chunk in process_iq_data.
+        # Used by extract_and_decode to derive the exact ping epoch from the IQ
+        # sample index, immune to pipeline / queue latency.
+        self._iq_t0_wall: float | None = None
         self._detect_cooldowns   = {}
         self._ch_above_thresh    = {}   # ch_k -> consecutive hops above threshold
         self._iq_ring_gen = 0
@@ -208,6 +268,21 @@ class Engine:
         ) / 1e6
         self.freq_axis = self.fft_bin_axis_mhz + self.center_freq_mhz
         self.display_center_freq_mhz = -1.0  # force report_freq() on first display update
+
+    def set_blanker(self, name: str) -> None:
+        """Switch noise-blanker backend at runtime.
+
+        The previous backend's warm-up state (``_nb_*``) is cleared so the new
+        backend starts from a clean baseline on the next chunk.  No sample-
+        stream gap is introduced — the next ``process_iq_data`` call simply
+        runs under the new backend.
+        """
+        from .noise_blanker import make
+        new = make(name)
+        old = getattr(self, 'blanker', None)
+        if old is not None:
+            old.reset(self)     # clear prior backend's warm-up state
+        self.blanker = new
 
     def _rebuild_channelizer_state(self):
         """Rebuild channelizer NCO after center_freq_mhz or calling_freq_mhz changes.

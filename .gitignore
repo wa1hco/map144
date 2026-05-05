@@ -87,3 +87,7 @@ Thumbs.db
 # Local working copy of DSP / decode reliability plan (canonical: docs/dsp-reliability-plan.example.md)
 docs/dsp-reliability-plan.md
 
+# Vendored WDSP build artifacts (source is tracked; binaries rebuild locally)
+vendor/wdsp/*.o
+vendor/wdsp/*.so
+

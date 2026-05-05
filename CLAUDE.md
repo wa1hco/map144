@@ -24,6 +24,12 @@ When making code changes:
 - Do not silently change numerical conventions, normalization, indexing, or phase sign conventions.
 - If a change may alter decode behavior, detection sensitivity, or numerical stability, say so explicitly.
 
+## GUI preferences
+
+- Framework: PyQt5 (Qt)
+- Theme: light mode
+- Font size: 12 pt
+
 ## Project goals
 
 ### MAP144

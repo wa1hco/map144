@@ -1,7 +1,13 @@
 {
     "workbench.editor.enablePreview": false,
     "workbench.editor.enablePreviewFromQuickOpen": false,
-    "python-envs.pythonProjects": [],
+    "python-envs.pythonProjects": [
+        {
+            "path": ".",
+            "envManager": "ms-python.python:venv",
+            "packageManager": "ms-python.python:pip"
+        }
+    ],
     "chat.tools.terminal.autoApprove": {
         "/home/jeff/ham/map144/.venv/bin/python": true
     },

@@ -176,11 +176,12 @@ def setup_radio_client(self):
 def _connect_airspy_client(self):
     """Instantiate AirspyHFSource on first use (called from on_select_source_airspy)."""
     if getattr(self, 'airspy_client', None) is not None:
+        self.airspy_client.center_freq_mhz = self.calling_freq_mhz
         return
     try:
         from .airspy_source import AirspyHFSource
         self.airspy_client = AirspyHFSource(
-            center_freq_mhz=28.180,   # MSK144 10m calling frequency
+            center_freq_mhz=self.calling_freq_mhz,
             target_rate=self.sample_rate,
         )
         print("[airspy] AirspyHFSource created", flush=True)
@@ -246,11 +247,12 @@ def _stop_airspy_source(self):
 def _connect_rtlsdr_client(self):
     """Instantiate NesdrSmartSource on first use (called from on_select_source_rtlsdr)."""
     if getattr(self, 'rtlsdr_client', None) is not None:
+        self.rtlsdr_client.center_freq_mhz = self.calling_freq_mhz
         return
     try:
         from .rtlsdr_source import NesdrSmartSource
         self.rtlsdr_client = NesdrSmartSource(
-            center_freq_mhz=50.260,   # MSK144 6m calling frequency
+            center_freq_mhz=self.calling_freq_mhz,
             target_rate=self.sample_rate,
         )
         print("[rtlsdr] NesdrSmartSource created", flush=True)
@@ -290,9 +292,199 @@ def _stop_rtlsdr_source(self):
     self._rtlsdr_started = False
 
 
+def _connect_sdrangel_client(self):
+    """Instantiate SDRAngelSource(s) on first use (called from on_select_source_sdrangel).
+
+    Reads connection settings from QSettings.  Always creates both H (device set N)
+    and V (device set N+1) clients — MAP144 always uses SDRangel with a USRP B210
+    which has two RX streams.  auto_configure_b210() creates the device sets if
+    they don't yet exist.  V-channel UDP port is primary port - 1.
+    """
+    if getattr(self, 'sdrangel_client', None) is not None:
+        self.sdrangel_client.calling_freq_mhz = self.calling_freq_mhz
+        sc_v = getattr(self, 'sdrangel_client_v', None)
+        if sc_v is not None:
+            sc_v.calling_freq_mhz = self.calling_freq_mhz
+        return
+    try:
+        from .sdrangel_source import SDRAngelSource
+        from .visualizer import _SETTINGS as _S
+        _host = str(_S.value('sdrangel_host', 'localhost'))
+        try:
+            _rest_port = int(_S.value('sdrangel_rest_port', 8091))
+        except (ValueError, TypeError):
+            _rest_port = 8091
+        try:
+            _udp_port = int(_S.value('sdrangel_udp_port', 9999))
+        except (ValueError, TypeError):
+            _udp_port = 9999
+        try:
+            _dev_set = int(_S.value('sdrangel_device_set', 0))
+        except (ValueError, TypeError):
+            _dev_set = 0
+        try:
+            _lo_offset = float(_S.value('sdrangel_lo_offset_khz', 50.0))
+        except (ValueError, TypeError):
+            _lo_offset = 50.0
+        try:
+            _dev_rate = int(_S.value('sdrangel_dev_sample_rate', 192000))
+        except (ValueError, TypeError):
+            _dev_rate = 192000
+        try:
+            _gain = float(_S.value('sdrangel_gain_db', 40.0))
+        except (ValueError, TypeError):
+            _gain = 40.0
+        try:
+            _rx_scale_raw = float(_S.value('sdrangel_rx_scale', 0.0))
+            _rx_scale = _rx_scale_raw if _rx_scale_raw > 0 else None
+        except (ValueError, TypeError):
+            _rx_scale = None
+        _exe_path = str(_S.value('sdrangel_exe', '')).strip() or None
+
+        # H channel (device set _dev_set, stream 0).
+        self.sdrangel_client = SDRAngelSource(
+            host             = _host,
+            rest_port        = _rest_port,
+            udp_port         = _udp_port,
+            device_set       = _dev_set,
+            calling_freq_mhz = self.calling_freq_mhz,
+            lo_offset_khz    = _lo_offset,
+            target_rate      = self.sample_rate,
+            exe_path         = _exe_path,
+            dev_sample_rate  = _dev_rate,
+            gain_db          = _gain,
+            stream_index     = 0,
+            rx_scale         = _rx_scale,
+        )
+        print("[sdrangel] SDRAngelSource (H/stream0) created", flush=True)
+
+        # V channel (device set _dev_set+1, stream 1) — always created for B210.
+        _udp_port_v = _udp_port - 1
+        _dev_set_v  = _dev_set + 1
+        self.sdrangel_client_v = SDRAngelSource(
+            host             = _host,
+            rest_port        = _rest_port,
+            udp_port         = _udp_port_v,
+            device_set       = _dev_set_v,
+            calling_freq_mhz = self.calling_freq_mhz,
+            lo_offset_khz    = _lo_offset,
+            target_rate      = self.sample_rate,
+            exe_path         = _exe_path,
+            dev_sample_rate  = _dev_rate,
+            gain_db          = _gain,
+            stream_index     = 1,
+            rx_scale         = _rx_scale,
+        )
+        print(f"[sdrangel] SDRAngelSource (V/stream1) created: device_set={_dev_set_v}"
+              f"  UDP port={_udp_port_v}", flush=True)
+
+    except Exception as exc:
+        print(f"[sdrangel] SDRAngelSource creation failed: {exc}", flush=True)
+        self.sdrangel_client   = None
+        self.sdrangel_client_v = None
+
+
+def _start_sdrangel_source(self) -> bool:
+    if getattr(self, '_sdrangel_started', False):
+        return True
+    if getattr(self, 'sdrangel_client', None) is None:
+        return False
+    try:
+        sc_v  = getattr(self, 'sdrangel_client_v', None)
+        is_dual = sc_v is not None
+        _set_dual_pol(self, is_dual)
+        self.sdrangel_client.start()
+        if is_dual:
+            try:
+                sc_v.start()
+            except Exception as exc:
+                print(f"[sdrangel] V-channel start failed: {exc}", flush=True)
+                self.sdrangel_client_v = None
+                _set_dual_pol(self, False)
+        self._sdrangel_started = True
+        if hasattr(self, '_jt9_markers'):
+            self._jt9_markers.clear()
+        if hasattr(self, 'decode_panel'):
+            self.decode_panel.clear()
+        return True
+    except Exception as exc:
+        print(f"[sdrangel] start error: {exc}", flush=True)
+        import traceback; traceback.print_exc()
+        self.sdrangel_client = None
+        return False
+
+
+def _stop_sdrangel_source(self):
+    if not getattr(self, '_sdrangel_started', False):
+        return
+    try:
+        self.sdrangel_client.stop()
+    except Exception:
+        pass
+    sc_v = getattr(self, 'sdrangel_client_v', None)
+    if sc_v is not None:
+        try:
+            sc_v.stop()
+        except Exception:
+            pass
+    self._sdrangel_started = False
+    # Close the SDRangel process so hardware is released for other sources.
+    sc = getattr(self, 'sdrangel_client', None)
+    if sc is not None:
+        from .sdrangel_source import _terminate_sdrangel, _save_sdrangel_layout
+        _terminate_sdrangel(sc.host, sc.rest_port)
+        # SDRangel has now exited and flushed its Qt settings file.
+        # Auto-save the layout so the next launch restores it.
+        _save_sdrangel_layout()
+
+
+def _sdrangel_ensure_ssb_service(self):
+    """Find or create SSBDemod + virtual audio device for WSJT-X use.
+
+    Creates a PipeWire/PulseAudio null sink named 'MAP144-WSJT-X' (and
+    'MAP144-WSJT-X-V' for the V channel when dual-pol is active).
+    Configures SSBDemod in each device set to output to the respective sink.
+    Returns a dict with keys 'audio_h', 'audio_v' (or None if not created).
+    """
+    from .sdrangel_source import create_virtual_audio_sink
+    sc   = getattr(self, 'sdrangel_client',   None)
+    sc_v = getattr(self, 'sdrangel_client_v', None)
+    result = {'audio_h': None, 'audio_v': None}
+
+    if sc is None:
+        return result
+
+    # H channel.
+    name_h = 'MAP144-WSJT-X'
+    dev_h  = create_virtual_audio_sink(name_h)
+    if dev_h:
+        ch_h = sc.ensure_ssb_receiver(audio_device=dev_h)
+        result['audio_h'] = dev_h
+        print(f"[sdrangel] SSB service H: sink='{dev_h}'  ch={ch_h}", flush=True)
+    else:
+        ch_h = sc.ensure_ssb_receiver()
+        print(f"[sdrangel] SSB service H: ch={ch_h} (no virtual audio created)", flush=True)
+
+    # V channel (dual-pol only).
+    if sc_v is not None:
+        name_v = 'MAP144-WSJT-X-V'
+        dev_v  = create_virtual_audio_sink(name_v)
+        if dev_v:
+            ch_v = sc_v.ensure_ssb_receiver(audio_device=dev_v)
+            result['audio_v'] = dev_v
+            print(f"[sdrangel] SSB service V: sink='{dev_v}'  ch={ch_v}", flush=True)
+        else:
+            ch_v = sc_v.ensure_ssb_receiver()
+            print(f"[sdrangel] SSB service V: ch={ch_v} (no virtual audio created)",
+                  flush=True)
+
+    return result
+
+
 def _connect_usrp_client(self):
     """Instantiate USRPSource on first use (called from on_select_source_usrp)."""
     if getattr(self, 'usrp_client', None) is not None:
+        self.usrp_client.center_freq_mhz = self.calling_freq_mhz
         return
     try:
         from .usrp_source import USRPSource
@@ -308,7 +500,7 @@ def _connect_usrp_client(self):
         except (ValueError, TypeError):
             _gain1 = _gain
         self.usrp_client = USRPSource(
-            center_freq_mhz=50.260,   # MSK144 6m calling frequency
+            center_freq_mhz=self.calling_freq_mhz,
             target_rate=self.sample_rate,
             gain_db=_gain,
             antenna=_ant,
@@ -358,8 +550,13 @@ def _connect_radio_client(self):
     """Instantiate FlexDAXIQ on first use (called from on_select_source_radio)."""
     if self.radio_client is not None:
         return   # already connected
+    import time as _time
+    t0 = _time.monotonic()
     try:
+        print(f"[radio] importing flexclient...", flush=True)
         flex_client_module = importlib.import_module('flexclient')
+        t_import = _time.monotonic()
+        print(f"[radio] import done ({t_import - t0:.2f}s); calling FlexDAXIQ(...)", flush=True)
         flex_client_class = flex_client_module.FlexDAXIQ
         self.radio_client = flex_client_class(
             center_freq_mhz=self.center_freq_mhz,
@@ -367,9 +564,11 @@ def _connect_radio_client(self):
             dax_channel=1,
             bind_client_id=getattr(self, 'bind_client_id', None),
         )
-        print("[radio] FlexDAXIQ connected", flush=True)
+        t_connect = _time.monotonic()
+        print(f"[radio] FlexDAXIQ connected ({t_connect - t_import:.2f}s in ctor; {t_connect - t0:.2f}s total)", flush=True)
     except Exception as exc:
-        print(f"[radio] FlexDAXIQ connection failed: {exc}", flush=True)
+        t_fail = _time.monotonic()
+        print(f"[radio] FlexDAXIQ connection failed after {t_fail - t0:.2f}s: {exc}", flush=True)
         self.radio_client = None
 
 
@@ -552,9 +751,14 @@ def _reset_wav_timeline(self):
     self._ch_snr_history_v[:] = 0.0
     self._ch_snr_write_idx  = 0
     self._ch_snr_boundary   = 0
+    self._ch_snr_hop_count  = 0
     self._iq_ring[:] = 0
     self._iq_ring_pos = 0
     self._iq_abs_sample = 0
+    self._iq_t0_wall = None
+    if hasattr(self, '_sync_buf'):
+        self._sync_buf[:]   = 0
+        self._sync_buf_v[:] = 0
     self._detect_cooldowns = {}
     self._iq_ring_gen = getattr(self, '_iq_ring_gen', 0) + 1
     if hasattr(self, '_jt9_markers'):
@@ -792,7 +996,10 @@ def _run_wav_comparison(wav_path: str, run_start: datetime | None,
     matched_ids: set[int] = set()
 
     def _snr_str(v):
-        return f"{v:>+4d} dB" if v is not None else "      ?"
+        if v is None:
+            return "      ?"
+        # Accept either int or float (older ramp manifests stored snr_db as float).
+        return f"{int(round(v)):>+4d} dB"
 
     def _pol_str(theta_gen, theta_meas):
         if not _has_pol:
@@ -900,6 +1107,8 @@ def run_radio_source(self):
                     _stop_rtlsdr_source(self)
                 if getattr(self, '_usrp_started', False):
                     _stop_usrp_source(self)
+                if getattr(self, '_sdrangel_started', False):
+                    _stop_sdrangel_source(self)
                 _process_wav_source_step(self)
                 continue
 
@@ -910,6 +1119,8 @@ def run_radio_source(self):
                     _stop_airspy_source(self)
                 if getattr(self, '_usrp_started', False):
                     _stop_usrp_source(self)
+                if getattr(self, '_sdrangel_started', False):
+                    _stop_sdrangel_source(self)
                 if not _start_rtlsdr_source(self):
                     time.sleep(1.0)
                     continue
@@ -940,6 +1151,8 @@ def run_radio_source(self):
                     _stop_radio_source(self)
                 if getattr(self, '_usrp_started', False):
                     _stop_usrp_source(self)
+                if getattr(self, '_sdrangel_started', False):
+                    _stop_sdrangel_source(self)
                 if not _start_airspy_source(self):
                     time.sleep(1.0)
                     continue
@@ -972,6 +1185,8 @@ def run_radio_source(self):
                     _stop_airspy_source(self)
                 if getattr(self, '_rtlsdr_started', False):
                     _stop_rtlsdr_source(self)
+                if getattr(self, '_sdrangel_started', False):
+                    _stop_sdrangel_source(self)
                 if not _start_usrp_source(self):
                     time.sleep(1.0)
                     continue
@@ -994,6 +1209,73 @@ def run_radio_source(self):
                         drained += 1
                 except Exception as exc:
                     logger.exception("[usrp] queue/process error: %s", exc)
+                continue
+
+            if self.source_mode == "sdrangel":
+                if self._radio_started:
+                    _stop_radio_source(self)
+                if getattr(self, '_airspy_started', False):
+                    _stop_airspy_source(self)
+                if getattr(self, '_rtlsdr_started', False):
+                    _stop_rtlsdr_source(self)
+                if getattr(self, '_usrp_started', False):
+                    _stop_usrp_source(self)
+                if not _start_sdrangel_source(self):
+                    time.sleep(1.0)
+                    continue
+                try:
+                    sc_v    = getattr(self, 'sdrangel_client_v', None)
+                    is_dual = sc_v is not None and getattr(self, 'dual_pol', False)
+                    drained = 0
+                    while drained < 64:
+                        try:
+                            packet = self.sdrangel_client.sample_queue.get_nowait()
+                        except queue.Empty:
+                            if drained == 0:
+                                try:
+                                    packet = self.sdrangel_client.sample_queue.get(timeout=1.0)
+                                except queue.Empty:
+                                    # Check whether the SDRangel process is still alive.
+                                    import map144_app.sdrangel_source as _ss
+                                    _proc = _ss._sdrangel_proc
+                                    if _proc is not None and _proc.poll() is not None:
+                                        print(f"[sdrangel] process died (exit {_proc.poll()})"
+                                              " — stopping clients and relaunching", flush=True)
+                                        _ss._sdrangel_proc = None
+                                        # Stop recv threads so sockets are freed before restart.
+                                        for _sc in (getattr(self, 'sdrangel_client', None),
+                                                    getattr(self, 'sdrangel_client_v', None)):
+                                            if _sc is not None:
+                                                try: _sc.stop()
+                                                except Exception: pass
+                                        self._sdrangel_started = False
+                                    break
+                            else:
+                                break
+                        # SDRangel S16LE → ±1.0 done in recv_loop — no ingress scaling needed.
+                        if is_dual:
+                            # Pair H packet with a V packet from the second device set.
+                            # Both streams run from the same hardware clock (B210);
+                            # timestamps are wall-clock anchored and should match
+                            # within a packet duration.  Take one V packet per H packet;
+                            # if V queue is empty, fall back to single-pol for this chunk.
+                            try:
+                                pkt_v = sc_v.sample_queue.get_nowait()
+                                n     = min(len(packet.samples), len(pkt_v.samples))
+                                h_iq  = np.asarray(packet.samples[:n], dtype=np.complex64)
+                                v_iq  = np.asarray(pkt_v.samples[:n],  dtype=np.complex64)
+                                chunk = np.column_stack((h_iq.ravel(), v_iq.ravel()))
+                            except queue.Empty:
+                                chunk = _polarization_combine(
+                                    np.asarray(packet.samples, dtype=np.complex64))
+                        else:
+                            chunk = _polarization_combine(
+                                np.asarray(packet.samples, dtype=np.complex64))
+                        self.process_iq_data(chunk, packet.timestamp_int, packet.timestamp_frac)
+                        drained += 1
+                except Exception as exc:
+                    print(f"[sdrangel] queue/process error: {exc}", flush=True)
+                    import traceback; traceback.print_exc()
                 continue
 
             if not _start_radio_source(self):
@@ -1127,12 +1409,17 @@ def run_radio_source(self):
                     _batch_n += len(pkt_chunk)
 
                     if _batch_n >= _FLEX_BATCH_SAMPLES:
-                        _wt = _drain_t0 + _drain_samples / self.sample_rate
-                        self.process_iq_data(
-                            np.concatenate(_batch_chunks),
-                            int(_wt),
-                            int((_wt - int(_wt)) * 1_000_000_000_000),
-                        )
+                        # Pass timestamp_int=0 to signal "no valid radio clock" —
+                        # process_iq_data then falls back to its session-level
+                        # sample-clock anchor (_iq_t0_wall + _iq_abs_sample/sr),
+                        # which is monotonic across drain cycles and immune to
+                        # the wall-clock jitter that the older _drain_t0 +
+                        # _drain_samples scheme introduced (a fresh time.time()
+                        # per drain meant ~5–20 ms of jitter per drain boundary
+                        # during CPU bursts, which manifested as spec_staging
+                        # gap-fill and visible 200 ms repeat-banding in the
+                        # fast graph during noise bursts).
+                        self.process_iq_data(np.concatenate(_batch_chunks), 0, 0)
                         _drain_samples += _batch_n
                         _batch_chunks  = []
                         _batch_ts_int  = None
@@ -1141,12 +1428,7 @@ def run_radio_source(self):
 
                 # Flush any remaining samples shorter than a full batch.
                 if _batch_chunks and not getattr(self, '_flex_was_tx', False):
-                    _wt = _drain_t0 + _drain_samples / self.sample_rate
-                    self.process_iq_data(
-                        np.concatenate(_batch_chunks),
-                        int(_wt),
-                        int((_wt - int(_wt)) * 1_000_000_000_000),
-                    )
+                    self.process_iq_data(np.concatenate(_batch_chunks), 0, 0)
             except Exception as exc:
                 print(f"Queue get/process error: {exc}", flush=True)
                 import traceback
@@ -1161,6 +1443,7 @@ def run_radio_source(self):
 
     _stop_radio_source(self)
     _stop_usrp_source(self)
+    _stop_sdrangel_source(self)
 
 
 def _get_tuned_frequency_mhz(self):
@@ -1169,16 +1452,19 @@ def _get_tuned_frequency_mhz(self):
         return self.center_freq_mhz, "WAV", None
     if self.source_mode == "airspy":
         ac = getattr(self, 'airspy_client', None)
-        freq = ac.center_freq_mhz_actual if ac is not None else 28.180
+        freq = ac.center_freq_mhz_actual if ac is not None else self.calling_freq_mhz
         return freq, "Airspy HF+", None
     if self.source_mode == "rtlsdr":
         rc = getattr(self, 'rtlsdr_client', None)
-        freq = rc.center_freq_mhz_actual if rc is not None else 50.260
+        freq = rc.center_freq_mhz_actual if rc is not None else self.calling_freq_mhz
         return freq, "NESDR Smart", None
     if self.source_mode == "usrp":
         uc = getattr(self, 'usrp_client', None)
-        freq = uc.center_freq_mhz_actual if uc is not None else 50.260
+        freq = uc.center_freq_mhz_actual if uc is not None else self.calling_freq_mhz
         return freq, "USRP B210", None
+    if self.source_mode == "sdrangel":
+        # UDP Sink output is centered on calling_freq (lo_offset applied inside SDRangel).
+        return self.calling_freq_mhz, "SDRangel", None
 
     tuned_freq_mhz = None
     tuned_source = None
@@ -1218,7 +1504,10 @@ def closeEvent(self, event):
     _SETTINGS.setValue('max_level',            self.max_level)
     _SETTINGS.setValue('detect_min_level_f',   self.detect_min_level)
     _SETTINGS.setValue('detect_max_level_f',   self.detect_max_level)
+    _SETTINGS.setValue('sync_detect_min_level_f', getattr(self, 'sync_detect_min_level', -5.0))
+    _SETTINGS.setValue('sync_detect_max_level_f', getattr(self, 'sync_detect_max_level', 20.0))
     _SETTINGS.setValue('nb_factor',            self.nb_factor)
+    _SETTINGS.setValue('nb_factor_v',          getattr(self, 'nb_factor_v', self.nb_factor))
     _td_sl = getattr(self, 'td_scale_slider', None)
     _SETTINGS.setValue('td_scale',             _td_sl.value() if _td_sl else 10)
     _SETTINGS.setValue('td_span',              int(getattr(self, 'td_span_ms', 200)))
@@ -1226,12 +1515,14 @@ def closeEvent(self, event):
     for win, geo_key, vis_key in [
         (getattr(self, '_fast_graph_win', None), 'fast_graph_geometry', 'fast_graph_visible'),
         (getattr(self, '_detect_win',     None), 'detect_geometry',     'detect_visible'),
+        (getattr(self, '_sync_detect_win',None), 'sync_detect_geometry','sync_detect_visible'),
         (getattr(self, '_iq_nb_win',      None), 'iq_nb_geometry',      'iq_nb_visible'),
         (getattr(self, '_reporting_win',  None), 'reporting_geometry',  'reporting_visible'),
         (getattr(self, '_flex_win',       None), 'flex_geometry',       None),
         (getattr(self, '_usrp_win',       None), 'usrp_geometry',       None),
         (getattr(self, '_airspy_win',     None), 'airspy_geometry',     None),
         (getattr(self, '_rtlsdr_win',     None), 'rtlsdr_geometry',     None),
+        (getattr(self, '_sdrangel_win',   None), 'sdrangel_geometry',   None),
         (getattr(self, '_screenshot_win', None), 'screenshot_geometry', None),
     ]:
         if win is not None:
@@ -1253,6 +1544,8 @@ def closeEvent(self, event):
         _stop_rtlsdr_source(self)
     if getattr(self, '_usrp_started', False):
         _stop_usrp_source(self)
+    if getattr(self, '_sdrangel_started', False):
+        _stop_sdrangel_source(self)
 
     if hasattr(self, 'client_thread') and self.client_thread.isRunning():
         self.client_thread.quit()
@@ -1270,9 +1563,9 @@ def closeEvent(self, event):
     # top-level window (parent=None), quitOnLastWindowClosed will not fire
     # until every top-level window is closed.  _app_closing=True above ensures
     # their closeEvent accepts rather than ignoring the event.
-    for _attr in ('_fast_graph_win', '_detect_win', '_iq_nb_win',
+    for _attr in ('_fast_graph_win', '_detect_win', '_sync_detect_win', '_iq_nb_win',
                   '_reporting_win', '_flex_win', '_usrp_win', '_airspy_win', '_rtlsdr_win',
-                  '_screenshot_win'):
+                  '_sdrangel_win', '_screenshot_win'):
         _w = getattr(self, _attr, None)
         if _w is not None:
             _w.close()

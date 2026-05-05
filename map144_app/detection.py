@@ -435,6 +435,8 @@ def extract_and_decode(
     detect_ts: str = "",
     jt9_args: list | None = None,
     dual_pol: bool = False,
+    iq_t0_wall: float | None = None,
+    det_source: str = "sq",
 ) -> None:
     """Extract IQ around detect_sample, mix fc to 1500 Hz, decimate to 12 kHz, run jt9.
 
@@ -457,6 +459,11 @@ def extract_and_decode(
                       how the radio applies USB and the 1500 Hz audio convention.
     detect_ts       – UTC timestamp string for filenames and JSONL.
     jt9_args        – optional extra CLI args appended to the jt9 invocation.
+    iq_t0_wall      – wall-clock for IQ ring sample 0 (Unix seconds). When provided,
+                      the period epoch is derived from ``detect_sample`` and the IQ
+                      sample rate, which is immune to pipeline / queue latency.
+                      ``None`` falls back to the launch-time-minus-pre-window heuristic
+                      (used by the offline analysis-engine click path).
 
     Intended to run in a background daemon thread.
     """
@@ -581,17 +588,21 @@ def extract_and_decode(
     # Using the same convention ensures MAP144 decodes match the correct QSO
     # period in WSJT-X (1st/2nd checkbox) and in PSKReporter/DXcluster reports.
     #
-    # PERIOD_SLIP correction: pipeline latency (0.3–0.5 s) can cause the detection
-    # trigger to fire just after a 15-second boundary even though the actual ping
-    # was in the preceding period.  Anchoring the period estimate to the START of
-    # the pre-burst window (launch – pre_n) rather than the trigger instant shifts
-    # the reference back by 500 ms, which is sufficient to correct the slip without
-    # misassigning normal pings.  For jt9 decodes the exact dt field is used instead.
+    # PERIOD_SLIP correction: anchor the period to the IQ sample index, not to
+    # ``launch_ts``.  ``detect_sample`` is the absolute ring sample of the burst
+    # and ``iq_t0_wall`` is the wall-clock for ring sample 0 (refreshed every
+    # input chunk in process_iq_data).  The resulting epoch is sample-accurate
+    # and immune to pipeline / queue latency — the dominant cause of slips with
+    # a wall-clock-anchored estimator.  The ``None`` branch keeps the legacy
+    # heuristic for the analysis-engine click path, which has no ring epoch.
     try:
         _launch_dt = datetime.strptime(launch_ts, "%Y-%m-%d_%H:%M:%S.%f").replace(tzinfo=timezone.utc)
     except ValueError:
         _launch_dt = datetime.strptime(launch_ts, "%Y-%m-%d_%H:%M:%S").replace(tzinfo=timezone.utc)
-    _ping_epoch_est = _launch_dt.timestamp() - pre_n / sample_rate   # start of pre-burst window
+    if iq_t0_wall is not None:
+        _ping_epoch_est = iq_t0_wall + detect_sample / sample_rate
+    else:
+        _ping_epoch_est = _launch_dt.timestamp() - pre_n / sample_rate
     _period_epoch   = int(_ping_epoch_est // 15) * 15 + 15           # period END
     _period_dt      = datetime.fromtimestamp(_period_epoch, tz=timezone.utc)
     period_ts       = _period_dt.strftime("%Y-%m-%d_%H:%M:%S")
@@ -633,7 +644,7 @@ def extract_and_decode(
                 shutil.move(tmp_path, str(out_dir / save_name))
                 _pol_str = f"  θ={theta_deg:.0f}°" if dual_pol else ""
                 print(f"[MSK144 SPD]  t={t_sec:.2f}s  radio={radio_khz:.3f} kHz{_pol_str}"
-                      f"  navg={spd_navg}  {full_msg}", flush=True)
+                      f"  det={det_source}  navg={spd_navg}  {full_msg}", flush=True)
 
                 if decode_queue is not None:
                     decode_queue.put({
@@ -739,11 +750,17 @@ def extract_and_decode(
                     snr = jt9_snr if jt9_snr is not None else est_snr
 
                     # Refine period using jt9's dt field (exact ping time in WAV).
-                    # dt is seconds from WAV start; WAV starts (pre+pad) before detection.
+                    # dt is seconds from WAV start; the burst sits (_jt9_pre_used + pad_n)
+                    # samples after WAV start.  When the IQ ring epoch is available we use
+                    # it (exact); otherwise fall back to the launch-anchored form.
                     try:
                         _dt_jt9 = float(tokens[2])
                         _wav_offset = (_jt9_pre_used + pad_n) / sample_rate
-                        _ping_epoch_jt9 = _launch_dt.timestamp() - _wav_offset + _dt_jt9
+                        if iq_t0_wall is not None:
+                            _burst_epoch = iq_t0_wall + detect_sample / sample_rate
+                        else:
+                            _burst_epoch = _launch_dt.timestamp()
+                        _ping_epoch_jt9 = _burst_epoch - _wav_offset + _dt_jt9
                         _period_epoch   = int(_ping_epoch_jt9 // 15) * 15 + 15
                         _period_dt      = datetime.fromtimestamp(_period_epoch, tz=timezone.utc)
                         period_ts       = _period_dt.strftime("%Y-%m-%d_%H:%M:%S")
@@ -755,7 +772,8 @@ def extract_and_decode(
                     save_name = f"{_ts_file}_{rf_int}kHz_{msg_safe}.wav"
                     shutil.move(tmp_path, str(out_dir / save_name))
                     _pol_str = f"  θ={theta_deg:.0f}°" if dual_pol else ""
-                    print(f"[MSK144 DECODE]  t={t_sec:.2f}s  radio={radio_khz:.3f} kHz{_pol_str}  {decoded}", flush=True)
+                    print(f"[MSK144 DECODE]  t={t_sec:.2f}s  radio={radio_khz:.3f} kHz{_pol_str}"
+                          f"  det={det_source}  {decoded}", flush=True)
 
                     if decode_queue is not None:
                         decode_queue.put({

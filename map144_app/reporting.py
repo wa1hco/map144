@@ -52,6 +52,7 @@ import struct
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -421,7 +422,10 @@ class Reporter:
         self._dx_sock     = None
         self._dx_lock     = threading.Lock()
         self._dx_logged_in = False
+        self._dx_connect_inflight = False  # only mutated under _dx_lock
         self._dx_dupe_cache: dict[str, tuple[float, float]] = {}  # call → (last_time, last_freq_khz)
+        self._dx_log_path = (Path(__file__).parent.parent
+                             / 'MSK144' / 'detections' / 'dx_spots.log')
 
         # Runtime state
         self._sock       = None
@@ -467,7 +471,11 @@ class Reporter:
         if dx_changed:
             self._dx_disconnect()
         if self.dx_enabled and self.my_call:
-            self._dx_connect()
+            # Run on a daemon thread — _dx_connect blocks on banner / login
+            # recv() and would otherwise stall whichever thread called
+            # apply_settings (typically the GUI thread).
+            threading.Thread(target=self._dx_connect,
+                             daemon=True, name='dx-connect').start()
 
         self._send_heartbeat()
         self._send_status()
@@ -522,29 +530,59 @@ class Reporter:
     # ── Internal threads ──────────────────────────────────────────────────────
 
     def _dx_connect(self):
-        """Open TCP connection to DX cluster and log in with callsign."""
+        """Open TCP connection to DX cluster and log in with callsign.
+
+        Performs the slow banner / login I/O *outside* `_dx_lock` so other
+        threads (including the GUI) can call `_dx_disconnect()` or check
+        state without waiting for a stalled remote.
+        """
+        # Pre-check: skip if already connected or another connect is running.
         with self._dx_lock:
-            if self._dx_sock is not None:
-                return  # already connected
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(10)
-                s.connect((self.dx_host, self.dx_port))
-                s.settimeout(None)
-                # Read banner (may include login prompt), then send callsign
-                s.recv(4096)
-                s.sendall((self.my_call + '\r\n').encode('ascii'))
-                # Read login response
-                s.recv(4096)
-                self._dx_sock = s
-                self._dx_logged_in = True
-                self.stat_dx_status = f"connected: {self.dx_host}:{self.dx_port}"
-                print(f"[reporter] DX cluster: connected to {self.dx_host}:{self.dx_port}", flush=True)
-            except Exception as e:
-                self.stat_dx_status = f"error: {e}"
-                self.stat_last_error = f"DX cluster: {e}"
+            if self._dx_sock is not None or self._dx_connect_inflight:
+                return
+            self._dx_connect_inflight = True
+            self.stat_dx_status = f"connecting: {self.dx_host}:{self.dx_port}"
+
+        s = None
+        err = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10)
+            s.connect((self.dx_host, self.dx_port))
+            # Bounded timeout across banner / login round-trip so a slow
+            # cluster server cannot hang us indefinitely; switch to blocking
+            # mode after login for the read loop.
+            s.settimeout(10)
+            s.recv(4096)  # banner (may include login prompt)
+            s.sendall((self.my_call + '\r\n').encode('ascii'))
+            s.recv(4096)  # login response
+            s.settimeout(None)
+        except Exception as e:
+            err = e
+            if s is not None:
+                try: s.close()
+                except Exception: pass
+                s = None
+
+        with self._dx_lock:
+            self._dx_connect_inflight = False
+            if not self.dx_enabled:
+                # User disabled DX cluster while we were connecting — discard.
+                if s is not None:
+                    try: s.close()
+                    except Exception: pass
+                self.stat_dx_status = 'disabled'
+                return
+            if err is not None:
+                self.stat_dx_status = f"error: {err}"
+                self.stat_last_error = f"DX cluster: {err}"
                 self._dx_sock = None
                 self._dx_logged_in = False
+                return
+            self._dx_sock = s
+            self._dx_logged_in = True
+            self.stat_dx_status = f"connected: {self.dx_host}:{self.dx_port}"
+        print(f"[reporter] DX cluster: connected to {self.dx_host}:{self.dx_port}", flush=True)
 
     def _dx_disconnect(self):
         with self._dx_lock:
@@ -555,7 +593,21 @@ class Reporter:
                     pass
                 self._dx_sock = None
                 self._dx_logged_in = False
-                self.stat_dx_status = 'disabled'
+            self.stat_dx_status = 'disabled'
+
+    def _dx_log(self, tag: str, detail: str):
+        """Append one line to MSK144/detections/dx_spots.log.
+
+        Best-effort: any I/O error is swallowed so logging never disrupts
+        the reporting thread.
+        """
+        try:
+            self._dx_log_path.parent.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            with open(self._dx_log_path, 'a') as f:
+                f.write(f"{ts} {tag} {detail}\n")
+        except Exception:
+            pass
 
     def _dx_send_spot(self, freq_khz: float, dx_call: str, comment: str):
         """Send one DX spot. Reconnects once if the connection has dropped."""
@@ -569,6 +621,7 @@ class Reporter:
                 try:
                     self._dx_sock.sendall(cmd.encode('ascii'))
                     self.stat_dx_sent += 1
+                    self._dx_log('SENT', cmd.rstrip())
                     return
                 except OSError:
                     try:
@@ -679,6 +732,12 @@ class Reporter:
                 comment  = f"MSK144 {grid_str} {snr_str}".strip()
                 self._dx_send_spot(freq_khz, de_call, comment)
                 self._dx_dupe_cache[_key] = (_now, radio_khz)
+            else:
+                # Dedup fired — record the would-be spot so we can confirm
+                # the cluster is NOT seeing duplicates from us.
+                age = int(_now - _last_t)
+                self._dx_log('SUPPRESSED',
+                             f"DX {radio_khz:.3f} {de_call} (age={age}s)")
                 # Prune stale entries so the cache doesn't grow unbounded
                 # during a long session with many unique callsigns.
                 if len(self._dx_dupe_cache) > 500:

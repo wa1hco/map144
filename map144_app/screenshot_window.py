@@ -67,7 +67,7 @@ def setup_screenshot_window(self, view_action):
         ('_main_win_self',    "Controls and Decodes",  "map144_main"),
         ('_fast_graph_win',   "Fast Graph",            "map144_fast_graph"),
         ('_detect_win',       "Tone Detection SNR",    "map144_detection_heatmap"),
-        ('_iq_nb_win',        "IQ / Noise Blanker",    "map144_iq_noise_blanker"),
+        ('_iq_nb_win',        "Noise Blanker",         "map144_noise_blanker"),
         ('_reporting_win',    "Reporting",             "map144_reporting"),
         ('_flex_win',         "Flex Radio",            "map144_flex_radio"),
         ('_usrp_win',         "USRP B210",             "map144_usrp_b210"),
