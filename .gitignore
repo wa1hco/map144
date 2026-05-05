@@ -91,3 +91,9 @@ docs/dsp-reliability-plan.md
 vendor/wdsp/*.o
 vendor/wdsp/*.so
 
+# Fortran-vs-Python decoder cross-check (source is tracked; build locally with gfortran)
+fortran_bp_test/*.o
+fortran_bp_test/*.mod
+fortran_bp_test/bp_test
+fortran_bp_test/mf_test
+

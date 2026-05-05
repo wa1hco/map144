@@ -1,0 +1,73 @@
+digraph pipeline {
+    rankdir=LR
+    graph [bgcolor="#FFFFFF", pad=0.45, nodesep=0.30, ranksep=0.50]
+    node  [shape=box, style="filled,rounded", fillcolor="#D6EAF8",
+           color="#276FBF", fontname="Helvetica", fontsize=12,
+           margin="0.15,0.08"]
+    edge  [color="#1B3A6B", arrowsize=0.8, penwidth=1.5, fontname="Helvetica",
+           fontsize=9]
+
+    // ── Processing nodes ──────────────────────────────────────────────────
+    src  [label="IQ Source\n48 kHz"]
+    nb   [label="Noise\nBlanker"]
+    ch   [label="Polyphase\nChannelizer\n48 × 1 kHz"]
+    sq   [label="Squarer\n(x\u00B2)"]
+    det  [label="Metric\nDetector"]
+    gate [label="Coincidence\nGate"]
+    bpf  [label="Decimate+Mix\n+BPF\n48→12 kHz IQ"]
+    spd  [label="SPD\nDecoder", fillcolor="#D5F5E3"]
+    jt9  [label="jt9 Decoder\n(fallback)", fillcolor="#D5F5E3"]
+    dl   [label="Decode List", fillcolor="#D5F5E3"]
+
+    // ── Storage ───────────────────────────────────────────────────────────
+    ring [label="IQ Ring Buffer\n30 s", shape=cylinder,
+          fillcolor="#FEF9E7", color="#8E6914"]
+
+    // ── Display windows & outputs (row 2) ─────────────────────────────────
+    iqwin [label="IQ / Noise\nBlanker Window", shape=box,
+           fillcolor="#FCF3CF", color="#8E6914"]
+    fg    [label="Fast Graph\nWaterfall",      shape=box,
+           fillcolor="#FCF3CF", color="#8E6914"]
+    dp    [label="Tone Detection\nSNR Plot",   shape=box,
+           fillcolor="#FCF3CF", color="#8E6914"]
+    rep   [label="Reporting",                   shape=box,
+           fillcolor="#FADBD8", color="#8E6914"]
+
+    // ── Main pipeline ─────────────────────────────────────────────────────
+    src -> nb -> ch -> sq -> det -> gate -> bpf -> spd
+    spd -> dl [label=" decoded"]
+    spd -> jt9 [style=dashed, label=" SPD miss\n(fallback)"]
+    jt9 -> dl
+
+    // ── IQ ring buffer (for jt9 fallback) ─────────────────────────────────
+    ch   -> ring [style=dashed, constraint=false, label=" write"]
+    ring -> jt9  [constraint=false, label=" 12 kHz\naudio"]
+
+    // ── IQ/Noise Blanker Window: before & after blanker ───────────────────
+    src  -> iqwin [style=dashed, color="#888899", constraint=false]
+    nb   -> iqwin [style=dashed, color="#888899", constraint=false]
+
+    // ── Fast Graph: waterfall from channelizer only ───────────────────────
+    ch   -> fg [style=dashed, color="#888899", constraint=false]
+
+    // ── Tone Detection SNR Plot ───────────────────────────────────────────
+    sq   -> dp [style=dashed, color="#888899", constraint=false,
+                label=" background"]
+    gate -> dp [style=dashed, color="#888899", constraint=false,
+                label=" circles"]
+    spd  -> dp [style=dashed, color="#888899", constraint=false,
+                label=" color\ncodes"]
+    jt9  -> dp [style=dashed, color="#888899", constraint=false,
+                label=" color\ncodes"]
+
+    // ── Reporting: decoded messages forwarded externally ──────────────────
+    spd  -> rep [style=dashed, color="#888899", constraint=false]
+    jt9  -> rep [style=dashed, color="#888899", constraint=false]
+
+    // ── Row-2 placement: anchor each display node below its source ─────────
+    { rank=same; nb;   iqwin }
+    { rank=same; ch;   fg    }
+    { rank=same; sq;   ring  }
+    { rank=same; gate; dp    }
+    { rank=same; dl;   rep   }
+}
