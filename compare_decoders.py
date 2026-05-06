@@ -494,6 +494,13 @@ CLASS_RANK = {
     "UNKNOWN":      4,
 }
 
+# Distance bands from ``project_signal_categories``.  Physics-based, so they
+# are module constants rather than tunable config — the radio horizon, common
+# meteor-trail height (~100 km), and the geometric peak of the MS common
+# volume put the MS sweet spot at ~800–2200 km.
+MS_MIN_KM = 800.0    # below this: too geometrically close for typical MS
+MS_MAX_KM = 2200.0   # above this: long-haul (Es, F2)
+
 _GRID_TOKEN_RE = re.compile(r'^[A-R]{2}[0-9]{2}([A-X]{2})?$', re.IGNORECASE)
 
 
@@ -596,8 +603,39 @@ def classify_callsigns(
 ) -> dict[str, str]:
     """Return ``{callsign: classification}`` over the union of decodes.
 
-    Period count is attributed to the *transmitting* station only — the
-    addressed station in a QSO message ("X Y FN20" → Y is sender,
+    Distance bands first, density second.  A station's distance from
+    the operator's grid determines what propagation modes are
+    physically possible; density (period count) then refines whether
+    the station is sparse vs frequent within that band.
+
+    Bands (per ``project_signal_categories`` and the user's review):
+
+        rng < local_max_km  (default 300):
+            STRONG_LOCAL — ground-wave / line-of-sight; high-density.
+            Stations this close at high density are interference for
+            the MS mission.  Low-density nearby stations (≤ max_ping_-
+            periods) are still TRUE_PING — could be a brief contact,
+            unusual but not impossible.
+
+        local_max_km ≤ rng < MS_MIN_KM  (300–800 km):
+            WEAK_FADING — ducting / weak prop / Es edge.  The geometry
+            doesn't favour MS at this range; a frequent station here is
+            most likely a propagation mode that fades in and out.
+
+        MS_MIN_KM ≤ rng < MS_MAX_KM  (800–2200 km):
+            TRUE_PING — meteor-scatter sweet spot.  At this range pings
+            dominate; a station appearing in many periods is most
+            likely making many separate meteor-scatter contacts (each
+            ping is its own brief event), NOT a sustained signal.
+            This band reclassifies the misclassified-as-WEAK_FADING /
+            CONT_PROP cases like K2IL (1909 km, frequent contacts).
+
+        rng ≥ MS_MAX_KM  (≥ 2200 km):
+            CONT_PROP if frequent (sustained F2 / long-haul Es); else
+            TRUE_PING (rare long-haul, treat as ping bucket).
+
+    Period count is attributed to the *transmitting* station only —
+    the addressed station in a QSO message ("X Y FN20" → Y is sender,
     X is just whom they're calling) contributes nothing.  See
     :func:`sender_in_message`.
     """
@@ -612,19 +650,44 @@ def classify_callsigns(
     out: dict[str, str] = {}
     for cs, periods in periods_by_call.items():
         n = len(periods)
+        rng = range_km_for_grid(cs2grid.get(cs), my_lat, my_lon)
+
+        # Sparse callsigns are TRUE_PING regardless of distance — too
+        # few data points to claim continuous propagation.
         if n <= max_ping_periods:
             out[cs] = "TRUE_PING"
-        elif n < min_local_periods:
-            out[cs] = "WEAK_FADING"
-        else:
-            grid = cs2grid.get(cs)
-            rng = range_km_for_grid(grid, my_lat, my_lon)
-            if rng is None:
-                out[cs] = "STRONG_LOCAL"      # unknown distance → conservative
-            elif rng < local_max_km:
+            continue
+
+        # Unknown distance → conservative density-only fallback.
+        if rng is None:
+            if n >= min_local_periods:
                 out[cs] = "STRONG_LOCAL"
             else:
+                out[cs] = "WEAK_FADING"
+            continue
+
+        # Distance-band classification.
+        if rng < local_max_km:                       # < 300 km
+            # Local + frequent = ground-wave / LOS interference.
+            # Local + medium-frequency stays STRONG_LOCAL too — a
+            # nearby station hitting us in 6–29 periods is still
+            # local; it's just less of a hammer.
+            out[cs] = "STRONG_LOCAL"
+        elif rng < MS_MIN_KM:                        # 300–800 km
+            # Outside MS sweet spot but reachable by ducting / weak
+            # prop / sporadic-E edge — true fading regime.
+            out[cs] = "WEAK_FADING"
+        elif rng < MS_MAX_KM:                        # 800–2200 km
+            # Meteor-scatter zone — pings, frequent or not.
+            out[cs] = "TRUE_PING"
+        else:                                        # ≥ 2200 km
+            # Long-haul: F2 / Es high-MUF / unusual modes.  Frequent
+            # stations are sustained propagation; rare stations are
+            # likely a single-ping or a brief opening.
+            if n >= min_local_periods:
                 out[cs] = "CONT_PROP"
+            else:
+                out[cs] = "TRUE_PING"
     return out
 
 
