@@ -77,6 +77,11 @@ def parse_wsjtx(path: Path):
                 'freq_mhz':  float(freq),
                 'snr':       int(snr),
                 'dt':        float(dt_s),
+                # ``t_sec`` mirrors MAP144's field name so per-sender
+                # aggregation can pool the two sources.  WSJT-X's ``dt``
+                # is jt9-aligned (sub-frame accuracy) and is offset
+                # within the 15-s period.
+                't_sec':     float(dt_s),
                 'af_hz':     int(af),
                 'message':   msg.strip(),
                 'source':    'wsjtx',
@@ -123,6 +128,14 @@ def parse_map144(path: Path):
                 # clock, so we need the raw string here.
                 'raw_timestamp': d.get('timestamp', ''),
                 'raw_radio_khz': int(d.get('radio_khz', 0)),
+                # Offset within the 15-s period — discriminates auto
+                # stations (tight cluster near a fixed sequencer-delay
+                # offset) from real meteor pings (random across the
+                # period).  MAP144's ``t_sec`` is the trigger time
+                # within the period; lags the actual signal arrival by
+                # ~50–100 ms (channelizer hop + sync NSPM).  Per-station
+                # spread is unaffected by this constant bias.
+                't_sec': float(d.get('t_sec', 0.0) or 0.0),
             })
     return results
 
@@ -718,6 +731,7 @@ def build_callsign_rows(
     by_call_snrs: dict[str, list[float]] = defaultdict(list)
     by_call_periods: dict[str, set] = defaultdict(set)
     by_call_count: Counter = Counter()
+    by_call_tsec: dict[str, list[float]] = defaultdict(list)
     for d in decodes:
         sender = sender_in_message(d['message'])
         if sender is None:
@@ -727,6 +741,11 @@ def build_callsign_rows(
             by_call_snrs[sender].append(snr)
         by_call_periods[sender].add(d['ts'])
         by_call_count[sender] += 1
+        # Period offset: small + tight = automatic-TX station; spread
+        # near 7s = pings (random within 15-s period).
+        t_sec = d.get('t_sec')
+        if t_sec is not None:
+            by_call_tsec[sender].append(float(t_sec))
 
     alltime_periods: dict[str, set] = defaultdict(set)
     for d in all_time_decodes:
@@ -761,6 +780,17 @@ def build_callsign_rows(
         grid = cs2grid.get(cs)
         row['grid'] = grid
         row['range_km'] = range_km_for_grid(grid, my_lat, my_lon)
+        # Period-offset stats — auto stations have tight std (~0.05 s
+        # from sequencer jitter); real pings are random within the
+        # 15-s period (std ≈ 4 s for a uniform distribution).
+        tsecs = by_call_tsec[cs]
+        if tsecs:
+            arr = np.array(tsecs, dtype=float)
+            row['t_med'] = float(np.median(arr))
+            row['t_std'] = float(arr.std()) if len(arr) >= 2 else None
+        else:
+            row['t_med'] = None
+            row['t_std'] = None
         rows.append(row)
     return rows
 
@@ -1482,10 +1512,11 @@ class CompareGUI(QtWidgets.QMainWindow):
         # ── Callsign table (left pane — populated in _do_run) ─────────────────
         self._callsign_summary = QtWidgets.QLabel("Run to populate.")
         self._callsign_summary.setStyleSheet("font-weight: 600; padding: 2px;")
-        self._callsign_table = QtWidgets.QTableWidget(0, 12)
+        self._callsign_table = QtWidgets.QTableWidget(0, 14)
         self._callsign_table.setHorizontalHeaderLabels([
             "callsign", "grid", "rng_km", "class",
             "n_dec", "n_per", "n_alltime",
+            "t_med", "t_std",                      # period-offset stats
             "SNR min", "p25", "med", "p75", "max",
         ])
         self._callsign_table.setEditTriggers(
@@ -1766,6 +1797,15 @@ class CompareGUI(QtWidgets.QMainWindow):
             it.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
             return it
 
+        def cell_t(v, dec):
+            it = QtWidgets.QTableWidgetItem()
+            if v is None:
+                it.setData(QtCore.Qt.DisplayRole, "—")
+            else:
+                it.setData(QtCore.Qt.DisplayRole, f"{v:.{dec}f}")
+            it.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            return it
+
         for i, r in enumerate(rows):
             self._callsign_table.setItem(i, 0,
                 QtWidgets.QTableWidgetItem(r["callsign"]))
@@ -1777,11 +1817,14 @@ class CompareGUI(QtWidgets.QMainWindow):
             self._callsign_table.setItem(i, 4, cell_int(r["n_decodes"]))
             self._callsign_table.setItem(i, 5, cell_int(r["n_periods"]))
             self._callsign_table.setItem(i, 6, cell_int(r["n_periods_alltime"]))
-            self._callsign_table.setItem(i, 7, cell_float_db(r["snr_min"]))
-            self._callsign_table.setItem(i, 8, cell_float_db(r["snr_p25"]))
-            self._callsign_table.setItem(i, 9, cell_float_db(r["snr_med"]))
-            self._callsign_table.setItem(i, 10, cell_float_db(r["snr_p75"]))
-            self._callsign_table.setItem(i, 11, cell_float_db(r["snr_max"]))
+            # Period-offset stats (s within the 15-s period).
+            self._callsign_table.setItem(i, 7,  cell_t(r["t_med"], 1))
+            self._callsign_table.setItem(i, 8,  cell_t(r["t_std"], 2))
+            self._callsign_table.setItem(i, 9,  cell_float_db(r["snr_min"]))
+            self._callsign_table.setItem(i, 10, cell_float_db(r["snr_p25"]))
+            self._callsign_table.setItem(i, 11, cell_float_db(r["snr_med"]))
+            self._callsign_table.setItem(i, 12, cell_float_db(r["snr_p75"]))
+            self._callsign_table.setItem(i, 13, cell_float_db(r["snr_max"]))
 
         self._callsign_table.resizeColumnsToContents()
         self._callsign_table.setSortingEnabled(True)
