@@ -35,6 +35,7 @@ Public API
 from __future__ import annotations
 
 from .block import Block
+from .channelizer_block import ChannelizerBlock, ChannelizerBlockConfig
 from .flex_source import FLEX_DAXIQ_FULL_SCALE, FlexSource, FlexSourceConfig
 from .graph import Runtime
 from .jsonl_sink import JsonlSink, JsonlSinkConfig
@@ -52,6 +53,8 @@ from .wav_source import WavSource, WavSourceConfig
 __all__ = [
     "Block",
     "BlockConfig",
+    "ChannelizerBlock",
+    "ChannelizerBlockConfig",
     "CoherentPair",
     "Event",
     "FLEX_DAXIQ_FULL_SCALE",
