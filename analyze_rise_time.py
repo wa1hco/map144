@@ -197,10 +197,20 @@ def compute_features(
     times_s: np.ndarray,
     snr_db: np.ndarray,
     fading_min_window_s: float = 4.0,
+    edge_window_s: float = 0.2,
 ) -> dict:
     """Extract temporal features.  NaN where a feature isn't well-defined
     (e.g. fading-rate from a < 4 s window, or rise-time from a clip
     with no above-threshold peak).
+
+    ``peak_to_start_db`` and ``peak_to_end_db`` measure how much the
+    SNR has dropped at the window edges relative to the peak, averaged
+    over ``edge_window_s`` seconds.  These distinguish a sustained
+    keyed signal (small peak-to-end gap — still keyed at window end)
+    from a real ping (large peak-to-end gap — signal returned to
+    baseline).  Critical when rise_time alone is misleading: a station
+    that keys up mid-period has a fast rise too, but its peak_to_end
+    is small.
     """
     out: dict = {
         "duration_s":            float(times_s[-1] - times_s[0]) if len(times_s) > 1 else 0.0,
@@ -209,6 +219,9 @@ def compute_features(
         "rise_time_ms":          float("nan"),
         "fall_time_ms":          float("nan"),
         "duty_cycle":            float("nan"),
+        "longest_run_ms":        float("nan"),
+        "peak_to_start_db":      float("nan"),
+        "peak_to_end_db":        float("nan"),
         "fading_peak_hz":        float("nan"),
         "fading_band_power_frac": float("nan"),
     }
@@ -252,7 +265,46 @@ def compute_features(
     out["fall_time_ms"] = float((times_s[i_p10_fall] - times_s[i_p90_fall]) * 1000)
 
     # ── Duty cycle (fraction of frames above threshold) ──────────────
-    out["duty_cycle"] = float((snr_db > DETECT_THRESH_DB).sum() / len(snr_db))
+    above = snr_db > DETECT_THRESH_DB
+    out["duty_cycle"] = float(above.sum() / len(snr_db))
+
+    # ── Longest contiguous run above threshold (ms) ─────────────────
+    # A ping shows ONE short run; a sustained signal shows ONE long run
+    # spanning most of the window.  duty_cycle alone treats fragmented
+    # bursts and a single sustained burst the same; longest_run pulls
+    # them apart.
+    if above.any():
+        runs = []
+        cur = 0
+        for v in above:
+            if v:
+                cur += 1
+            else:
+                if cur > 0:
+                    runs.append(cur)
+                cur = 0
+        if cur > 0:
+            runs.append(cur)
+        max_run_frames = max(runs) if runs else 0
+        # Frame step in seconds
+        dt_s = float(times_s[1] - times_s[0]) if len(times_s) > 1 else 0.0
+        out["longest_run_ms"] = float(max_run_frames * dt_s * 1000)
+    else:
+        out["longest_run_ms"] = 0.0
+
+    # ── Peak-to-edge differences ─────────────────────────────────────
+    # Sample the leading / trailing ``edge_window_s`` seconds and report
+    # the mean SNR there relative to the peak.  Local keying mid-period
+    # → small peak_to_end (signal still strong at end).  Real ping with
+    # full decay → large peak_to_end (signal gone by end).
+    dt_s = float(times_s[1] - times_s[0]) if len(times_s) > 1 else 0.0
+    if dt_s > 0:
+        edge_n = max(1, int(round(edge_window_s / dt_s)))
+        edge_n = min(edge_n, len(snr_db) // 4 or 1)
+        start_mean = float(snr_db[:edge_n].mean())
+        end_mean = float(snr_db[-edge_n:].mean())
+        out["peak_to_start_db"] = peak - start_mean
+        out["peak_to_end_db"] = peak - end_mean
 
     # ── Fading rate (FFT of the SNR envelope; only if window long enough) ─
     if out["duration_s"] >= fading_min_window_s and len(snr_db) >= 32:
@@ -378,14 +430,19 @@ def plot_results(results_by_class: dict, output_path: Path) -> None:
             else:
                 ax.set_visible(False)
 
-    # Feature histograms (bottom row, 3 panels).
+    # Feature histograms (bottom row, 4 panels).  The four shown together
+    # disambiguate the failure mode where rise_time alone misclassifies
+    # a station that keys mid-period as a ping: fall_time and
+    # peak_to_end_dB stay LOW for the keying station (signal sustained)
+    # but stay HIGH for a real ping that decayed before window end.
     feature_specs = [
-        ("rise_time_ms",   "rise time (ms)",          [0, 1000]),
-        ("duty_cycle",     "duty cycle",              [0, 1]),
-        ("fading_peak_hz", "fading peak frequency (Hz)", [0, 2]),
+        ("rise_time_ms",     "rise time (ms)",      [0, 1000]),
+        ("fall_time_ms",     "fall time (ms)",      [0, 1500]),
+        ("longest_run_ms",   "longest run (ms)",    None),       # auto x
+        ("peak_to_end_db",   "peak − end (dB)",     [0, 25]),
     ]
     for fi, (fname, label, xlim) in enumerate(feature_specs):
-        ax = fig.add_subplot(rows, 3, n_classes * 3 + fi + 1)
+        ax = fig.add_subplot(rows, len(feature_specs), n_classes * len(feature_specs) + fi + 1)
         for cls in classes:
             vals = [r["features"][fname] for r in results_by_class[cls]
                     if not np.isnan(r["features"][fname])]
@@ -420,33 +477,36 @@ def plot_results(results_by_class: dict, output_path: Path) -> None:
 
 
 def print_summary(results_by_class: dict) -> None:
+    """Print medians per class for every feature, with column groups
+    that distinguish similar-rise but different-after-peak signals.
+    """
     print()
     print(
-        f"{'class':<14} {'n':>4} "
-        f"{'rise_med':>10} {'rise_p25':>10} {'rise_p75':>10} "
-        f"{'duty_med':>10} {'fade_hz_med':>12}"
+        f"{'class':<14} {'n':>3} | "
+        f"{'rise_ms':>8} {'fall_ms':>8} | "
+        f"{'duty':>5} {'longrun_ms':>10} | "
+        f"{'p2start_dB':>11} {'p2end_dB':>9} | "
+        f"{'fade_Hz':>8}"
     )
-    print("-" * 76)
+    print("-" * 96)
     for cls, results in results_by_class.items():
         if not results:
             continue
 
         def med(key):
             vals = [r["features"][key] for r in results
-                    if not np.isnan(r["features"][key])]
+                    if r["features"].get(key) is not None
+                    and r["features"].get(key) == r["features"].get(key)]   # NaN-safe
             return np.median(vals) if vals else float("nan")
 
-        def pct(key, p):
-            vals = [r["features"][key] for r in results
-                    if not np.isnan(r["features"][key])]
-            return np.percentile(vals, p) if vals else float("nan")
-
         n = len(results)
-        rmed = med("rise_time_ms")
-        rp25 = pct("rise_time_ms", 25)
-        rp75 = pct("rise_time_ms", 75)
-        dmed = med("duty_cycle")
-        fmed = med("fading_peak_hz")
+        rise = med("rise_time_ms")
+        fall = med("fall_time_ms")
+        duty = med("duty_cycle")
+        runl = med("longest_run_ms")
+        p2s = med("peak_to_start_db")
+        p2e = med("peak_to_end_db")
+        fade = med("fading_peak_hz")
 
         def fmt(x, w):
             return f"{x:>{w}.0f}" if (x == x and not np.isinf(x)) else " " * (w - 1) + "—"
@@ -455,9 +515,11 @@ def print_summary(results_by_class: dict) -> None:
             return f"{x:>{w}.{dec}f}" if (x == x and not np.isinf(x)) else " " * (w - 1) + "—"
 
         print(
-            f"{cls:<14} {n:>4} "
-            f"{fmt(rmed, 10)} {fmt(rp25, 10)} {fmt(rp75, 10)} "
-            f"{fmt_f(dmed, 10, 2)} {fmt_f(fmed, 12, 2)}"
+            f"{cls:<14} {n:>3} | "
+            f"{fmt(rise, 8)} {fmt(fall, 8)} | "
+            f"{fmt_f(duty, 5, 2)} {fmt(runl, 10)} | "
+            f"{fmt_f(p2s, 11, 1)} {fmt_f(p2e, 9, 1)} | "
+            f"{fmt_f(fade, 8, 2)}"
         )
 
 
