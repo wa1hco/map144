@@ -19,7 +19,7 @@ import json
 import re
 import signal
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -361,6 +361,230 @@ def _format_summary(matched, wsjtx_only, map144_only, wsjtx_all, map144_all,
     return '\n'.join(lines)
 
 
+# ── Classification (density + distance) ──────────────────────────────────────
+#
+# Four-class scheme combining period-density (continuous-TX vs sparse) and
+# great-circle range from the operator's grid:
+#
+#   TRUE_PING     ≤ max_ping_periods periods                      (mission target)
+#   WEAK_FADING   between max_ping_periods and min_local_periods   (intermittent)
+#   STRONG_LOCAL  ≥ min_local_periods AND range < local_max_km     (LOS / ground-wave)
+#   CONT_PROP     ≥ min_local_periods AND range ≥ local_max_km     (continuous propagation
+#                                                                    — Es / F2 / beacon)
+#
+# When a callsign has no known grid we default high-density to STRONG_LOCAL
+# (conservative: assume local until proven otherwise).
+#
+# CLASS_RANK doubles as the "most-noise wins" tie-breaker for messages
+# carrying multiple callsigns and as the sort order in the callsign table
+# (mission-first when reversed).
+
+CLASS_RANK = {
+    "STRONG_LOCAL": 0,
+    "CONT_PROP":    1,
+    "WEAK_FADING":  2,
+    "TRUE_PING":    3,
+    "UNKNOWN":      4,
+}
+
+_GRID_TOKEN_RE = re.compile(r'^[A-R]{2}[0-9]{2}([A-X]{2})?$', re.IGNORECASE)
+
+
+def grid_to_lat_lon(grid: str) -> tuple[float, float]:
+    """Maidenhead grid (4 or 6 char) → (lat, lon) of cell center."""
+    g = grid.upper()
+    if len(g) not in (4, 6):
+        raise ValueError(f"unsupported grid length: {grid!r}")
+    lon = (ord(g[0]) - ord('A')) * 20.0 - 180.0
+    lat = (ord(g[1]) - ord('A')) * 10.0 - 90.0
+    lon += int(g[2]) * 2.0
+    lat += int(g[3]) * 1.0
+    if len(g) == 6:
+        lon += (ord(g[4]) - ord('A')) * (5.0 / 60.0) + (2.5 / 60.0)
+        lat += (ord(g[5]) - ord('A')) * (2.5 / 60.0) + (1.25 / 60.0)
+    else:
+        lon += 1.0
+        lat += 0.5
+    return lat, lon
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in kilometres."""
+    import math
+    R_km = 6371.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return 2 * R_km * math.asin(math.sqrt(a))
+
+
+def range_km_for_grid(grid: str | None,
+                       my_lat: float | None,
+                       my_lon: float | None) -> float | None:
+    if not grid or my_lat is None or my_lon is None:
+        return None
+    try:
+        lat, lon = grid_to_lat_lon(grid)
+    except ValueError:
+        return None
+    return haversine_km(my_lat, my_lon, lat, lon)
+
+
+def extract_grid_assignments(decodes: list[dict]) -> dict[str, str]:
+    """For each callsign appearing in a message with a grid token, return
+    its most common observed grid.  The grid is associated with the
+    *last callsign before the grid token* in the message (the sender).
+
+    Examples
+    --------
+    "CQ K1ABC FN42"            → grid for K1ABC
+    "K1ABC W2DEF FN42"         → grid for W2DEF
+    "K1ABC W2DEF -01"          → no grid
+    "K1ABC W2DEF RR73"         → no grid — RR73 is a sign-off, not a grid
+
+    Note that ``RR73`` matches the Maidenhead pattern (RR is letters in
+    [A-R], 73 is digits) but is the WSJT sign-off — must be skipped
+    explicitly via ``_SKIP_WORDS``.  Without this skip, every QSO ending
+    "RR73" would falsely assign grid ``RR73`` (point in the Arctic
+    Ocean) to the receiving station.
+    """
+    grid_obs: dict[str, Counter] = defaultdict(Counter)
+    for d in decodes:
+        tokens = d['message'].split()
+        grid_idx = None
+        for i in range(len(tokens) - 1, -1, -1):
+            t = tokens[i]
+            if t in _SKIP_WORDS:           # RR73 / 73 / CQ / DE / QRZ / RRR
+                continue
+            if _GRID_TOKEN_RE.match(t):
+                grid_idx = i
+                break
+        if grid_idx is None:
+            continue
+        grid = tokens[grid_idx].upper()
+        for i in range(grid_idx - 1, -1, -1):
+            t = tokens[i]
+            if t in _SKIP_WORDS:
+                continue
+            if _GRID_TOKEN_RE.match(t):
+                continue
+            if _CALL_RE.match(t):
+                grid_obs[t][grid] += 1
+                break
+    return {cs: ctr.most_common(1)[0][0] for cs, ctr in grid_obs.items()}
+
+
+def classify_callsigns(
+    map144_all: list[dict],
+    wsjtx_all: list[dict],
+    cs2grid: dict[str, str] | None = None,
+    my_lat: float | None = None,
+    my_lon: float | None = None,
+    *,
+    min_local_periods: int = 30,
+    max_ping_periods: int = 5,
+    local_max_km: float = 300.0,
+) -> dict[str, str]:
+    """Return ``{callsign: classification}`` over the union of decodes."""
+    cs2grid = cs2grid or {}
+    periods_by_call: dict[str, set] = defaultdict(set)
+    for src in (map144_all, wsjtx_all):
+        for d in src:
+            for cs in _calls_in_message(d['message']):
+                periods_by_call[cs].add(d['ts'])
+
+    out: dict[str, str] = {}
+    for cs, periods in periods_by_call.items():
+        n = len(periods)
+        if n <= max_ping_periods:
+            out[cs] = "TRUE_PING"
+        elif n < min_local_periods:
+            out[cs] = "WEAK_FADING"
+        else:
+            grid = cs2grid.get(cs)
+            rng = range_km_for_grid(grid, my_lat, my_lon)
+            if rng is None:
+                out[cs] = "STRONG_LOCAL"      # unknown distance → conservative
+            elif rng < local_max_km:
+                out[cs] = "STRONG_LOCAL"
+            else:
+                out[cs] = "CONT_PROP"
+    return out
+
+
+def classify_decode(d: dict, cs2cls: dict[str, str]) -> str:
+    """Most-noise-wins picking among the message's callsigns."""
+    best_cls, best_rank = "UNKNOWN", 99
+    for cs in _calls_in_message(d['message']):
+        cls = cs2cls.get(cs, "UNKNOWN")
+        r = CLASS_RANK[cls]
+        if r < best_rank:
+            best_cls, best_rank = cls, r
+    return best_cls
+
+
+def build_callsign_rows(
+    decodes: list[dict],
+    cs2cls: dict[str, str],
+    all_time_decodes: list[dict],
+    cs2grid: dict[str, str] | None = None,
+    my_lat: float | None = None,
+    my_lon: float | None = None,
+) -> list[dict]:
+    """One row per callsign in ``decodes`` with SNR percentiles + range +
+    classification.  ``all_time_decodes`` provides the period-count basis
+    that the classifier used (informational column).
+    """
+    cs2grid = cs2grid or {}
+    by_call_snrs: dict[str, list[float]] = defaultdict(list)
+    by_call_periods: dict[str, set] = defaultdict(set)
+    by_call_count: Counter = Counter()
+    for d in decodes:
+        snr = d.get('snr')
+        for cs in _calls_in_message(d['message']):
+            if snr is not None:
+                by_call_snrs[cs].append(snr)
+            by_call_periods[cs].add(d['ts'])
+            by_call_count[cs] += 1
+
+    alltime_periods: dict[str, set] = defaultdict(set)
+    for d in all_time_decodes:
+        for cs in _calls_in_message(d['message']):
+            alltime_periods[cs].add(d['ts'])
+
+    rows = []
+    for cs, n in by_call_count.items():
+        snrs = by_call_snrs[cs]
+        if snrs:
+            arr = np.array(snrs, dtype=float)
+            row = {
+                'callsign': cs,
+                'n_decodes': n,
+                'n_periods': len(by_call_periods[cs]),
+                'snr_min': float(arr.min()),
+                'snr_p25': float(np.percentile(arr, 25)),
+                'snr_med': float(np.percentile(arr, 50)),
+                'snr_p75': float(np.percentile(arr, 75)),
+                'snr_max': float(arr.max()),
+            }
+        else:
+            row = {
+                'callsign': cs, 'n_decodes': n,
+                'n_periods': len(by_call_periods[cs]),
+                'snr_min': None, 'snr_p25': None, 'snr_med': None,
+                'snr_p75': None, 'snr_max': None,
+            }
+        row['classification'] = cs2cls.get(cs, 'UNKNOWN')
+        row['n_periods_alltime'] = len(alltime_periods[cs])
+        grid = cs2grid.get(cs)
+        row['grid'] = grid
+        row['range_km'] = range_km_for_grid(grid, my_lat, my_lon)
+        rows.append(row)
+    return rows
+
+
 # ── Figure builders ───────────────────────────────────────────────────────────
 
 _TAG_STYLE = {
@@ -679,6 +903,149 @@ def _make_snr_scatter_fig(matched, wsjtx_only, map144_only,
     return fig
 
 
+# ── Figure builders, by-class variants ───────────────────────────────────────
+
+#: Class colour map shared between the by-class plots and the GUI table.
+CLASS_COLORS = {
+    "TRUE_PING":    "#1f77b4",   # blue   — primary mission
+    "WEAK_FADING":  "#2ca02c",   # green  — secondary mission
+    "CONT_PROP":    "#ff7f0e",   # orange — distant-but-frequent (Es / F2 / beacon)
+    "STRONG_LOCAL": "#d62728",   # red    — local interference
+}
+
+
+def _make_detection_rate_by_class_fig(
+    matched, wsjtx_only, period_slip_ids: set, cs2cls: dict[str, str],
+    date_label: str = '',
+) -> Figure:
+    """MAP144 detection rate (hits / WSJT-X total) vs WSJT-X SNR, one
+    line per classification.  Period-slipped decodes count as hits —
+    MAP144 *did* decode them, just landed in a different period.
+    """
+    snr_bins = np.arange(-8.5, 9.5, 1.0)
+    bin_centers = 0.5 * (snr_bins[:-1] + snr_bins[1:])
+    classes = ("TRUE_PING", "WEAK_FADING", "CONT_PROP", "STRONG_LOCAL")
+    hits = {c: np.zeros(len(bin_centers)) for c in classes}
+    total = {c: np.zeros(len(bin_centers)) for c in classes}
+
+    def bin_idx(snr):
+        if snr is None:
+            return None
+        i = int(np.searchsorted(snr_bins, snr) - 1)
+        return i if 0 <= i < len(bin_centers) else None
+
+    for w, _m in matched:
+        cls = classify_decode(w, cs2cls)
+        if cls not in classes:
+            continue
+        i = bin_idx(w['snr'])
+        if i is None:
+            continue
+        hits[cls][i] += 1
+        total[cls][i] += 1
+    for w in wsjtx_only:
+        cls = classify_decode(w, cs2cls)
+        if cls not in classes:
+            continue
+        i = bin_idx(w['snr'])
+        if i is None:
+            continue
+        if id(w) in period_slip_ids:
+            hits[cls][i] += 1
+        total[cls][i] += 1
+
+    fig = Figure(figsize=(8.5, 6.5))
+    ax_rate = fig.add_axes([0.10, 0.32, 0.85, 0.55])
+    ax_count = fig.add_axes([0.10, 0.08, 0.85, 0.18], sharex=ax_rate)
+    for cls in classes:
+        t = total[cls]
+        rate = np.divide(hits[cls], t,
+                         out=np.full_like(t, np.nan), where=t > 0)
+        ax_rate.plot(bin_centers, rate, 'o-',
+                     color=CLASS_COLORS[cls], label=cls, lw=2, ms=6)
+        ax_count.bar(bin_centers, t, width=0.8,
+                     color=CLASS_COLORS[cls], alpha=0.4, label=cls)
+    ax_rate.set_ylim(-0.05, 1.05)
+    ax_rate.axhline(1.0, color='gray', ls=':', lw=0.8)
+    ax_rate.set_ylabel('MAP144 detection rate\n(hits / WSJT-X total)')
+    title = 'MAP144 detection rate by class — period-slipped decodes count as hits'
+    if date_label:
+        title += f'\n{date_label}'
+    ax_rate.set_title(title, fontsize=12)
+    ax_rate.grid(True, alpha=0.3)
+    ax_rate.legend(loc='lower right')
+    ax_count.set_ylabel('WSJT-X count\n(per bin)')
+    ax_count.set_xlabel('WSJT-X SNR (dB)')
+    ax_count.grid(True, alpha=0.3)
+    return fig
+
+
+def _make_snr_scatter_by_class_fig(
+    matched, wsjtx_only, map144_only, cs2cls: dict[str, str],
+    date_label: str = '',
+) -> Figure:
+    """SNR vs UTC time, one panel per classification.
+
+    Panels stacked vertically with shared x-axis: TRUE_PING, WEAK_FADING,
+    CONT_PROP, STRONG_LOCAL.  WSJT-X-only blue dots, MAP144-only red x,
+    matched green o.
+    """
+    classes = ("TRUE_PING", "WEAK_FADING", "CONT_PROP", "STRONG_LOCAL")
+    fig = Figure(figsize=(11, 9))
+    axes = []
+    n = len(classes)
+    for k, cls in enumerate(classes):
+        ax = fig.add_subplot(n, 1, k + 1, sharex=axes[0] if axes else None)
+        axes.append(ax)
+
+    by_class = {c: {'matched': [], 'wsjtx_only': [], 'map144_only': []}
+                for c in classes}
+    for w, _m in matched:
+        cls = classify_decode(w, cs2cls)
+        if cls in by_class:
+            by_class[cls]['matched'].append((w['ts'], w['snr']))
+    for w in wsjtx_only:
+        cls = classify_decode(w, cs2cls)
+        if cls in by_class:
+            by_class[cls]['wsjtx_only'].append((w['ts'], w['snr']))
+    for d in map144_only:
+        cls = classify_decode(d, cs2cls)
+        if cls in by_class:
+            by_class[cls]['map144_only'].append((d['ts'], d['snr']))
+
+    for ax, cls in zip(axes, classes):
+        bucket = by_class[cls]
+
+        def split(pairs):
+            if not pairs:
+                return [], []
+            ts, snr = zip(*[(t, s) for t, s in pairs if s is not None])
+            return list(ts), list(snr)
+
+        m_t, m_s = split(bucket['matched'])
+        w_t, w_s = split(bucket['wsjtx_only'])
+        x_t, x_s = split(bucket['map144_only'])
+        ax.scatter(w_t, w_s, color='#1f77b4', marker='.', s=18, alpha=0.55,
+                   label=f"WSJT-X only (n={len(w_t)})")
+        ax.scatter(x_t, x_s, color='#d62728', marker='x', s=22, alpha=0.55,
+                   label=f"MAP144 only (n={len(x_t)})")
+        ax.scatter(m_t, m_s, color='#2ca02c', marker='o', s=22, alpha=0.65,
+                   label=f"matched (n={len(m_t)})")
+        ax.set_ylabel('SNR (dB)')
+        n_total = len(m_t) + len(w_t) + len(x_t)
+        ax.set_title(f"{cls}  —  {n_total} decodes", fontsize=10)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right', fontsize=8)
+        ax.set_ylim(-12, 25)
+    axes[-1].set_xlabel('UTC time')
+    suptitle = 'SNR scatter by class'
+    if date_label:
+        suptitle += f' — {date_label}'
+    fig.suptitle(suptitle, fontsize=12)
+    fig.tight_layout()
+    return fig
+
+
 # ── Legacy CLI plot wrappers (kept for --no-gui mode) ─────────────────────────
 
 def plot_detection_rate(matched, wsjtx_only, out_path, date_label=''):
@@ -816,6 +1183,30 @@ class CompareGUI(QtWidgets.QMainWindow):
         cbox.addWidget(self._local_spin)
         cbox.addWidget(QtWidgets.QLabel("periods"))
 
+        # New: operator's grid (drives range_km column + density-distance class)
+        cbox.addSpacing(12)
+        cbox.addWidget(QtWidgets.QLabel("My grid:"))
+        self._mygrid_edit = QtWidgets.QLineEdit("FN42EV")
+        self._mygrid_edit.setFixedWidth(72)
+        self._mygrid_edit.setToolTip(
+            "Operator's Maidenhead grid (4 or 6 char) — used for great-circle\n"
+            "range column and the local-vs-distant classifier split.")
+        cbox.addWidget(self._mygrid_edit)
+
+        cbox.addSpacing(12)
+        cbox.addWidget(QtWidgets.QLabel("Local max km:"))
+        self._localkm_spin = QtWidgets.QDoubleSpinBox()
+        self._localkm_spin.setRange(50.0, 5000.0)
+        self._localkm_spin.setSingleStep(50.0)
+        self._localkm_spin.setDecimals(0)
+        self._localkm_spin.setValue(300.0)
+        self._localkm_spin.setFixedWidth(80)
+        self._localkm_spin.setToolTip(
+            "High-density callsign within this range = STRONG_LOCAL;\n"
+            "beyond this range = CONT_PROP (continuous propagation,\n"
+            "e.g. sporadic-E season distant station).")
+        cbox.addWidget(self._localkm_spin)
+
         cbox.addSpacing(12)
         self._no_launches_cb = QtWidgets.QCheckBox("No launches data")
         cbox.addWidget(self._no_launches_cb)
@@ -842,14 +1233,43 @@ class CompareGUI(QtWidgets.QMainWindow):
         # ── Plot tabs ─────────────────────────────────────────────────────────
         self._tabs = QtWidgets.QTabWidget()
 
-        # ── Layout ────────────────────────────────────────────────────────────
+        # ── Callsign table (left pane — populated in _do_run) ─────────────────
+        self._callsign_summary = QtWidgets.QLabel("Run to populate.")
+        self._callsign_summary.setStyleSheet("font-weight: 600; padding: 2px;")
+        self._callsign_table = QtWidgets.QTableWidget(0, 12)
+        self._callsign_table.setHorizontalHeaderLabels([
+            "callsign", "grid", "rng_km", "class",
+            "n_dec", "n_per", "n_alltime",
+            "SNR min", "p25", "med", "p75", "max",
+        ])
+        self._callsign_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.NoEditTriggers)
+        self._callsign_table.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectRows)
+        self._callsign_table.setAlternatingRowColors(True)
+        self._callsign_table.setSortingEnabled(True)
+        left_pane = QtWidgets.QWidget()
+        lv = QtWidgets.QVBoxLayout(left_pane)
+        lv.setContentsMargins(4, 4, 4, 4)
+        lv.addWidget(self._callsign_summary)
+        lv.addWidget(self._callsign_table, 1)
+
+        # ── Layout (horizontal splitter: callsign table | tabs) ───────────────
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter.addWidget(left_pane)
+        splitter.addWidget(self._tabs)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([580, 1100])
+        self._splitter = splitter
+
         central = QtWidgets.QWidget()
         vbox = QtWidgets.QVBoxLayout(central)
         vbox.setContentsMargins(4, 4, 4, 4)
         vbox.setSpacing(4)
         vbox.addWidget(ctrl)
         vbox.addWidget(self._summary)
-        vbox.addWidget(self._tabs, stretch=1)
+        vbox.addWidget(splitter, stretch=1)
         self.setCentralWidget(central)
 
         # ── Status bar ────────────────────────────────────────────────────────
@@ -949,6 +1369,42 @@ class CompareGUI(QtWidgets.QMainWindow):
             summary = f"(filtered {n_test} MAP144 test messages)\n\n" + summary
         self._summary.setPlainText(summary)
 
+        # ── Classification (density + range) ──────────────────────────────────
+        my_grid = self._mygrid_edit.text().strip().upper() or "FN42EV"
+        try:
+            my_lat, my_lon = grid_to_lat_lon(my_grid)
+        except ValueError:
+            self._summary.setPlainText(
+                f"{self._summary.toPlainText()}\n\n"
+                f"Warning: invalid My grid {my_grid!r}; using FN42EV"
+            )
+            my_grid = "FN42EV"
+            my_lat, my_lon = grid_to_lat_lon(my_grid)
+        local_max_km = float(self._localkm_spin.value())
+        cs2grid = extract_grid_assignments(map144_all + wsjtx_all)
+        cs2cls = classify_callsigns(
+            map144_all, wsjtx_all,
+            cs2grid=cs2grid, my_lat=my_lat, my_lon=my_lon,
+            min_local_periods=self._local_spin.value(),
+            max_ping_periods=5,
+            local_max_km=local_max_km,
+        )
+
+        # Period-slip set for the per-class detection-rate plot (period-
+        # slipped wsjtx_only entries count as MAP144 hits — MAP144 *did*
+        # decode them, just into a different period).
+        period_slip_ids = {
+            d_id for d_id, tag in wsjtx_tags.items()
+            if tag == 'PERIOD_SLIP'
+        }
+
+        # ── Callsign table (left pane) ────────────────────────────────────────
+        rows = build_callsign_rows(
+            map144_all + wsjtx_all, cs2cls, map144_all + wsjtx_all,
+            cs2grid=cs2grid, my_lat=my_lat, my_lon=my_lon,
+        )
+        self._populate_callsign_table(rows, my_grid)
+
         # ── Build figures ─────────────────────────────────────────────────────
         date_label = self._date_label()
         timeline_fig = _make_timeline_fig(
@@ -963,11 +1419,22 @@ class CompareGUI(QtWidgets.QMainWindow):
             wsjtx_tags=wsjtx_tags or None,
             local_calls=local_calls or None,
         )
+        detrate_byclass_fig = _make_detection_rate_by_class_fig(
+            matched, wsjtx_only, period_slip_ids, cs2cls,
+            date_label=f"{date_label} @{my_grid}",
+        )
+        scatter_byclass_fig = _make_snr_scatter_by_class_fig(
+            matched, wsjtx_only, map144_only, cs2cls,
+            date_label=f"{date_label} @{my_grid}",
+        )
 
         # Close old figures to release memory
         for f in self._figs:
             f.clf()
-        self._figs = [timeline_fig, detrate_fig, scatter_fig]
+        self._figs = [
+            timeline_fig, detrate_fig, scatter_fig,
+            detrate_byclass_fig, scatter_byclass_fig,
+        ]
 
         # ── Populate tabs ─────────────────────────────────────────────────────
         self._tabs.clear()
@@ -975,6 +1442,12 @@ class CompareGUI(QtWidgets.QMainWindow):
         self._tabs.addTab(_PlotPane(timeline_fig, f"{stem}_timeline"), "Timeline")
         self._tabs.addTab(_PlotPane(detrate_fig,  f"{stem}_detect"),   "Detection Rate")
         self._tabs.addTab(_PlotPane(scatter_fig,  f"{stem}_scatter"),  "SNR Scatter")
+        self._tabs.addTab(_PlotPane(detrate_byclass_fig,
+                                    f"{stem}_detect_byclass"),
+                          "Detection Rate (by class)")
+        self._tabs.addTab(_PlotPane(scatter_byclass_fig,
+                                    f"{stem}_scatter_byclass"),
+                          "SNR Scatter (by class)")
 
         self._save_all_btn.setEnabled(True)
         n_total = len(matched) + len(wsjtx_only) + len(map144_only)
@@ -983,11 +1456,97 @@ class CompareGUI(QtWidgets.QMainWindow):
             f"WSJT-X: {len(wsjtx_all)}  MAP144: {len(map144_all)}  "
             f"matched: {len(matched)}")
 
+    def _populate_callsign_table(self, rows: list[dict], my_grid: str) -> None:
+        """Fill the left-pane callsign table from ``build_callsign_rows`` output.
+
+        Sorted by classification (mission first) then n_decodes desc.
+        Class column is colour-coded per ``CLASS_COLORS`` shifted to Qt
+        named colours for legibility against the alternating-row backdrop.
+        """
+        sort_rank = {"TRUE_PING": 0, "WEAK_FADING": 1,
+                     "CONT_PROP": 2, "STRONG_LOCAL": 3, "UNKNOWN": 4}
+        rows = sorted(
+            rows, key=lambda r: (sort_rank[r["classification"]], -r["n_decodes"]),
+        )
+        cls_color = {
+            "TRUE_PING":    QtCore.Qt.darkBlue,
+            "WEAK_FADING":  QtCore.Qt.darkGreen,
+            "CONT_PROP":    QtCore.Qt.darkYellow,
+            "STRONG_LOCAL": QtCore.Qt.darkRed,
+            "UNKNOWN":      QtCore.Qt.gray,
+        }
+
+        # Disable sorting while populating to avoid visual flicker.
+        self._callsign_table.setSortingEnabled(False)
+        self._callsign_table.setRowCount(len(rows))
+
+        def cell_int(v):
+            it = QtWidgets.QTableWidgetItem()
+            it.setData(QtCore.Qt.DisplayRole, int(v))
+            it.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            return it
+
+        def cell_float_db(v):
+            it = QtWidgets.QTableWidgetItem()
+            if v is None:
+                it.setData(QtCore.Qt.DisplayRole, "—")
+            else:
+                it.setData(QtCore.Qt.DisplayRole, f"{v:+.0f}")
+            it.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            return it
+
+        def cell_text(v, align_right=False):
+            it = QtWidgets.QTableWidgetItem(v if v else "—")
+            if align_right:
+                it.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            return it
+
+        def cell_range(km):
+            it = QtWidgets.QTableWidgetItem()
+            if km is None:
+                it.setData(QtCore.Qt.DisplayRole, "—")
+            else:
+                it.setData(QtCore.Qt.DisplayRole, int(round(km)))
+            it.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            return it
+
+        for i, r in enumerate(rows):
+            self._callsign_table.setItem(i, 0,
+                QtWidgets.QTableWidgetItem(r["callsign"]))
+            self._callsign_table.setItem(i, 1, cell_text(r["grid"]))
+            self._callsign_table.setItem(i, 2, cell_range(r["range_km"]))
+            it_cls = QtWidgets.QTableWidgetItem(r["classification"])
+            it_cls.setForeground(cls_color.get(r["classification"], QtCore.Qt.black))
+            self._callsign_table.setItem(i, 3, it_cls)
+            self._callsign_table.setItem(i, 4, cell_int(r["n_decodes"]))
+            self._callsign_table.setItem(i, 5, cell_int(r["n_periods"]))
+            self._callsign_table.setItem(i, 6, cell_int(r["n_periods_alltime"]))
+            self._callsign_table.setItem(i, 7, cell_float_db(r["snr_min"]))
+            self._callsign_table.setItem(i, 8, cell_float_db(r["snr_p25"]))
+            self._callsign_table.setItem(i, 9, cell_float_db(r["snr_med"]))
+            self._callsign_table.setItem(i, 10, cell_float_db(r["snr_p75"]))
+            self._callsign_table.setItem(i, 11, cell_float_db(r["snr_max"]))
+
+        self._callsign_table.resizeColumnsToContents()
+        self._callsign_table.setSortingEnabled(True)
+
+        # Header summary: total + per-class counts.
+        cls_counts = Counter(r["classification"] for r in rows)
+        summary_parts = []
+        for c in ("TRUE_PING", "WEAK_FADING", "CONT_PROP", "STRONG_LOCAL", "UNKNOWN"):
+            n = cls_counts.get(c, 0)
+            if n:
+                summary_parts.append(f"{c}={n}")
+        self._callsign_summary.setText(
+            f"{len(rows)} callsigns @ {my_grid} — " + ", ".join(summary_parts)
+        )
+
     def _save_all(self):
-        """Auto-save all three figures to timestamped PNGs."""
+        """Auto-save all current figures to timestamped PNGs."""
         date_str = self._date_edit.text().strip() or datetime.now().strftime('%Y%m%d')
         stem = Path(__file__).parent / f"compare_{date_str}"
-        names = ['timeline', 'detect', 'scatter']
+        names = ['timeline', 'detect', 'scatter',
+                 'detect_byclass', 'scatter_byclass']
         saved = []
         for fig, name in zip(self._figs, names):
             path = str(stem) + f'_{name}.png'
@@ -1013,6 +1572,13 @@ def main():
     ap.add_argument('--utc',    default=None, metavar='HH:MM-HH:MM')
     ap.add_argument('--launches', metavar='FILE', default=str(MAP144_LAUNCHES))
     ap.add_argument('--no-launches', action='store_true')
+    ap.add_argument('--my-grid', default='FN42EV',
+                    help="Operator's Maidenhead grid (4 or 6 char) for "
+                         "great-circle range column and the local-vs-distant "
+                         "classifier split (default FN42EV — WA1HCO)")
+    ap.add_argument('--local-max-km', type=float, default=300.0,
+                    help='High-density callsign within this range = STRONG_LOCAL; '
+                         'beyond = CONT_PROP (default 300)')
     args = ap.parse_args()
 
     if args.no_gui:
