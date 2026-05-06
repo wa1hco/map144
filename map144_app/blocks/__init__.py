@@ -36,23 +36,35 @@ from __future__ import annotations
 
 from .block import Block
 from .graph import Runtime
+from .jsonl_sink import JsonlSink, JsonlSinkConfig
+from .source import Source, SourceConfig
 from .stream import (
     CoherentPair,
     Stream,
     make_event_stream,
     make_sample_stream,
 )
+from .synthetic_source import SyntheticSource, SyntheticSourceConfig
 from .types import BlockConfig, Event, Record, StreamClosed
+from .wav_source import WavSource, WavSourceConfig
 
 __all__ = [
     "Block",
     "BlockConfig",
     "CoherentPair",
     "Event",
+    "JsonlSink",
+    "JsonlSinkConfig",
     "Record",
     "Runtime",
+    "Source",
+    "SourceConfig",
     "Stream",
     "StreamClosed",
+    "SyntheticSource",
+    "SyntheticSourceConfig",
+    "WavSource",
+    "WavSourceConfig",
     "make_event_stream",
     "make_sample_stream",
 ]
