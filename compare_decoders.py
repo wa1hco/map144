@@ -1823,8 +1823,14 @@ class CompareGUI(QtWidgets.QMainWindow):
             )
             return
         try:
+            # ``--no-file-picker`` suppresses analyze's own Tkinter
+            # WAV-list Toplevel — compare_decoders' right-click menu
+            # already lets the operator pick the right WAV, and the
+            # built-in picker would otherwise show all 5000+ files in
+            # MSK144/detections/ alongside the spectrogram.
             subprocess.Popen(
-                [sys.executable, str(self._ANALYZE_MSK144), wav_path],
+                [sys.executable, str(self._ANALYZE_MSK144),
+                 "--no-file-picker", wav_path],
                 start_new_session=True,
             )
         except OSError as exc:

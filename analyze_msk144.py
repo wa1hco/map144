@@ -1063,6 +1063,7 @@ def plot_analysis(
     fc_hz:      float,
     ntol_hz:    float,
     timings:    dict | None = None,
+    show_file_picker: bool = True,
 ) -> None:
     def _tick(label: str, t0: float) -> float:
         """Record elapsed time for a section and return a new start time."""
@@ -1399,15 +1400,16 @@ def plot_analysis(
 
         open_btn.on_clicked(_on_open_wav)
 
-        try:
-            _build_file_picker(
-                fig.canvas.manager.window,
-                dialog_dir,
-                _reload,
-                initial_filename=name,
-            )
-        except Exception:
-            pass  # non-TkAgg backend: file picker unavailable, Open WAV button still works
+        if show_file_picker:
+            try:
+                _build_file_picker(
+                    fig.canvas.manager.window,
+                    dialog_dir,
+                    _reload,
+                    initial_filename=name,
+                )
+            except Exception:
+                pass  # non-TkAgg backend: file picker unavailable, Open WAV button still works
     else:
         fig.tight_layout(rect=[0, 0.02, 1, 0.97])
 
@@ -1465,6 +1467,16 @@ def main() -> None:
             '--profile', action='store_true', default=False,
             help='Run cProfile and print top functions by cumulative time (forces --no-show-plots)',
         )
+        parser.add_argument(
+            '--file-picker', dest='file_picker', action='store_true', default=True,
+            help='Open the persistent WAV-file selector Toplevel beside the figure '
+                 '(default; useful when running standalone)',
+        )
+        parser.add_argument(
+            '--no-file-picker', dest='file_picker', action='store_false',
+            help='Do NOT open the WAV-file selector — useful when launched from '
+                 'another tool that already supplied the WAV',
+        )
         args = parser.parse_args()
 
         if args.wav is None:
@@ -1517,6 +1529,7 @@ def main() -> None:
             fc_hz=args.fc_hz,
             ntol_hz=args.ntol_hz,
             timings=timings,
+            show_file_picker=args.file_picker,
         )
 
         if args.profile:
