@@ -241,10 +241,75 @@ def _build_wsjtx_tags(wsjtx_only, launches):
 _SKIP_WORDS = {'CQ', 'DE', 'QRZ', 'RR73', '73', 'RRR'}
 _CALL_RE    = re.compile(r'^[A-Z0-9]{2,}(/[A-Z0-9]+)?$')
 _GRID_RE    = re.compile(r'^[A-R]{2}[0-9]{2}([A-X]{2})?$', re.IGNORECASE)
+#: Tokens that introduce a CQ-form message.  The transmitting station is
+#: then the first extracted callsign; any 2-letter region/state filter
+#: between CQ and the call is filtered by ``_calls_in_message`` (no digit).
+_CQ_PREFIXES = {'CQ', 'DE', 'QRZ'}
+
 
 def _calls_in_message(msg: str) -> list[str]:
-    return [w for w in msg.split()
-            if _CALL_RE.match(w) and w not in _SKIP_WORDS and not _GRID_RE.match(w)]
+    """Return tokens that look like real amateur callsigns.
+
+    Real callsigns contain at least one digit (e.g. ``K1ABC``,
+    ``W2DEF``, ``BT1NFE/R``).  Without the digit requirement, CQ
+    qualifiers like ``NA`` / ``DX`` / ``EU`` (and US-state abbreviations
+    in CQ-by-region messages) sneak through as "callsigns" and get
+    counted in per-callsign statistics.
+    """
+    out = []
+    for w in msg.split():
+        if w in _SKIP_WORDS:
+            continue
+        if _GRID_RE.match(w):
+            continue
+        if not _CALL_RE.match(w):
+            continue
+        # Require ≥1 digit in the base call (before any /SUFFIX).
+        base = w.split('/', 1)[0]
+        if not any(c.isdigit() for c in base):
+            continue
+        out.append(w)
+    return out
+
+
+def sender_in_message(msg: str) -> str | None:
+    """Return the *transmitting* station of an MSK144 message — None if
+    no clear sender can be identified.
+
+    MSK144 message-form conventions:
+
+    +----------------------------------+--------------------+
+    | Message form                     | Sender             |
+    +==================================+====================+
+    | ``CQ <SENDER> [grid]``           | first extracted    |
+    | ``CQ DX <SENDER> [grid]``        | first extracted    |
+    | ``CQ <region> <SENDER> [grid]``  | first extracted    |
+    | ``<addressed> <SENDER> <grid>``  | second extracted   |
+    | ``<addressed> <SENDER> <report>``| second extracted   |
+    | ``<addressed> <SENDER> RR73``    | second extracted   |
+    +----------------------------------+--------------------+
+
+    The first callsign in a non-CQ message is the *addressed* station
+    (the operator the SENDER is calling) and contributes nothing to
+    SENDER statistics: their grid, SNR, or transmission count cannot be
+    inferred from this message.
+    """
+    tokens = msg.split()
+    if not tokens:
+        return None
+    calls = _calls_in_message(msg)
+    if not calls:
+        return None
+    if tokens[0] in _CQ_PREFIXES:
+        # CQ form: the first extracted callsign is the sender.  Any
+        # 2-letter regional filter ('DX', 'NA', 'MA' …) was already
+        # excluded by the digit requirement above.
+        return calls[0]
+    # Standard QSO form: first call is addressed, second is sender.
+    if len(calls) >= 2:
+        return calls[1]
+    # Degenerate (single callsign, non-CQ) — best guess: that's the sender.
+    return calls[0]
 
 
 def _local_callsigns(all_decodes: list[dict], min_periods: int = 5) -> dict[str, int]:
@@ -487,13 +552,20 @@ def classify_callsigns(
     max_ping_periods: int = 5,
     local_max_km: float = 300.0,
 ) -> dict[str, str]:
-    """Return ``{callsign: classification}`` over the union of decodes."""
+    """Return ``{callsign: classification}`` over the union of decodes.
+
+    Period count is attributed to the *transmitting* station only — the
+    addressed station in a QSO message ("X Y FN20" → Y is sender,
+    X is just whom they're calling) contributes nothing.  See
+    :func:`sender_in_message`.
+    """
     cs2grid = cs2grid or {}
     periods_by_call: dict[str, set] = defaultdict(set)
     for src in (map144_all, wsjtx_all):
         for d in src:
-            for cs in _calls_in_message(d['message']):
-                periods_by_call[cs].add(d['ts'])
+            sender = sender_in_message(d['message'])
+            if sender is not None:
+                periods_by_call[sender].add(d['ts'])
 
     out: dict[str, str] = {}
     for cs, periods in periods_by_call.items():
@@ -515,14 +587,11 @@ def classify_callsigns(
 
 
 def classify_decode(d: dict, cs2cls: dict[str, str]) -> str:
-    """Most-noise-wins picking among the message's callsigns."""
-    best_cls, best_rank = "UNKNOWN", 99
-    for cs in _calls_in_message(d['message']):
-        cls = cs2cls.get(cs, "UNKNOWN")
-        r = CLASS_RANK[cls]
-        if r < best_rank:
-            best_cls, best_rank = cls, r
-    return best_cls
+    """Return the classification of the decode's *transmitting* station."""
+    sender = sender_in_message(d['message'])
+    if sender is None:
+        return "UNKNOWN"
+    return cs2cls.get(sender, "UNKNOWN")
 
 
 def build_callsign_rows(
@@ -533,26 +602,32 @@ def build_callsign_rows(
     my_lat: float | None = None,
     my_lon: float | None = None,
 ) -> list[dict]:
-    """One row per callsign in ``decodes`` with SNR percentiles + range +
-    classification.  ``all_time_decodes`` provides the period-count basis
-    that the classifier used (informational column).
+    """One row per *transmitting* callsign in ``decodes``.
+
+    Each statistic (SNR percentiles, decode count, period count) is
+    attributed to the message's SENDER only.  Addressed stations are
+    not credited — they didn't transmit anything we received in the
+    relevant message.  See :func:`sender_in_message`.
     """
     cs2grid = cs2grid or {}
     by_call_snrs: dict[str, list[float]] = defaultdict(list)
     by_call_periods: dict[str, set] = defaultdict(set)
     by_call_count: Counter = Counter()
     for d in decodes:
+        sender = sender_in_message(d['message'])
+        if sender is None:
+            continue
         snr = d.get('snr')
-        for cs in _calls_in_message(d['message']):
-            if snr is not None:
-                by_call_snrs[cs].append(snr)
-            by_call_periods[cs].add(d['ts'])
-            by_call_count[cs] += 1
+        if snr is not None:
+            by_call_snrs[sender].append(snr)
+        by_call_periods[sender].add(d['ts'])
+        by_call_count[sender] += 1
 
     alltime_periods: dict[str, set] = defaultdict(set)
     for d in all_time_decodes:
-        for cs in _calls_in_message(d['message']):
-            alltime_periods[cs].add(d['ts'])
+        sender = sender_in_message(d['message'])
+        if sender is not None:
+            alltime_periods[sender].add(d['ts'])
 
     rows = []
     for cs, n in by_call_count.items():
