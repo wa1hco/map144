@@ -1805,7 +1805,16 @@ class CompareGUI(QtWidgets.QMainWindow):
             self._launch_analyze_msk144(chosen.data())
 
     def _launch_analyze_msk144(self, wav_path: str) -> None:
-        """Spawn analyze_msk144.py in a subprocess so the GUI doesn't block."""
+        """Spawn analyze_msk144.py in a subprocess so the GUI doesn't block.
+
+        ``start_new_session=True`` puts the child in its own process group
+        and session, so Ctrl-C in the *compare_decoders* terminal does
+        NOT propagate to running analyze windows.  Without this flag, a
+        single Ctrl-C signals every analyze child plus the parent at
+        once; matplotlib's event loops then take a long time to unwind
+        and the parent terminal appears to hang while the user closes
+        the orphaned windows.
+        """
         import subprocess
         if not self._ANALYZE_MSK144.is_file():
             QtWidgets.QMessageBox.warning(
@@ -1814,7 +1823,10 @@ class CompareGUI(QtWidgets.QMainWindow):
             )
             return
         try:
-            subprocess.Popen([sys.executable, str(self._ANALYZE_MSK144), wav_path])
+            subprocess.Popen(
+                [sys.executable, str(self._ANALYZE_MSK144), wav_path],
+                start_new_session=True,
+            )
         except OSError as exc:
             QtWidgets.QMessageBox.warning(
                 self, "Launch failed",
@@ -1914,10 +1926,16 @@ def main():
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
 
     # Ctrl-C from the terminal: Qt's event loop ignores Python signals while it
-    # is running C++ code, so we restore the default SIGINT handler (which raises
-    # KeyboardInterrupt → exit) and tick a no-op QTimer every 200 ms to give
-    # control back to the Python interpreter often enough for the signal to fire.
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    # is running C++ code, so we tick a no-op QTimer every 200 ms to give
+    # control back to the Python interpreter often enough for the signal to
+    # fire.  The handler explicitly calls ``app.quit()`` rather than relying
+    # on KeyboardInterrupt unwinding through PyQt's slot machinery (which
+    # in some configurations swallows the exception, leaving app.exec_()
+    # running indefinitely).
+    def _sigint_handler(_sig, _frame):
+        print("\nCtrl-C — exiting", flush=True)
+        app.quit()
+    signal.signal(signal.SIGINT, _sigint_handler)
     _sigint_timer = QtCore.QTimer()
     _sigint_timer.start(200)
     _sigint_timer.timeout.connect(lambda: None)

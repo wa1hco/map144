@@ -112,6 +112,7 @@ import io
 import pstats
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import tkinter as tk
@@ -1550,7 +1551,16 @@ def main() -> None:
         else:
             plot_analysis(**call_kwargs)
     except KeyboardInterrupt:
-        print("\nExiting on user interrupt (Ctrl+C). Goodbye!")
+        print("\nExiting on user interrupt (Ctrl+C). Goodbye!", flush=True)
+        # Without these two calls, matplotlib's interactive backend keeps
+        # its Qt event loop and any open figures alive — the terminal
+        # waiting on this process never returns, even though main() did.
+        try:
+            import matplotlib.pyplot as plt
+            plt.close('all')
+        except Exception:
+            pass
+        sys.exit(0)
 
 
 if __name__ == '__main__':
