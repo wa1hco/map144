@@ -318,6 +318,42 @@ def sender_in_message(msg: str) -> str | None:
     return calls[0]
 
 
+def _format_decode_for_menu(msg: str, sender: str) -> tuple[str, str]:
+    """Split a decoded message into (addressee, tail) for context-menu
+    display where the sender is implicit.
+
+    Examples (sender = ``WA2FZW``)::
+
+        "CQ WA2FZW FN20"          → ("CQ",     "FN20")
+        "N4WLO WA2FZW FN20"       → ("N4WLO",  "FN20")
+        "N4WLO WA2FZW R+13"       → ("N4WLO",  "R+13")
+        "K1ABC WA2FZW RR73"       → ("K1ABC",  "RR73")
+        "K1ABC WA2FZW 73"         → ("K1ABC",  "73")
+
+    Falls back to ``("?", msg)`` if the message doesn't fit any
+    expected form.
+    """
+    tokens = msg.split()
+    if not tokens:
+        return ("?", msg)
+    # Locate the sender token; everything before is the addressee form,
+    # everything after is the tail.
+    try:
+        idx = tokens.index(sender)
+    except ValueError:
+        return ("?", msg)
+    pre = tokens[:idx]
+    tail = " ".join(tokens[idx + 1:])
+    if not pre:
+        # Sender was the very first token — degenerate; show the raw msg.
+        return ("(none)", tail or msg)
+    if pre[0] in _CQ_PREFIXES:
+        # CQ / CQ DX / CQ <region>: addressee is the literal CQ string.
+        return (" ".join(pre), tail)
+    # Standard QSO form: the addressee is the first callsign-shaped token.
+    return (pre[0], tail)
+
+
 def _local_callsigns(all_decodes: list[dict], min_periods: int = 5) -> dict[str, int]:
     """Return callsigns appearing in >= min_periods distinct 15-second periods.
 
@@ -1707,9 +1743,14 @@ class CompareGUI(QtWidgets.QMainWindow):
         """Show "Analyze captures…" submenu for the right-clicked sender.
 
         Each entry is one capture WAV where this callsign was the
-        transmitting station (per ``sender_in_message``).  Clicking an
-        entry launches :file:`analyze_msk144.py` on that WAV in a
+        *transmitting* station (per ``sender_in_message``).  Clicking
+        an entry launches :file:`analyze_msk144.py` on that WAV in a
         separate process so the GUI stays responsive.
+
+        Label format ``<UTC ts>  <SNR>  → <addressee>  <tail>`` makes
+        the sender→addressee relationship explicit — the SENDER is
+        always the row's callsign; the addressee (and any
+        report/grid/sign-off tail) is what differs between captures.
         """
         item = self._callsign_table.itemAt(pos)
         if item is None:
@@ -1724,20 +1765,34 @@ class CompareGUI(QtWidgets.QMainWindow):
             callsign, self._all_decodes_for_lookup, self._CAPTURES_DIR,
         )
         menu = QtWidgets.QMenu(self)
-        title = menu.addAction(f"{callsign} — captures (sender)")
+        title = menu.addAction(
+            f"{callsign} — captures where {callsign} is the SENDER")
         title.setEnabled(False)
         menu.addSeparator()
         if not wavs:
-            none_action = menu.addAction("(no capture WAVs found)")
+            # Distinguish "never transmitted in this window" from
+            # "transmitted but no MAP144 capture available" — they're
+            # very different operationally.
+            n_sender_decodes = sum(
+                1 for d in self._all_decodes_for_lookup
+                if sender_in_message(d['message']) == callsign
+            )
+            if n_sender_decodes == 0:
+                msg = (f"(only ever addressed in this window — "
+                       f"{callsign} never transmitted)")
+            else:
+                msg = (f"({n_sender_decodes} sender decode(s) in WSJT-X log, "
+                       f"but no MAP144 capture WAV)")
+            none_action = menu.addAction(msg)
             none_action.setEnabled(False)
         else:
-            # Cap the menu — anything more than ~30 entries is unwieldy
-            # and the table-row sender is the same across all of them.
+            # Cap the menu — anything more than ~30 entries is unwieldy.
             for d, wav in wavs[:30]:
                 ts = d['ts'].strftime('%Y-%m-%d %H:%M:%S')
                 snr = d.get('snr')
-                snr_str = f"{snr:+d} dB" if snr is not None else "—"
-                label = f"{ts}   {snr_str}   {d['message']}"
+                snr_str = f"{snr:+d} dB" if snr is not None else "    —"
+                addressee, tail = _format_decode_for_menu(d['message'], callsign)
+                label = f"{ts}  {snr_str}  → {addressee:<10}  {tail}"
                 act = menu.addAction(label)
                 act.setData(str(wav))
             if len(wavs) > 30:
