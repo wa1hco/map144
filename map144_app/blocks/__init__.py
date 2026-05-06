@@ -36,6 +36,7 @@ from __future__ import annotations
 
 from .block import Block
 from .channelizer_block import ChannelizerBlock, ChannelizerBlockConfig
+from .detector_block import DetectorBlock, DetectorBlockConfig
 from .flex_source import FLEX_DAXIQ_FULL_SCALE, FlexSource, FlexSourceConfig
 from .graph import Runtime
 from .jsonl_sink import JsonlSink, JsonlSinkConfig
@@ -56,6 +57,8 @@ __all__ = [
     "ChannelizerBlock",
     "ChannelizerBlockConfig",
     "CoherentPair",
+    "DetectorBlock",
+    "DetectorBlockConfig",
     "Event",
     "FLEX_DAXIQ_FULL_SCALE",
     "FlexSource",
