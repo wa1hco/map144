@@ -117,6 +117,12 @@ def parse_map144(path: Path):
                 'af_hz':    0,
                 'message':  d.get('message', '').strip(),
                 'source':   'map144',
+                # Raw fields preserved for capture-WAV lookup — the
+                # ``ts`` above is period-floored (15-s boundary), but the
+                # capture filename uses the actual second-precision wall
+                # clock, so we need the raw string here.
+                'raw_timestamp': d.get('timestamp', ''),
+                'raw_radio_khz': int(d.get('radio_khz', 0)),
             })
     return results
 
@@ -658,6 +664,72 @@ def build_callsign_rows(
         row['range_km'] = range_km_for_grid(grid, my_lat, my_lon)
         rows.append(row)
     return rows
+
+
+# ── Capture-WAV lookup (per-decode audio inspection) ─────────────────────────
+
+
+def decode_to_capture_path(d: dict, captures_dir: Path) -> Path | None:
+    """Map a decode entry to its capture WAV file, if one exists.
+
+    The capture filename convention is::
+
+        YYYYMMDD_HHMMSSZ_<radio_khz>kHz_<message_with_underscores>.wav
+
+    where the time component is the second-precision UTC timestamp
+    (fractional second dropped) and the message tokens are joined by
+    underscores (with ``+`` and ``-`` also collapsed to underscores).
+    We glob on the timestamp + frequency prefix because the message
+    suffix is lossy after the +/- substitutions and we don't need it
+    to find the file.
+
+    Reads ``raw_timestamp`` / ``raw_radio_khz`` if present (set by
+    :func:`parse_map144`); falls back to ``ts`` (which is
+    period-floored — works only if the capture happened exactly at the
+    period boundary, which it doesn't, so the fallback is best-effort).
+    """
+    ts_str = d.get('raw_timestamp') or ''
+    radio_khz = d.get('raw_radio_khz')
+    if not ts_str or radio_khz is None:
+        # Fallback: derive from parsed ``ts`` and ``freq_mhz``.  This is
+        # period-floored and will only match if the capture happened
+        # right on the period boundary; usually we want the raw fields.
+        ts = d.get('ts')
+        if ts is None:
+            return None
+        ts_str = ts.strftime('%Y-%m-%d_%H:%M:%S')
+        if radio_khz is None and 'freq_mhz' in d:
+            radio_khz = int(round(d['freq_mhz'] * 1000))
+    try:
+        date_part, time_part = ts_str.split('_', 1)
+        time_part = time_part.split('.')[0]
+        h, m, s = time_part.split(':')
+        ts_compact = f"{date_part.replace('-', '')}_{h}{m}{s}Z"
+    except ValueError:
+        return None
+    pattern = f"{ts_compact}_{radio_khz}kHz_*.wav"
+    matches = list(captures_dir.glob(pattern))
+    return matches[0] if matches else None
+
+
+def wavs_for_sender(
+    sender: str,
+    decodes: list[dict],
+    captures_dir: Path,
+) -> list[tuple[dict, Path]]:
+    """Return ``[(decode, wav_path), ...]`` for every decode where
+    ``sender`` is the transmitting station and the corresponding WAV
+    capture file exists.  Sorted newest-first.
+    """
+    out: list[tuple[dict, Path]] = []
+    for d in decodes:
+        if sender_in_message(d['message']) != sender:
+            continue
+        wav = decode_to_capture_path(d, captures_dir)
+        if wav is not None and wav.is_file():
+            out.append((d, wav))
+    out.sort(key=lambda x: x[0]['ts'], reverse=True)
+    return out
 
 
 # ── Figure builders ───────────────────────────────────────────────────────────
@@ -1323,6 +1395,13 @@ class CompareGUI(QtWidgets.QMainWindow):
             QtWidgets.QAbstractItemView.SelectRows)
         self._callsign_table.setAlternatingRowColors(True)
         self._callsign_table.setSortingEnabled(True)
+        # Right-click → submenu of capture WAVs for the selected sender,
+        # each of which launches analyze_msk144.py as a subprocess.
+        self._callsign_table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self._callsign_table.customContextMenuRequested.connect(
+            self._on_callsign_context_menu)
+        # Cache populated each Run; empty until then.
+        self._all_decodes_for_lookup: list[dict] = []
         left_pane = QtWidgets.QWidget()
         lv = QtWidgets.QVBoxLayout(left_pane)
         lv.setContentsMargins(4, 4, 4, 4)
@@ -1479,6 +1558,9 @@ class CompareGUI(QtWidgets.QMainWindow):
             cs2grid=cs2grid, my_lat=my_lat, my_lon=my_lon,
         )
         self._populate_callsign_table(rows, my_grid)
+        # Cache the merged decode list so the right-click "Analyze captures…"
+        # menu can look up WAV paths without re-parsing the logs.
+        self._all_decodes_for_lookup = map144_all + wsjtx_all
 
         # ── Build figures ─────────────────────────────────────────────────────
         date_label = self._date_label()
@@ -1614,6 +1696,78 @@ class CompareGUI(QtWidgets.QMainWindow):
                 summary_parts.append(f"{c}={n}")
         self._callsign_summary.setText(
             f"{len(rows)} callsigns @ {my_grid} — " + ", ".join(summary_parts)
+        )
+
+    # ── Right-click integration with analyze_msk144.py ───────────────────────
+
+    _CAPTURES_DIR = Path(__file__).parent / "MSK144" / "detections"
+    _ANALYZE_MSK144 = Path(__file__).parent / "analyze_msk144.py"
+
+    def _on_callsign_context_menu(self, pos):
+        """Show "Analyze captures…" submenu for the right-clicked sender.
+
+        Each entry is one capture WAV where this callsign was the
+        transmitting station (per ``sender_in_message``).  Clicking an
+        entry launches :file:`analyze_msk144.py` on that WAV in a
+        separate process so the GUI stays responsive.
+        """
+        item = self._callsign_table.itemAt(pos)
+        if item is None:
+            return
+        row = item.row()
+        cs_item = self._callsign_table.item(row, 0)
+        if cs_item is None:
+            return
+        callsign = cs_item.text()
+
+        wavs = wavs_for_sender(
+            callsign, self._all_decodes_for_lookup, self._CAPTURES_DIR,
+        )
+        menu = QtWidgets.QMenu(self)
+        title = menu.addAction(f"{callsign} — captures (sender)")
+        title.setEnabled(False)
+        menu.addSeparator()
+        if not wavs:
+            none_action = menu.addAction("(no capture WAVs found)")
+            none_action.setEnabled(False)
+        else:
+            # Cap the menu — anything more than ~30 entries is unwieldy
+            # and the table-row sender is the same across all of them.
+            for d, wav in wavs[:30]:
+                ts = d['ts'].strftime('%Y-%m-%d %H:%M:%S')
+                snr = d.get('snr')
+                snr_str = f"{snr:+d} dB" if snr is not None else "—"
+                label = f"{ts}   {snr_str}   {d['message']}"
+                act = menu.addAction(label)
+                act.setData(str(wav))
+            if len(wavs) > 30:
+                more = menu.addAction(f"… and {len(wavs) - 30} more (use the "
+                                       "filter or a tighter window)")
+                more.setEnabled(False)
+
+        chosen = menu.exec_(self._callsign_table.viewport().mapToGlobal(pos))
+        if chosen is not None and chosen.data():
+            self._launch_analyze_msk144(chosen.data())
+
+    def _launch_analyze_msk144(self, wav_path: str) -> None:
+        """Spawn analyze_msk144.py in a subprocess so the GUI doesn't block."""
+        import subprocess
+        if not self._ANALYZE_MSK144.is_file():
+            QtWidgets.QMessageBox.warning(
+                self, "Tool missing",
+                f"analyze_msk144.py not found at {self._ANALYZE_MSK144}",
+            )
+            return
+        try:
+            subprocess.Popen([sys.executable, str(self._ANALYZE_MSK144), wav_path])
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Launch failed",
+                f"Could not launch analyze_msk144.py:\n{exc}",
+            )
+            return
+        self.statusBar().showMessage(
+            f"Launched analyze_msk144.py {Path(wav_path).name}", 5000,
         )
 
     def _save_all(self):
