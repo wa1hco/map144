@@ -115,6 +115,15 @@ class DisplayBlockConfig(BlockConfig):
     #: the port is *not* connected, no waterfall work is done and the
     #: snapshot's ``spectrogram_data`` array stays at the sentinel.
     iq_port_name: str = "iq"
+    #: Optional decode-event input port (#10c).  When connected, the
+    #: block accumulates a rolling list of recent DecodeEvents (decoded
+    #: outcomes only; no_decode / timeout / error are skipped) and
+    #: exposes them via ``state_snapshot().decode_panel_entries``.
+    decode_port_name: str = "decodes"
+    #: Maximum decode-panel entries retained.  Older entries are
+    #: dropped when the buffer fills.  Default 100 matches typical
+    #: legacy GUI scrolling depth.
+    decode_panel_max: int = 100
 
     # Heatmap geometry.
     n_channels: int = N_CHANNELS
@@ -165,6 +174,20 @@ class DisplayState:
     spec_filled:      bool        # True once at least one period has
                                   # been completed (spectrogram_data
                                   # holds real data, not the sentinel)
+
+    # Decode panel (#10c).  Rolling list of recent decoded events,
+    # newest LAST (append-order).  Each entry is a frozen dict with:
+    #   wall_clock     (float, UTC seconds)
+    #   message        (str)
+    #   jt9_snr        (int | None)
+    #   radio_khz      (float)
+    #   t_sec          (float — within-period offset)
+    #   channel_index  (int)
+    #   fc_hz          (float)
+    #   marker_id      (int | None — for legacy GUI overlay correlation)
+    # GUI consumer computes age from (now - wall_clock) for colour
+    # coding; bounded by ``decode_panel_max`` config field.
+    decode_panel_entries: tuple[dict[str, Any], ...]
 
 
 class DisplayBlock(Block):
@@ -233,6 +256,10 @@ class DisplayBlock(Block):
         self._fft_window: np.ndarray = None  # type: ignore[assignment]
         self._fft_window_gain: float = 1.0
 
+        # Decode panel state (#10c).  Rolling list of recent decoded
+        # events — newest LAST.  Bounded by config.decode_panel_max.
+        self._decode_panel_entries: list[dict[str, Any]] = []
+
         # Snapshot lock — held only briefly while copying arrays.
         self._snap_lock = threading.Lock()
 
@@ -244,6 +271,9 @@ class DisplayBlock(Block):
         self._n_iq_samples: int = 0
         self._n_spec_blocks_written: int = 0
         self._n_spec_period_snapshots: int = 0
+        self._n_decode_events_in: int = 0     # all kinds, including non-decoded
+        self._n_decode_panel_appended: int = 0
+        self._n_decode_panel_dropped:  int = 0  # buffer-full evictions
 
     # --- Lifecycle ----------------------------------------------------
 
@@ -300,6 +330,9 @@ class DisplayBlock(Block):
         )
         self._sbuf_end = 0
         self._sbuf_t0 = None
+
+        # Decode panel reset.
+        self._decode_panel_entries = []
 
         # FFT window — Hanning, matched to legacy.  window_gain is
         # the coherent gain (sum of window samples / N) used to
@@ -395,6 +428,12 @@ class DisplayBlock(Block):
         iq_stream = self.inputs.get(iq_port)
         if iq_stream is not None:
             self._drain_iq_records(iq_stream)
+
+        # 7. Drain decode-event stream (#10c).  Non-blocking; bounded.
+        decode_port = cfg.decode_port_name
+        decode_stream = self.inputs.get(decode_port)
+        if decode_stream is not None:
+            self._drain_decode_events(decode_stream)
 
     # --- Helpers ------------------------------------------------------
 
@@ -589,6 +628,50 @@ class DisplayBlock(Block):
             self._sbuf_end = tail
             self._sbuf_t0 = self._sbuf_t0 + hop / float(sr)
 
+    # --- Decode panel (#10c) -----------------------------------------
+
+    def _drain_decode_events(self, decode_stream: Any) -> None:
+        """Pull queued DecodeEvents and append to the rolling panel list.
+
+        Filters: only ``payload['outcome'] == 'decoded'`` events appear
+        on the panel.  no_decode / timeout / error events still tick
+        ``_n_decode_events_in`` so the operator can see throughput in
+        ``stats()``.
+
+        Eviction: when ``len(_decode_panel_entries) >= decode_panel_max``,
+        drop the oldest (head) before appending the new (tail).  This
+        is a simple bounded ring with newest-LAST order.
+        """
+        cfg: DisplayBlockConfig = self.config  # type: ignore[assignment]
+        budget = 16
+        for _ in range(budget):
+            try:
+                evt = decode_stream.get(timeout=0.0)
+            except (TimeoutError, StreamClosed):
+                return
+            if not isinstance(evt, Event) or evt.kind != "decode":
+                continue
+            self._n_decode_events_in += 1
+            payload = evt.payload or {}
+            if payload.get("outcome") != "decoded":
+                continue
+            entry = {
+                "wall_clock":     evt.wall_clock_at_production,
+                "message":        payload.get("message", ""),
+                "jt9_snr":        payload.get("jt9_snr"),
+                "radio_khz":      payload.get("radio_khz", 0.0),
+                "t_sec":          payload.get("t_sec", 0.0),
+                "channel_index":  payload.get("channel_index"),
+                "fc_hz":          payload.get("fc_hz"),
+                "marker_id":      payload.get("marker_id"),
+            }
+            with self._snap_lock:
+                if len(self._decode_panel_entries) >= cfg.decode_panel_max:
+                    self._decode_panel_entries.pop(0)
+                    self._n_decode_panel_dropped += 1
+                self._decode_panel_entries.append(entry)
+                self._n_decode_panel_appended += 1
+
     # --- Public read-only API ----------------------------------------
 
     def state_snapshot(self) -> DisplayState:
@@ -610,6 +693,9 @@ class DisplayBlock(Block):
                 spec_staging=self._spec_staging.copy(),
                 spec_period_index=self._spec_period_index,
                 spec_filled=self._spec_filled,
+                decode_panel_entries=tuple(
+                    dict(e) for e in self._decode_panel_entries
+                ),
             )
 
     def stats(self) -> dict[str, Any]:
@@ -622,6 +708,10 @@ class DisplayBlock(Block):
             "iq_samples":         self._n_iq_samples,
             "spec_blocks_written":  self._n_spec_blocks_written,
             "spec_period_snapshots": self._n_spec_period_snapshots,
+            "decode_events_in":     self._n_decode_events_in,
+            "decode_panel_appended": self._n_decode_panel_appended,
+            "decode_panel_dropped":  self._n_decode_panel_dropped,
+            "decode_panel_size":    len(self._decode_panel_entries),
             "current_period_index": self._ch_snr_period_index,
             "current_hop_count":  self._ch_snr_hop_count,
             "spec_filled":        self._spec_filled,

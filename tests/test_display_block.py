@@ -538,6 +538,155 @@ class TestWaterfallPeriodSnapshot(unittest.TestCase):
                          "exactly one period snapshot expected")
 
 
+# --- Decode panel (#10c) --------------------------------------------
+
+
+def _decode_event(outcome: str = "decoded",
+                  message: str = "WA1HCO FN42",
+                  jt9_snr: int = 12,
+                  radio_khz: float = 50260.5,
+                  t_sec: float = 7.5,
+                  channel_index: int = 5,
+                  fc_hz: float = 1500.0,
+                  marker_id: int = 42,
+                  wall_clock: float = 1700000000.0) -> Event:
+    return Event(
+        kind="decode",
+        occurred_at_sample=12345,
+        sample_rate_hz=48_000,
+        wall_clock_at_production=wall_clock,
+        payload={
+            "outcome":      outcome,
+            "message":      message,
+            "jt9_snr":      jt9_snr,
+            "radio_khz":    radio_khz,
+            "t_sec":        t_sec,
+            "channel_index": channel_index,
+            "fc_hz":        fc_hz,
+            "marker_id":    marker_id,
+        },
+    )
+
+
+class _PanelHarness:
+    """Harness for #10c decode-panel tests."""
+
+    def __init__(self, panel_max: int = 100):
+        self.rt = Runtime()
+        self.disp = self.rt.add(DisplayBlock("disp"), DisplayBlockConfig(
+            n_channels=N_CHANNELS,
+            history_rows=HISTORY_ROWS,
+            history_period_s=PERIOD_S,
+            decode_panel_max=panel_max,
+            get_timeout_s=0.05,
+        ))
+        self.metrics = make_sample_stream(
+            "metrics", queue_depth_seconds=4.0,
+            sample_rate_hz=SR, n_samples_per_record=STRIDE,
+        )
+        self.detections = make_event_stream("detections", capacity=64)
+        self.decodes    = make_event_stream("decodes", capacity=64)
+        self.disp.inputs["metrics"]    = self.metrics
+        self.disp.inputs["detections"] = self.detections
+        self.disp.inputs["decodes"]    = self.decodes
+
+    def push_metric(self, rec: ChannelMetricRecord) -> None:
+        self.metrics.put(rec)
+
+    def push_decode(self, evt: Event) -> None:
+        self.decodes.put(evt)
+
+    def settle(self, seconds: float = 0.20) -> None:
+        time.sleep(seconds)
+
+
+class TestDecodePanel(unittest.TestCase):
+
+    def test_decoded_event_appended_to_panel(self):
+        h = _PanelHarness()
+        h.rt.start()
+        try:
+            h.push_decode(_decode_event(message="WA1HCO FN42",
+                                        jt9_snr=8,
+                                        radio_khz=50260.5))
+            h.push_metric(_metric_record(start_sample=0, wall_clock=0.5))
+            h.settle()
+            snap = h.disp.state_snapshot()
+        finally:
+            h.rt.stop(timeout_s=1.0)
+
+        self.assertEqual(len(snap.decode_panel_entries), 1)
+        e = snap.decode_panel_entries[0]
+        self.assertEqual(e["message"], "WA1HCO FN42")
+        self.assertEqual(e["jt9_snr"], 8)
+        self.assertAlmostEqual(e["radio_khz"], 50260.5)
+        self.assertEqual(e["marker_id"], 42)
+
+    def test_non_decoded_outcomes_skipped_from_panel(self):
+        h = _PanelHarness()
+        h.rt.start()
+        try:
+            h.push_decode(_decode_event(outcome="no_decode"))
+            h.push_decode(_decode_event(outcome="timeout"))
+            h.push_decode(_decode_event(outcome="error"))
+            h.push_decode(_decode_event(outcome="decoded",
+                                        message="REAL DECODE"))
+            h.push_metric(_metric_record(start_sample=0, wall_clock=0.5))
+            h.settle()
+            snap = h.disp.state_snapshot()
+            stats = h.disp.stats()
+        finally:
+            h.rt.stop(timeout_s=1.0)
+        self.assertEqual(len(snap.decode_panel_entries), 1)
+        self.assertEqual(snap.decode_panel_entries[0]["message"],
+                         "REAL DECODE")
+        # All 4 events count as 'in', but only 1 was appended.
+        self.assertEqual(stats["decode_events_in"], 4)
+        self.assertEqual(stats["decode_panel_appended"], 1)
+
+    def test_panel_eviction_when_full(self):
+        h = _PanelHarness(panel_max=3)
+        h.rt.start()
+        try:
+            for k in range(5):
+                h.push_decode(_decode_event(message=f"CALL{k} FN42"))
+                h.push_metric(_metric_record(
+                    start_sample=k * STRIDE, wall_clock=0.5 + k * 0.01,
+                ))
+            h.settle(seconds=0.30)
+            snap = h.disp.state_snapshot()
+            stats = h.disp.stats()
+        finally:
+            h.rt.stop(timeout_s=1.0)
+        # Only 3 retained, oldest 2 dropped.
+        self.assertEqual(len(snap.decode_panel_entries), 3)
+        # Newest LAST: latest call should be CALL4.
+        msgs = [e["message"] for e in snap.decode_panel_entries]
+        self.assertEqual(msgs, ["CALL2 FN42", "CALL3 FN42", "CALL4 FN42"])
+        self.assertEqual(stats["decode_panel_dropped"], 2)
+
+    def test_snapshot_panel_entries_are_immutable(self):
+        h = _PanelHarness()
+        h.rt.start()
+        try:
+            h.push_decode(_decode_event(message="A1BC FN42"))
+            h.push_metric(_metric_record(start_sample=0, wall_clock=0.5))
+            h.settle()
+            snap = h.disp.state_snapshot()
+            # Mutating snapshot dict should not affect the block's state.
+            snap_entries = snap.decode_panel_entries
+            self.assertIsInstance(snap_entries, tuple)
+            # Mutate a copy of the dict to confirm copies are safe.
+            mutated = dict(snap_entries[0])
+            mutated["message"] = "MUTATED"
+            # Re-snapshot — original unchanged.
+            snap2 = h.disp.state_snapshot()
+        finally:
+            h.rt.stop(timeout_s=1.0)
+        self.assertEqual(snap2.decode_panel_entries[0]["message"],
+                         "A1BC FN42")
+
+
 # --- End-to-end: Detector → Display ---------------------------------
 
 
