@@ -30,6 +30,7 @@ from .ui import (
     on_nb_factor_changed,
     on_nb_factor_v_changed,
     on_nb_backend_changed,
+    _on_show_raw_power_toggled,
     on_td_scale_changed,
     on_td_span_changed,
     on_select_source_radio,
@@ -68,6 +69,7 @@ class MAP144Visualizer(Engine, QtWidgets.QMainWindow):
     on_nb_factor_changed = on_nb_factor_changed
     on_nb_factor_v_changed = on_nb_factor_v_changed
     on_nb_backend_changed = on_nb_backend_changed
+    _on_show_raw_power_toggled = _on_show_raw_power_toggled
     on_td_scale_changed = on_td_scale_changed
     on_td_span_changed  = on_td_span_changed
     on_select_source_radio = on_select_source_radio

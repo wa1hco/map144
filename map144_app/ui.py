@@ -211,6 +211,26 @@ def setup_ui(self):
         act.setChecked(True)
         view_menu.addAction(act)
 
+    # ── Diagnostics menu ──────────────────────────────────────────────────────
+    # Diagnostic toggles that affect *display only* (detection logic remains
+    # unchanged).  Not persisted across runs — accidentally leaving a
+    # diagnostic mode on between sessions would confuse the live operator.
+    diagnostics_menu = menu_bar.addMenu("&Diagnostics")
+    self.show_raw_power_action = QtWidgets.QAction(
+        "Show raw power (bypass pct25 normalisation)", self)
+    self.show_raw_power_action.setCheckable(True)
+    self.show_raw_power_action.setChecked(False)
+    self.show_raw_power_action.setToolTip(
+        "Detection heatmap shows raw squared-FFT power (dB) instead of "
+        "dB-above-pct25.  Reveals persistent spurs and asymmetric noise-"
+        "floor rolloffs that the rolling baseline normally absorbs.\n\n"
+        "Detection-trigger logic is unaffected; only the heatmap display "
+        "changes.  Adjust the detection colour-scale slider when toggling "
+        "— raw dB has a different dynamic range from pair-metric dB."
+    )
+    self.show_raw_power_action.toggled.connect(self._on_show_raw_power_toggled)
+    diagnostics_menu.addAction(self.show_raw_power_action)
+
     # ── Band selector toolbar ─────────────────────────────────────────────────
     from .visualizer import _SETTINGS as _VS
     band_toolbar = self.addToolBar("Band")
@@ -808,6 +828,29 @@ def on_nb_factor_v_changed(self, value):
     from .processing  import reset_detection_baseline
     _SETTINGS.setValue('nb_factor_v', self.nb_factor_v)
     reset_detection_baseline(self)
+
+
+def _on_show_raw_power_toggled(self, checked):
+    """Diagnostic: toggle the detection heatmap between pair_metric (dB
+    above pct25) and raw squared-FFT power (dB).  Detection-trigger logic
+    is unaffected; only the displayed values change.
+
+    See processing.process_iq_data — the heatmap-write site checks
+    ``self._show_raw_power`` and writes the appropriate values to
+    ``_ch_snr_history_h/v``.
+
+    Not persisted across sessions: a diagnostic mode left enabled between
+    runs would mislead the live operator into thinking the colour scale
+    is broken.
+    """
+    self._show_raw_power = bool(checked)
+    # Clear the history buffers so the freshly-toggled mode starts clean
+    # at the current write position — without this, half the heatmap
+    # would show old-mode values until the ring fills.
+    if hasattr(self, '_ch_snr_history_h'):
+        self._ch_snr_history_h[:] = -999.0
+    if hasattr(self, '_ch_snr_history_v'):
+        self._ch_snr_history_v[:] = -999.0
 
 
 def on_nb_backend_changed(self, name):

@@ -672,8 +672,26 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
 
         # Hop-counter row index — guaranteed contiguous across hops.
         self._ch_snr_write_idx = self._ch_snr_hop_count % N_SNR_HIST
-        self._ch_snr_history_h[self._ch_snr_write_idx, :] = pair_metric_h
-        self._ch_snr_history_v[self._ch_snr_write_idx, :] = pair_metric_v
+        # ── Diagnostic toggle: raw power vs pct25-normalised metric ────────
+        # Default heatmap shows pair_metric (dB above the rolling 25th-pct
+        # baseline), which absorbs steady spurs and asymmetric noise-floor
+        # rolloffs.  When ``_show_raw_power`` is set (UI checkbox), substitute
+        # the raw squared-FFT power in dB so persistent / asymmetric features
+        # become visible.  Detection logic continues to use pair_metric — only
+        # the display changes.  No pct25 logic is bypassed.
+        # Note: dynamic range of raw dB (~−110…−40) differs from pair_metric
+        # (~−5…+30); user should adjust the colour-scale slider on toggle.
+        if getattr(self, '_show_raw_power', False):
+            raw_db_h = (10.0 * np.log10(np.maximum(raw_lin, 1e-30))).astype(np.float32)
+            if ch_block_v is not None:
+                raw_db_v = (10.0 * np.log10(np.maximum(raw_lin_v, 1e-30))).astype(np.float32)
+            else:
+                raw_db_v = raw_db_h
+            self._ch_snr_history_h[self._ch_snr_write_idx, :] = raw_db_h
+            self._ch_snr_history_v[self._ch_snr_write_idx, :] = raw_db_v
+        else:
+            self._ch_snr_history_h[self._ch_snr_write_idx, :] = pair_metric_h
+            self._ch_snr_history_v[self._ch_snr_write_idx, :] = pair_metric_v
         if sync_metric_h is not None:
             self._sync_snr_history_h[self._ch_snr_write_idx, :] = sync_metric_h
         if sync_metric_v is not None:
