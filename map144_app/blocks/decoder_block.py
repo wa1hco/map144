@@ -103,10 +103,21 @@ class DecoderBlockConfig(BlockConfig):
 
     # IQ ring sizing.
     sample_rate_hz: int   = 48_000
-    ring_seconds:   float = 5.0          # holds ~5 s of recent IQ
-                                          # (max read window is 1.7 s for
-                                          # SPD; 5 s gives 3 s of slack
-                                          # for late detection events)
+    ring_seconds:   float = 15.0         # holds ~15 s of recent IQ — one
+                                          # full WSJT MSK144 period.  Burst
+                                          # mode (Stage 2) only reads ±1.7 s
+                                          # around each detection event, so
+                                          # the extra ~13 s is overhead for
+                                          # current behaviour.  The full-
+                                          # period reach is required by
+                                          # period-mode decoding (TODO #42)
+                                          # which integrates the entire
+                                          # 15-s WSJT period to recover
+                                          # weak-signal-mode reception
+                                          # (forward scatter / tropo /
+                                          # airplane / sporadic-E).  Memory
+                                          # cost ~5.8 MB per polarisation,
+                                          # negligible.
 
     # Decode-worker pool.  Default 4 matches legacy ``_jt9_threads``
     # semaphore width — jt9 subprocess is the bottleneck so this also

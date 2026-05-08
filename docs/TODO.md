@@ -352,6 +352,48 @@ See `project_ml_qso_classifier_plan` memory for the full plan; see
       requires `nb_blanked_pct` per launch (TODO `#27b`
       heartbeat). Run correlation analysis once available.
 
+42. ⬜ **Period-mode decode for weak-signal propagation modes** —
+    user-stated 2026-05-08, see `project_propagation_modes` memory.
+    MSK144 reception involves multiple modes (true MS pings,
+    airplane scatter, forward scatter, tropo, Es) with very
+    different time scales. Only true MS pings have signal
+    localised to a 1.7-s burst window. The other modes have
+    signal **continuously** across the full 15-s WSJT period, often
+    individually below noise — a ping is just a brief 10–20 dB
+    enhancement that crosses the detection threshold. WSJT-X
+    catches these because `jt9 -p 15` integrates over the full
+    period; MAP144's 1.7-s decode window captures only ~10 % of
+    the available signal and misses the decode.
+
+    Hypothesis: most of the ~70 WSJT-X-decoded NO_DECODE events
+    MAP144 misses per day (per the 2026-05-08 compare run) are
+    weak-signal-mode reception. Their per-launch coherence median
+    is 0.379 (within the noise distribution), exactly matching
+    the weak-signal signature.
+
+    Strategy: **detect with ping, decode over period**. The ping
+    triggers a launch and identifies *which channel* and *which
+    period*. Decode-mode fans out to:
+    - **Burst mode** (1.7 s, current): always run, cheap, catches
+      strong MS pings.
+    - **Period mode** (15 s, new): run after burst-mode fails, at
+      end-of-period boundary; integrates the full 15 s to recover
+      below-noise weak-signal-mode messages.
+
+    Period-mode dedup: at most once per `(channel, period)` —
+    multiple pings from one event (tropo opening, fading airplane)
+    don't trigger redundant period-mode attempts. Mirrors `#36`
+    signature-aware claim mechanism.
+
+    CPU budget: period mode is ~10 × burst-mode CPU. Affordable
+    only after `#31`, `#32`, `#41`, and the ML programme have
+    suppressed 80–90 % of hopeless launches. The free CPU is
+    exactly what funds period-mode integration.
+
+    Architectural impact absorbed into `#11` Stage 2:
+    DecoderBlock IQ ring sized for 15 s (was 5 s) so period-mode
+    can read the full window when the time comes.
+
 ---
 
 ## Sequencing — what blocks what
