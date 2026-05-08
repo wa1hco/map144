@@ -832,16 +832,25 @@ def on_nb_factor_v_changed(self, value):
 
 def _on_show_raw_power_toggled(self, checked):
     """Diagnostic: toggle the detection heatmap between pair_metric (dB
-    above pct25) and raw squared-FFT power (dB).  Detection-trigger logic
-    is unaffected; only the displayed values change.
+    above pct25) and raw squared-FFT power.  Detection-trigger logic is
+    unaffected; only the displayed values change.
 
     See processing.process_iq_data — the heatmap-write site checks
     ``self._show_raw_power`` and writes the appropriate values to
-    ``_ch_snr_history_h/v``.
+    ``_ch_snr_history_h/v`` (squared-FFT detection panel) and
+    ``_sync_snr_history_h/v`` (sync-correlator detection panel).
 
-    Not persisted across sessions: a diagnostic mode left enabled between
-    runs would mislead the live operator into thinking the colour scale
-    is broken.
+    Implementation note on display scaling: raw squared-FFT power sits
+    around −90..−50 dBFS, well below the existing colour-scale slider's
+    reach.  Rather than fight the slider range, processing.py applies
+    a constant offset (``_RAW_POWER_DISPLAY_OFFSET_DB``) so the values
+    land back in the same dB-above-baseline window the sliders are
+    already calibrated for.  Differences between channels remain
+    accurate — only the absolute dBFS axis is shifted.
+
+    Not persisted across sessions: a diagnostic mode left enabled
+    between runs would mislead the live operator into thinking the
+    colour scale is broken.
     """
     self._show_raw_power = bool(checked)
     # Clear the history buffers so the freshly-toggled mode starts clean
@@ -851,6 +860,10 @@ def _on_show_raw_power_toggled(self, checked):
         self._ch_snr_history_h[:] = -999.0
     if hasattr(self, '_ch_snr_history_v'):
         self._ch_snr_history_v[:] = -999.0
+    if hasattr(self, '_sync_snr_history_h'):
+        self._sync_snr_history_h[:] = -999.0
+    if hasattr(self, '_sync_snr_history_v'):
+        self._sync_snr_history_v[:] = -999.0
 
 
 def on_nb_backend_changed(self, name):

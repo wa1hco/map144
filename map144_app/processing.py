@@ -109,6 +109,18 @@ ENABLE_SYNC_DETECT = True
 SYNC_DETECT_THRESH_DB = 3.0    # dB above 25th-percentile sync-magnitude baseline
 
 DETECT_THRESH_DB   = 3.0        # dB above 25th-percentile noise baseline
+
+# Diagnostic raw-power display offset.  When the operator enables
+# Diagnostics → "Show raw power", the heatmap shows raw squared-FFT
+# (and sync-correlator) power instead of dB-above-pct25.  Raw power
+# sits around −90..−50 dBFS on this Flex setup, well below the existing
+# colour-scale slider's reach.  Adding this offset shifts the values
+# back into the same display window the sliders are already calibrated
+# for (typical pair_metric range 0..30 dB) without changing the slider
+# ranges (which are fussy enough already).  Channel-to-channel deltas
+# are preserved exactly — only the absolute axis is shifted.
+# Chosen so a typical −80 dBFS noise floor maps to ~+5 dB displayed.
+_RAW_POWER_DISPLAY_OFFSET_DB = 85.0
 DETECT_MERGE_GAP_S = 0.5        # suppress re-trigger on the same channel within this window (s).
                                  # Per-channel cooldown: parallel channels are fully independent,
                                  # so simultaneous pings at different frequencies are unaffected.
@@ -673,18 +685,31 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         # Hop-counter row index — guaranteed contiguous across hops.
         self._ch_snr_write_idx = self._ch_snr_hop_count % N_SNR_HIST
         # ── Diagnostic toggle: raw power vs pct25-normalised metric ────────
-        # Default heatmap shows pair_metric (dB above the rolling 25th-pct
-        # baseline), which absorbs steady spurs and asymmetric noise-floor
-        # rolloffs.  When ``_show_raw_power`` is set (UI checkbox), substitute
-        # the raw squared-FFT power in dB so persistent / asymmetric features
-        # become visible.  Detection logic continues to use pair_metric — only
-        # the display changes.  No pct25 logic is bypassed.
-        # Note: dynamic range of raw dB (~−110…−40) differs from pair_metric
-        # (~−5…+30); user should adjust the colour-scale slider on toggle.
+        # Default heatmap shows pair_metric / sync_metric (dB above the
+        # rolling 25th-pct baseline), which absorbs steady spurs and
+        # asymmetric noise-floor rolloffs.  When ``_show_raw_power`` is set
+        # (UI checkbox in Diagnostics menu), substitute the raw power in dB
+        # so persistent / asymmetric features become visible.  Detection
+        # logic continues to use pair_metric — only the display changes.
+        #
+        # Display scaling: raw squared-FFT power on this Flex setup sits
+        # around −90..−50 dBFS, well below the existing colour-scale
+        # slider's reach.  We add a constant ``_RAW_POWER_DISPLAY_OFFSET_DB``
+        # so the values land back in the same dB-above-baseline window the
+        # sliders are already calibrated for (typical pair_metric range
+        # 0..30).  Channel-to-channel differences remain accurate — only
+        # the absolute axis is shifted.  Choose offset so a typical
+        # noise-floor (~−80 dBFS) maps to ~+5 dB displayed: offset = +85.
         if getattr(self, '_show_raw_power', False):
-            raw_db_h = (10.0 * np.log10(np.maximum(raw_lin, 1e-30))).astype(np.float32)
+            raw_db_h = (
+                10.0 * np.log10(np.maximum(raw_lin, 1e-30))
+                + _RAW_POWER_DISPLAY_OFFSET_DB
+            ).astype(np.float32)
             if ch_block_v is not None:
-                raw_db_v = (10.0 * np.log10(np.maximum(raw_lin_v, 1e-30))).astype(np.float32)
+                raw_db_v = (
+                    10.0 * np.log10(np.maximum(raw_lin_v, 1e-30))
+                    + _RAW_POWER_DISPLAY_OFFSET_DB
+                ).astype(np.float32)
             else:
                 raw_db_v = raw_db_h
             self._ch_snr_history_h[self._ch_snr_write_idx, :] = raw_db_h
@@ -692,10 +717,38 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         else:
             self._ch_snr_history_h[self._ch_snr_write_idx, :] = pair_metric_h
             self._ch_snr_history_v[self._ch_snr_write_idx, :] = pair_metric_v
+        # Sync history — independent panel.  Same toggle logic, separate
+        # pct25 (``_sync_pct25`` / ``_sync_pct25_v``).  We recover raw sync
+        # magnitude in dB by adding 10·log10(sync_pct25) back to
+        # sync_metric (which is already 10·log10(peaks/sync_pct25)).
         if sync_metric_h is not None:
-            self._sync_snr_history_h[self._ch_snr_write_idx, :] = sync_metric_h
+            if getattr(self, '_show_raw_power', False):
+                sp25_h = getattr(self, '_sync_pct25', None)
+                if sp25_h is not None:
+                    raw_sync_db_h = (
+                        sync_metric_h
+                        + 10.0 * np.log10(np.maximum(sp25_h, 1e-30))
+                        + _RAW_POWER_DISPLAY_OFFSET_DB
+                    ).astype(np.float32)
+                    self._sync_snr_history_h[self._ch_snr_write_idx, :] = raw_sync_db_h
+                else:
+                    self._sync_snr_history_h[self._ch_snr_write_idx, :] = sync_metric_h
+            else:
+                self._sync_snr_history_h[self._ch_snr_write_idx, :] = sync_metric_h
         if sync_metric_v is not None:
-            self._sync_snr_history_v[self._ch_snr_write_idx, :] = sync_metric_v
+            if getattr(self, '_show_raw_power', False):
+                sp25_v = getattr(self, '_sync_pct25_v', None)
+                if sp25_v is not None:
+                    raw_sync_db_v = (
+                        sync_metric_v
+                        + 10.0 * np.log10(np.maximum(sp25_v, 1e-30))
+                        + _RAW_POWER_DISPLAY_OFFSET_DB
+                    ).astype(np.float32)
+                    self._sync_snr_history_v[self._ch_snr_write_idx, :] = raw_sync_db_v
+                else:
+                    self._sync_snr_history_v[self._ch_snr_write_idx, :] = sync_metric_v
+            else:
+                self._sync_snr_history_v[self._ch_snr_write_idx, :] = sync_metric_v
         # ── DIAGNOSTIC: heatmap state at selected hops (DEBUG-level) ──────────
         # Enable with logging.getLogger("map144_app.processing").setLevel(DEBUG)
         # — useful when investigating detection-plot rendering vs. metric scale
