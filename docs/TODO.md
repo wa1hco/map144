@@ -93,6 +93,8 @@ landed-uncommitted; ML / clustering / classifier items added as #29–#39).
 > is intentionally left as a gap so existing `#20`+ cross-references
 > stay valid. The real lever lives in `#20` below.
 
+19. deleted
+
 ## ⬜ Sensitivity
 
 20. ⬜ **Sensitivity Step 2** — frame-coherent integration in detection:
@@ -328,6 +330,28 @@ See `project_ml_qso_classifier_plan` memory for the full plan; see
     median has to compensate for FIR-induced bias instead of just
     real-world noise variation.
 
+41. **Burst-context features for ML / runtime gating**
+    - 41a. ✅ `n_chans_300ms` and `n_chans_2s` per-launch features
+      added to launches.jsonl (commit `e4caf43`). Discriminate
+      in-burst, post-burst-rebound, and quiet-baseline launches
+      from per-launch context alone (no transition tracking
+      needed at consumer side). See `project_post_burst_rebound`
+      memory for the 100× post-burst spike that motivated them.
+    - 41b. ⬜ Optional runtime hard gate on these features:
+      "suppress launches with `n_chans_300ms ≥ 8` OR
+      (`n_chans_2s ≥ 8` AND within 1 s of a wideband burst-end
+      transition)." Catches ~225 launches/day on 2026-05-08 data
+      at zero decode cost. Hold for ML soft-mode rollout (`#37`)
+      so the classifier learns the rule before we hard-code it.
+    - 41c. ⬜ Principled DSP fix: exclude blanked samples from
+      the pct25 update path in `_compute_sq_metric_db` so the
+      noise blanker stops biasing the noise-floor estimator —
+      addresses the *cause* of the burst-end adaptive transient
+      rather than just recognising it. ~20 LOC.
+    - 41d. ⬜ Verification of the blanker→pct25 mechanism:
+      requires `nb_blanked_pct` per launch (TODO `#27b`
+      heartbeat). Run correlation analysis once available.
+
 ---
 
 ## Sequencing — what blocks what
@@ -362,4 +386,4 @@ are independent and can land at any time.
   commits).
 - Cross-references in `docs/block-stream-design.md` and in project
   memory entries use the `#N` IDs from this file. Do **not** renumber
-  to close gaps — `#19` is intentionally absent.
+  to close gaps — `#19` is deleted.
