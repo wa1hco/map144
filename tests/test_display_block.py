@@ -376,6 +376,168 @@ class TestDisplayBlockMonoPath(unittest.TestCase):
         )
 
 
+# --- IQ waterfall (#10b) --------------------------------------------
+
+
+def _iq_record(start_sample: int, n: int,
+               wall_clock: float = 100.0,
+               sample_rate_hz: int = 48_000,
+               fill_complex: complex = 0.5+0.0j) -> Record:
+    """1-D IQ record matching the IQStream contract.  Default fill is
+    a constant 0.5+0j (yields a clean DC tone in the waterfall)."""
+    return Record(
+        data=np.full(n, fill_complex, dtype=np.complex64),
+        sample_rate_hz=sample_rate_hz,
+        start_sample=start_sample,
+        wall_clock_at_production=wall_clock,
+    )
+
+
+class _WaterfallHarness:
+    """Build a Runtime with one DisplayBlock + IQ stream attached."""
+
+    def __init__(self):
+        self.rt = Runtime()
+        self.disp = self.rt.add(DisplayBlock("disp"), DisplayBlockConfig(
+            n_channels=N_CHANNELS,
+            history_rows=HISTORY_ROWS,
+            history_period_s=PERIOD_S,
+            iq_sample_rate_hz=48_000,
+            iq_fft_size=64,        # small FFT for fast tests
+            iq_full_scale=1.0,
+            get_timeout_s=0.05,
+        ))
+        self.metrics = make_sample_stream(
+            "metrics", queue_depth_seconds=4.0,
+            sample_rate_hz=SR, n_samples_per_record=STRIDE,
+        )
+        self.detections = make_event_stream("detections", capacity=64)
+        self.iq = make_sample_stream(
+            "iq", queue_depth_seconds=2.0,
+            sample_rate_hz=48_000, n_samples_per_record=512,
+        )
+        self.disp.inputs["metrics"]    = self.metrics
+        self.disp.inputs["detections"] = self.detections
+        self.disp.inputs["iq"]         = self.iq
+
+    def push_metric(self, rec: ChannelMetricRecord) -> None:
+        self.metrics.put(rec)
+
+    def push_iq(self, rec: Record) -> None:
+        self.iq.put(rec)
+
+    def settle(self, seconds: float = 0.20) -> None:
+        time.sleep(seconds)
+
+
+class TestWaterfallIQIngest(unittest.TestCase):
+
+    def test_waterfall_state_present_in_snapshot(self):
+        h = _WaterfallHarness()
+        h.rt.start()
+        try:
+            # rt.start() returns before on_start() runs in the spawned
+            # thread; brief barrier so _spectrogram_data is allocated.
+            for _ in range(40):
+                if h.disp._spectrogram_data is not None:
+                    break
+                time.sleep(0.01)
+            # No IQ yet — snapshot still has the waterfall fields, all
+            # at the sentinel.
+            snap = h.disp.state_snapshot()
+            self.assertEqual(snap.spectrogram_data.shape, snap.spec_staging.shape)
+            self.assertFalse(snap.spec_filled)
+            self.assertTrue(np.all(snap.spec_staging < -100))
+        finally:
+            h.rt.stop(timeout_s=1.0)
+
+    def test_iq_records_drained_into_sbuf(self):
+        h = _WaterfallHarness()
+        h.rt.start()
+        try:
+            # Need at least one metric record for the heartbeat that
+            # drives the IQ drain (tick is metric-blocking).
+            h.push_metric(_metric_record(start_sample=0, wall_clock=0.5,
+                                         fill=1.0))
+            # Push enough IQ for several FFT blocks: fft_size=64,
+            # hop=32, so 5 blocks = 5*32 + 32 = 192 samples (then a
+            # final 32-sample drain).  Push 1024 samples for headroom.
+            h.push_iq(_iq_record(start_sample=0, n=1024,
+                                 wall_clock=0.5, fill_complex=0.5+0j))
+            h.settle()
+            stats = h.disp.stats()
+        finally:
+            h.rt.stop(timeout_s=1.0)
+        self.assertGreater(stats["iq_records"], 0)
+        self.assertGreater(stats["iq_samples"], 0)
+        # FFT blocks were processed (at least a few).
+        self.assertGreater(stats["spec_blocks_written"], 0)
+
+    def test_constant_dc_input_produces_dc_bin_peak(self):
+        """A constant 0.5+0j IQ stream is a pure DC tone; FFT magnitude
+        should peak at the DC bin (= fft_size//2 after fftshift)."""
+        h = _WaterfallHarness()
+        h.rt.start()
+        try:
+            h.push_metric(_metric_record(start_sample=0, wall_clock=0.5,
+                                         fill=1.0))
+            for k in range(4):
+                h.push_iq(_iq_record(start_sample=k * 512, n=512,
+                                     wall_clock=0.5 + k * 0.01,
+                                     fill_complex=0.5+0j))
+            h.settle(seconds=0.30)
+            snap = h.disp.state_snapshot()
+        finally:
+            h.rt.stop(timeout_s=1.0)
+        # Find any row that has been populated (above sentinel).
+        populated = np.where(np.any(snap.spec_staging > -100, axis=1))[0]
+        self.assertGreater(len(populated), 0,
+                           "no rows were written to spec_staging")
+        # In any populated row, the peak bin should be at fft_size//2
+        # (DC after fftshift).
+        for row in populated[:3]:
+            peak_bin = int(np.argmax(snap.spec_staging[row, :]))
+            self.assertEqual(peak_bin, snap.spec_staging.shape[1] // 2,
+                             f"row {row}: peak at bin {peak_bin}, "
+                             f"expected DC bin {snap.spec_staging.shape[1]//2}")
+
+
+class TestWaterfallPeriodSnapshot(unittest.TestCase):
+
+    def test_period_boundary_snapshots_to_spectrogram_data(self):
+        """When a period boundary crosses, _spec_staging snapshots into
+        _spectrogram_data and spec_filled flips True."""
+        h = _WaterfallHarness()
+        h.rt.start()
+        try:
+            # Push IQ in period 0, then more in period 1.
+            h.push_metric(_metric_record(start_sample=0, wall_clock=14.0,
+                                         fill=1.0))
+            for k in range(3):
+                h.push_iq(_iq_record(start_sample=k * 512, n=512,
+                                     wall_clock=14.0 + k * 0.01,
+                                     fill_complex=0.5+0j))
+            h.settle(seconds=0.20)
+
+            # Cross boundary into period 1.
+            h.push_metric(_metric_record(start_sample=10_000,
+                                         wall_clock=15.5, fill=2.0))
+            for k in range(3):
+                h.push_iq(_iq_record(start_sample=10_000 + k * 512, n=512,
+                                     wall_clock=15.5 + k * 0.01,
+                                     fill_complex=0.5+0j))
+            h.settle(seconds=0.20)
+            snap = h.disp.state_snapshot()
+            stats = h.disp.stats()
+        finally:
+            h.rt.stop(timeout_s=1.0)
+
+        self.assertTrue(snap.spec_filled,
+                        "spec_filled should be True after period crosses")
+        self.assertEqual(stats["spec_period_snapshots"], 1,
+                         "exactly one period snapshot expected")
+
+
 # --- End-to-end: Detector → Display ---------------------------------
 
 
