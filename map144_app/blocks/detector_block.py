@@ -91,7 +91,7 @@ from ..processing import (
     _SUSTAINED_LOCKOUT,
 )
 from .block import Block
-from .types import BlockConfig, Event, Record, StreamClosed
+from .types import BlockConfig, ChannelMetricRecord, Event, Record, StreamClosed
 
 log = logging.getLogger(__name__)
 
@@ -113,6 +113,12 @@ class DetectorBlockConfig(BlockConfig):
     # Ports.
     input_port_name: str = "channels"
     detection_port_name: str = "detections"
+    #: Optional per-cycle metric stream, consumed by :class:`DisplayBlock`
+    #: for the detection-metric heatmap and (later) by cluster-classifier
+    #: blocks.  When the port is not connected, no metric records are
+    #: produced — keeps the legacy bit-exact-replay validation path
+    #: independent of Display state (§10).
+    metric_port_name: str = "metrics"
 
     # DSP knobs — defaults match the legacy detector exactly.
     n_channels: int = N_CHANNELS
@@ -480,6 +486,18 @@ class DetectorBlock(Block):
         # Combined pair_metric per channel.
         pair_metric = np.maximum(sq_metric, sync_metric)
 
+        # Emit a ChannelMetricRecord for the Display heatmap (and future
+        # cluster-classifier blocks).  Unconditional on triggers — the
+        # heatmap needs every frame.  Skipped if the metrics output port
+        # is not connected, so legacy bit-exact-replay tests that wire
+        # only the detection port are unaffected.
+        self._emit_metric_record(
+            sq_metric=sq_metric,
+            sync_metric=sync_metric,
+            pair_metric=pair_metric,
+            wall_clock_at_production=wall_clock_for_events,
+        )
+
         # Tick down cooldowns.
         self._detect_cooldowns = {
             k: v - 1 for k, v in self._detect_cooldowns.items() if v > 1
@@ -645,6 +663,55 @@ class DetectorBlock(Block):
     def _fc_hz_for_channel(self, ch_idx: int) -> float:
         cfg: DetectorBlockConfig = self.config  # type: ignore[assignment]
         return float(ch_idx) * cfg.channel_spacing_hz + cfg.channel_offset_hz
+
+    def _emit_metric_record(
+        self,
+        sq_metric: np.ndarray,
+        sync_metric: np.ndarray,
+        pair_metric: np.ndarray,
+        wall_clock_at_production: float,
+    ) -> None:
+        """Emit a per-cycle :class:`ChannelMetricRecord` for Display.
+
+        Mono path: ``pair_metric_db_v == pair_metric_db_h``.  The dual-pol
+        DetectorBlock equivalent will emit distinct H / V arrays.
+
+        ``start_sample`` is the position of the FFT window front
+        (``self._n_in_consumed``) at the moment the cycle ran.  The next
+        cycle's ``start_sample`` advances by ``stride_samples`` — gap-free
+        by construction with the legacy hop-counter row index.
+        """
+        cfg: DetectorBlockConfig = self.config  # type: ignore[assignment]
+        port = cfg.metric_port_name
+        if port not in self.outputs:
+            return  # metric sink is optional
+
+        sq_h = sq_metric if cfg.enable_sq_detect else None
+        sync_h = sync_metric if cfg.enable_sync_detect else None
+
+        # ChannelMetricRecord inherits ``data`` from Record (the primary
+        # heatmap metric) plus per-polarisation sub-metrics.  Mono
+        # detector populates _v == _h so consumers don't branch.
+        rec = ChannelMetricRecord(
+            data=pair_metric.astype(np.float32, copy=False),
+            sample_rate_hz=cfg.sample_rate_hz,
+            start_sample=self._n_in_consumed,
+            wall_clock_at_production=wall_clock_at_production,
+            metadata={
+                "stride_samples": cfg.stride_samples,
+                "fft_size": cfg.fft_size,
+            },
+            pair_metric_db_h=pair_metric.astype(np.float32, copy=False),
+            pair_metric_db_v=pair_metric.astype(np.float32, copy=False),
+            sq_metric_db_h=sq_h.astype(np.float32, copy=False) if sq_h is not None else None,
+            sq_metric_db_v=sq_h.astype(np.float32, copy=False) if sq_h is not None else None,
+            sync_metric_db_h=sync_h.astype(np.float32, copy=False) if sync_h is not None else None,
+            sync_metric_db_v=sync_h.astype(np.float32, copy=False) if sync_h is not None else None,
+        )
+        try:
+            self.outputs[port].put(rec)
+        except StreamClosed:
+            raise StopIteration
 
     def _emit_detection_event(
         self,

@@ -69,6 +69,59 @@ class Record:
 
 
 @dataclass(frozen=True)
+class ChannelMetricRecord(Record):
+    """Per-channel detector metrics — one record per detector cycle.
+
+    Emitted by :class:`DetectorBlock` (and the dual-pol equivalent) on its
+    ``metrics`` output port; consumed by :class:`DisplayBlock` for the
+    detection-metric heatmap and by future cluster-classifier blocks.
+
+    Inherits the dual-clock contract from :class:`Record` (§3.5):
+    ``start_sample`` and ``wall_clock_at_production`` are both first-class.
+    The 15-second period boundary used by the heatmap is wall-clock-defined
+    by protocol (UTC-aligned for cross-station synchronisation), but
+    ``wall_clock_at_production`` is itself sample-clock-derived at the
+    Source so it does not drift.
+
+    ``data`` carries the primary metric used for triggering — the
+    per-channel ``max(pair_metric_db_h, pair_metric_db_v)`` in dB above
+    the rolling pct25 baseline.  Shape ``(n_channels,)`` float32.
+
+    Sub-metrics are named:
+
+    - ``pair_metric_db_h`` / ``pair_metric_db_v`` — combined
+      ``max(sq, sync)`` dB above pct25, per polarisation.  For mono
+      sources both arrays are equal (== ``data``).
+    - ``sq_metric_db_h`` / ``sq_metric_db_v`` — squared-FFT-only metric.
+    - ``sync_metric_db_h`` / ``sync_metric_db_v`` — sync-correlator-only
+      metric.
+
+    Sub-metrics may be ``None`` when the corresponding detector path is
+    disabled (e.g. ``enable_sq_detect=False``).  ``data`` and the two
+    ``pair_metric_db_*`` arrays are always populated.
+    """
+
+    pair_metric_db_h: np.ndarray = None  # type: ignore[assignment]
+    pair_metric_db_v: np.ndarray = None  # type: ignore[assignment]
+    sq_metric_db_h: np.ndarray | None = None
+    sq_metric_db_v: np.ndarray | None = None
+    sync_metric_db_h: np.ndarray | None = None
+    sync_metric_db_v: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if self.pair_metric_db_h is None or self.pair_metric_db_v is None:
+            raise ValueError(
+                "ChannelMetricRecord requires pair_metric_db_h "
+                "and pair_metric_db_v"
+            )
+
+    @property
+    def n_channels(self) -> int:
+        """Number of channels along the channel axis."""
+        return int(self.data.shape[0])
+
+
+@dataclass(frozen=True)
 class Event:
     """A discrete event on a sparse stream — see §3.3.
 

@@ -38,6 +38,7 @@ from .block import Block
 from .channelizer_block import ChannelizerBlock, ChannelizerBlockConfig
 from .combiner_block import CombinerBlock, CombinerBlockConfig
 from .detector_block import DetectorBlock, DetectorBlockConfig
+from .display_block import DisplayBlock, DisplayBlockConfig, DisplayState
 from .flex_source import FLEX_DAXIQ_FULL_SCALE, FlexSource, FlexSourceConfig
 from .graph import Runtime
 from .jsonl_sink import JsonlSink, JsonlSinkConfig
@@ -49,12 +50,13 @@ from .stream import (
     make_sample_stream,
 )
 from .synthetic_source import SyntheticSource, SyntheticSourceConfig
-from .types import BlockConfig, Event, Record, StreamClosed
+from .types import BlockConfig, ChannelMetricRecord, Event, Record, StreamClosed
 from .wav_source import WavSource, WavSourceConfig
 
 __all__ = [
     "Block",
     "BlockConfig",
+    "ChannelMetricRecord",
     "ChannelizerBlock",
     "ChannelizerBlockConfig",
     "CoherentPair",
@@ -62,6 +64,9 @@ __all__ = [
     "CombinerBlockConfig",
     "DetectorBlock",
     "DetectorBlockConfig",
+    "DisplayBlock",
+    "DisplayBlockConfig",
+    "DisplayState",
     "Event",
     "FLEX_DAXIQ_FULL_SCALE",
     "FlexSource",
