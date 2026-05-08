@@ -37,6 +37,7 @@ from __future__ import annotations
 from .block import Block
 from .channelizer_block import ChannelizerBlock, ChannelizerBlockConfig
 from .combiner_block import CombinerBlock, CombinerBlockConfig
+from .decoder_block import DECODE_EVENT_KIND, DecoderBlock, DecoderBlockConfig
 from .detector_block import DetectorBlock, DetectorBlockConfig
 from .display_block import DisplayBlock, DisplayBlockConfig, DisplayState
 from .flex_source import FLEX_DAXIQ_FULL_SCALE, FlexSource, FlexSourceConfig
@@ -62,6 +63,9 @@ __all__ = [
     "CoherentPair",
     "CombinerBlock",
     "CombinerBlockConfig",
+    "DECODE_EVENT_KIND",
+    "DecoderBlock",
+    "DecoderBlockConfig",
     "DetectorBlock",
     "DetectorBlockConfig",
     "DisplayBlock",
