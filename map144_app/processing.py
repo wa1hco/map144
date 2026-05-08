@@ -980,6 +980,33 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                 # handles hop-to-hop re-triggers of the same channel without blocking
                 # independent signals in adjacent channels.
 
+            # Burst-context features for offline analysis + ML classifier.
+            # Track recent launches in a rolling 5-second window so each launch
+            # carries "how busy was the band recently" as numerical context.
+            #
+            # n_chans_300ms — distinct channels with launches in the last 300 ms
+            #   (excluding this one).  ≥ 8 ⇒ this launch is *inside* a wideband
+            #   burst (analyze_launches WIDEBAND_BURST rule).
+            # n_chans_2s — distinct channels in the last 2 s.  Captures the
+            #   post-burst tail and noisy-episode envelope without explicit
+            #   transition tracking.  High n_chans_2s with low n_chans_300ms
+            #   = post-burst rebound zone (where ~100 % of launches are noise
+            #   per the 2026-05-08 analysis: 0/657 decoded in the 5 s post-
+            #   burst window).
+            _now_epoch = datetime.now(timezone.utc).timestamp()
+            _recent = getattr(self, '_recent_launch_log', None)
+            if _recent is None:
+                _recent = []
+                self._recent_launch_log = _recent
+            # Drop entries older than 5 s.  In-place since this is single-thread.
+            _cutoff_5s = _now_epoch - 5.0
+            while _recent and _recent[0][0] < _cutoff_5s:
+                _recent.pop(0)
+            _cutoff_300ms = _now_epoch - 0.300
+            _cutoff_2s    = _now_epoch - 2.000
+            _n_chans_300ms = len({c for t, c in _recent if t > _cutoff_300ms})
+            _n_chans_2s    = len({c for t, c in _recent if t > _cutoff_2s})
+
             # Per-launch DSP-state snapshot for launches.jsonl.  Lets offline
             # analysis distinguish "real strong signal that didn't decode"
             # from "noise spike at the band edge crossing a low pct25
@@ -1004,7 +1031,13 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                 'ch_signed':         int(ch_signed),
                 'n_cluster_chan':    int(len(_cl_all)),
                 'det_source':        det_source,
+                # Burst-context features (see _recent_launch_log block above):
+                'n_chans_300ms':     int(_n_chans_300ms),
+                'n_chans_2s':        int(_n_chans_2s),
             }
+            # Append this launch to the recent log so subsequent launches in
+            # this hop's loop see it in their burst-context counts.
+            _recent.append((_now_epoch, int(ch_signed)))
 
             # ── #29: sync-correlator phase-derived features ─────────────────
             # Three physical-structure features the magnitude-only sync
