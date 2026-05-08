@@ -849,6 +849,32 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                 # handles hop-to-hop re-triggers of the same channel without blocking
                 # independent signals in adjacent channels.
 
+            # Per-launch DSP-state snapshot for launches.jsonl.  Lets offline
+            # analysis distinguish "real strong signal that didn't decode"
+            # from "noise spike at the band edge crossing a low pct25
+            # threshold" without needing the saved IQ.  All values in dB.
+            _pct25_arr   = getattr(self, '_pct25', None)
+            _pct25_v_arr = getattr(self, '_pct25_v', None)
+            launch_metrics = {
+                'pair_metric_db_h':  round(float(pair_metric_h[ch_k]), 1),
+                'pair_metric_db_v':  (round(float(pair_metric_v[ch_k]), 1)
+                                      if ch_block_v is not None else None),
+                'sq_metric_db_h':    round(float(sq_metric_h_only[ch_k]), 1),
+                'sq_metric_db_v':    (round(float(sq_metric_v_only[ch_k]), 1)
+                                      if ch_block_v is not None else None),
+                'sync_metric_db_h':  (round(float(sync_metric_h[ch_k]), 1)
+                                      if sync_metric_h is not None else None),
+                'sync_metric_db_v':  (round(float(sync_metric_v[ch_k]), 1)
+                                      if sync_metric_v is not None else None),
+                'ch_pct25_db_h':     (round(float(10.0 * np.log10(_pct25_arr[ch_k])), 1)
+                                      if _pct25_arr is not None else None),
+                'ch_pct25_db_v':     (round(float(10.0 * np.log10(_pct25_v_arr[ch_k])), 1)
+                                      if _pct25_v_arr is not None else None),
+                'ch_signed':         int(ch_signed),
+                'n_cluster_chan':    int(len(_cl_all)),
+                'det_source':        det_source,
+            }
+
             if not getattr(self, '_analysis_no_decode', False):
                 t = threading.Thread(
                     target=extract_and_decode,
@@ -858,7 +884,8 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                           ring_gen, ring_gen_fn,
                           getattr(self, 'display_center_freq_mhz', self.center_freq_mhz),
                           detect_ts, None, dual_pol),
-                    kwargs={'det_source': det_source},
+                    kwargs={'det_source': det_source,
+                            'launch_metrics': launch_metrics},
                     daemon=True,
                 )
                 t._fc_hz = fc_hz

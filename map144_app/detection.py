@@ -437,6 +437,7 @@ def extract_and_decode(
     dual_pol: bool = False,
     iq_t0_wall: float | None = None,
     det_source: str = "sq",
+    launch_metrics: dict | None = None,
 ) -> None:
     """Extract IQ around detect_sample, mix fc to 1500 Hz, decimate to 12 kHz, run jt9.
 
@@ -618,6 +619,12 @@ def extract_and_decode(
             "jt9_line":  jt9_line,
             "theta_deg": round(theta_deg, 1) if dual_pol else None,
         }
+        # DSP-state snapshot at the moment of launch — used by offline analysis
+        # (analyze_launches.py / compare_decoders.py) to separate real-signal
+        # launches from threshold-edge noise spikes without re-running the
+        # detector.  Absent when older runs predate the metric capture.
+        if launch_metrics:
+            entry.update(launch_metrics)
         with open(out_dir / "launches.jsonl", "a") as lf:
             lf.write(json.dumps(entry) + "\n")
 
