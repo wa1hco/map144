@@ -121,16 +121,19 @@ DETECT_THRESH_DB   = 3.0        # dB above 25th-percentile noise baseline
 # Flex setup.  +85 dB offset → typical −80 dBFS floor maps to +5 dB
 # displayed, well inside the slider window.
 #
-# Sync path: 10·log10(peaks) is already in the right ballpark — for
-# random-phase noise the peak magnitude is ~√(2·42) ≈ 9.2 (linear), so
-# 10·log10 ≈ +9.5 dB at the noise floor.  No offset needed.  Strong
-# signals push peaks higher, displayed values rise toward the slider
-# max as expected.
+# Sync path: peaks magnitude is ~√(2·42) × |c|_rms = 9.2 × |c|_rms in
+# *linear* IQ units.  For a typical Flex setup |c|_rms is ~1e-3..1e-2,
+# so 10·log10(peaks) lands around −20..−10 dB at the noise floor (NOT
+# the +9.5 dB I estimated initially — that assumed unit-amplitude IQ,
+# which is full-scale, not realistic).  Offset +30 dB puts the noise
+# floor in the +10..+20 dB display window for typical Flex gain.  Real
+# levels depend on user gain settings — if sync display sits dark or
+# saturates, this offset is the calibration to adjust.
 #
 # Channel-to-channel deltas are preserved exactly in both cases — only
 # the absolute axis is shifted.
 _RAW_POWER_DISPLAY_OFFSET_DB_SQ   = 85.0
-_RAW_POWER_DISPLAY_OFFSET_DB_SYNC = 0.0
+_RAW_POWER_DISPLAY_OFFSET_DB_SYNC = 30.0
 DETECT_MERGE_GAP_S = 0.5        # suppress re-trigger on the same channel within this window (s).
                                  # Per-channel cooldown: parallel channels are fully independent,
                                  # so simultaneous pings at different frequencies are unaffected.
@@ -885,9 +888,40 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                 _ch_above.pop(_ck, None)
         self._ch_above_thresh = _ch_above
 
+        # Compute the actual IF Nyquist channel for the Nyquist-edge mask.
+        # The naive "_nyquist_ch = N_CHANNELS // 2 = 24" is correct ONLY when
+        # the channel grid is centered on IQ DC (channel_offset_hz == 0).
+        # The USB-convention offset (channel_offset_hz = 1500 Hz when
+        # pan == calling) shifts the channel grid by 1.5 channels relative
+        # to IQ DC.  ch_k 24's NCO is 24*1000 + 1500 = 24500 Hz, which wraps
+        # to IF −23.5 kHz — NOT at the actual IF Nyquist (±24 kHz).
+        # The actual IF Nyquist sits at ch_k = (sample_rate/2 −
+        # channel_offset_hz) / CHANNEL_SPACING_HZ = (24000 − 1500) / 1000 = 22.5.
+        #
+        # Centering the mask on ch_k 24 instead of 22.5 leaves channel
+        # ch_k = 19 (IF +20.5 kHz) — which sits deep in the IF passband
+        # rolloff — UNmasked, while the equivalent negative-IF channel
+        # ch_k = 28 (IF −18.5 kHz, OUTSIDE the rolloff zone) IS masked.
+        # That asymmetric coverage is the root cause of the ~6× excess
+        # trigger rate at ch_signed +19 (the "STATIONARY_SPUR" / "rolloff
+        # bins" puzzle from project_launch_pattern_findings).
+        _ch_offset_in_channels = (
+            self._ch_state.channel_offset_hz / CHANNEL_SPACING_HZ
+        )
+        _nyquist_ch_real = (N_CHANNELS / 2) - _ch_offset_in_channels  # 22.5 typical
+
         for ch_k, _cl_all in _launch_channels:
-            _nyquist_ch = N_CHANNELS // 2  # ch 24 = ±24 kHz Nyquist
-            if abs(int(ch_k) - _nyquist_ch) <= _EDGE_CH_SKIP:
+            # Mask channels within _EDGE_CH_SKIP of the actual IF Nyquist.
+            # Uses the wrap-aware distance: ch_k is unsigned 0..47, but
+            # frequency-space distance to Nyquist needs to consider both
+            # +N_CHANNELS and -N_CHANNELS aliases.
+            _ch_int = int(ch_k)
+            _dist_to_nyquist = min(
+                abs(_ch_int - _nyquist_ch_real),
+                abs(_ch_int - _nyquist_ch_real - N_CHANNELS),
+                abs(_ch_int - _nyquist_ch_real + N_CHANNELS),
+            )
+            if _dist_to_nyquist <= _EDGE_CH_SKIP:
                 continue
 
             # Detector attribution: which path put this channel above threshold?

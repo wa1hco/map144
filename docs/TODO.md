@@ -172,18 +172,40 @@ See `project_ml_qso_classifier_plan` memory for the full plan; see
     sync-correlator peak (σ_f ≈ 5–15 Hz at typical detection SNR vs
     10–30 Hz for the squared-FFT path). Fall back to squared-FFT only
     when sync did not fire on this channel. Requires Phase 3 cut-over.
-31. ⬜ **Fix asymmetric upper-IF noise-floor rolloff** — six channels at
-    +14..+19 from pan center produce 28 % of all launches with 0 %
-    decode rate, because pct25 there is artificially low (4.7 dB drop
-    at +19 vs flat −80 dB baseline elsewhere). The asymmetry rules out
-    symmetric Nyquist rolloff; cause is in the upper-IF chain (Flex
-    DSP or MAP144 channelizer). The right fix is **NOT** channel-list
-    hard-suppression (that would block real signals there) — it's
-    cross-channel `pct25` reference, which is `#32` BandStateTracker
-    Stage 2. Originally framed as "STATIONARY_SPUR hard-suppression"
-    (analyze_launches.py 2026-05-07); reframed 2026-05-08 after
-    user-driven diagnosis. See `project_launch_pattern_findings`
-    memory for the pct25-by-channel data.
+31. ✅ **Nyquist mask off-center vs IF Nyquist (USB-convention offset
+    bug)** — the legacy detection gate at
+    [processing.py:891-894](../map144_app/processing.py#L891-L894) used
+    `_nyquist_ch = N_CHANNELS // 2 = 24` as the Nyquist channel center.
+    That assumes the channel grid is centered on IQ DC, which it
+    isn't: the USB-convention offset
+    `channel_offset_hz = (calling − pan) + 1500` shifts the grid by
+    1.5 channels (typical pan=calling case). The actual IF Nyquist is
+    at `ch_k = (sample_rate/2 − channel_offset_hz) / CHANNEL_SPACING_HZ
+    = 22.5`, **not 24**.
+
+    Consequence: with `_EDGE_CH_SKIP = 4` the legacy mask covered
+    ch_k 20..28 — IF +20.5..+23.5 kHz on positive (4 channels) and
+    IF −23.5..−18.5 kHz on negative (5 channels). The negative-side
+    rolloff zone was fully masked, but the **positive-side rolloff
+    bin `ch_k = 19` (IF +20.5) was unmasked**, producing the ~6×
+    false-trigger rate at `ch_signed +19` (1666 launches in the
+    overnight 2026-05-08 dataset, 0 % decode).
+
+    Fix landed: dynamic Nyquist channel based on actual
+    `channel_offset_hz`, with wrap-aware distance computation. New
+    mask covers ch_k 19..26 (IF ±19.5..±23.5, symmetric around the
+    real IF Nyquist).
+
+    Was originally framed (2026-05-07) as "STATIONARY_SPUR
+    hard-suppression" of channels 50274–50279, then (2026-05-08
+    intermediate) as "asymmetric IF rolloff, cause unidentified".
+    Final root cause: the IF rolloff IS symmetric in absolute
+    frequency; the launch-count asymmetry came entirely from the
+    mask being centered on the wrong channel.
+
+    See `project_launch_pattern_findings` memory for the diagnostic
+    data and the toggle (`Diagnostics → Show raw power`) used to
+    visualise the underlying symmetric rolloff.
 32. ⬜ **BandStateTracker** — single per-channel state object
     (background level + signal label + claim-based repeat-suppression)
     replacing the current pct25 / cooldown / sustained-lockout /
