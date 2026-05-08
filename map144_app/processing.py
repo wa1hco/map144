@@ -110,17 +110,27 @@ SYNC_DETECT_THRESH_DB = 3.0    # dB above 25th-percentile sync-magnitude baselin
 
 DETECT_THRESH_DB   = 3.0        # dB above 25th-percentile noise baseline
 
-# Diagnostic raw-power display offset.  When the operator enables
-# Diagnostics → "Show raw power", the heatmap shows raw squared-FFT
-# (and sync-correlator) power instead of dB-above-pct25.  Raw power
-# sits around −90..−50 dBFS on this Flex setup, well below the existing
-# colour-scale slider's reach.  Adding this offset shifts the values
-# back into the same display window the sliders are already calibrated
-# for (typical pair_metric range 0..30 dB) without changing the slider
-# ranges (which are fussy enough already).  Channel-to-channel deltas
-# are preserved exactly — only the absolute axis is shifted.
-# Chosen so a typical −80 dBFS noise floor maps to ~+5 dB displayed.
-_RAW_POWER_DISPLAY_OFFSET_DB = 85.0
+# Diagnostic raw-power display offsets.  When the operator enables
+# Diagnostics → "Show raw power", the heatmap shows raw power instead
+# of dB-above-pct25.  The squared-FFT and sync-correlator paths sit at
+# very different absolute scales, so each needs its own offset to land
+# the typical noise floor in the same display window the existing
+# colour-scale sliders are calibrated for (~0..30 dB).
+#
+# Squared-FFT path: 10·log10(raw_lin) sits around −90..−50 dBFS on this
+# Flex setup.  +85 dB offset → typical −80 dBFS floor maps to +5 dB
+# displayed, well inside the slider window.
+#
+# Sync path: 10·log10(peaks) is already in the right ballpark — for
+# random-phase noise the peak magnitude is ~√(2·42) ≈ 9.2 (linear), so
+# 10·log10 ≈ +9.5 dB at the noise floor.  No offset needed.  Strong
+# signals push peaks higher, displayed values rise toward the slider
+# max as expected.
+#
+# Channel-to-channel deltas are preserved exactly in both cases — only
+# the absolute axis is shifted.
+_RAW_POWER_DISPLAY_OFFSET_DB_SQ   = 85.0
+_RAW_POWER_DISPLAY_OFFSET_DB_SYNC = 0.0
 DETECT_MERGE_GAP_S = 0.5        # suppress re-trigger on the same channel within this window (s).
                                  # Per-channel cooldown: parallel channels are fully independent,
                                  # so simultaneous pings at different frequencies are unaffected.
@@ -692,23 +702,21 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         # so persistent / asymmetric features become visible.  Detection
         # logic continues to use pair_metric — only the display changes.
         #
-        # Display scaling: raw squared-FFT power on this Flex setup sits
-        # around −90..−50 dBFS, well below the existing colour-scale
-        # slider's reach.  We add a constant ``_RAW_POWER_DISPLAY_OFFSET_DB``
-        # so the values land back in the same dB-above-baseline window the
-        # sliders are already calibrated for (typical pair_metric range
-        # 0..30).  Channel-to-channel differences remain accurate — only
-        # the absolute axis is shifted.  Choose offset so a typical
-        # noise-floor (~−80 dBFS) maps to ~+5 dB displayed: offset = +85.
+        # Display scaling: see _RAW_POWER_DISPLAY_OFFSET_DB_SQ /
+        # _RAW_POWER_DISPLAY_OFFSET_DB_SYNC at module top.  Squared-FFT
+        # raw power is ~−90..−50 dBFS so the SQ offset shifts it +85
+        # dB into the slider window.  Sync correlator output is already
+        # at +9..+30 dB so SYNC offset is 0.  Channel-to-channel
+        # differences are preserved exactly in both cases.
         if getattr(self, '_show_raw_power', False):
             raw_db_h = (
                 10.0 * np.log10(np.maximum(raw_lin, 1e-30))
-                + _RAW_POWER_DISPLAY_OFFSET_DB
+                + _RAW_POWER_DISPLAY_OFFSET_DB_SQ
             ).astype(np.float32)
             if ch_block_v is not None:
                 raw_db_v = (
                     10.0 * np.log10(np.maximum(raw_lin_v, 1e-30))
-                    + _RAW_POWER_DISPLAY_OFFSET_DB
+                    + _RAW_POWER_DISPLAY_OFFSET_DB_SQ
                 ).astype(np.float32)
             else:
                 raw_db_v = raw_db_h
@@ -728,7 +736,7 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                     raw_sync_db_h = (
                         sync_metric_h
                         + 10.0 * np.log10(np.maximum(sp25_h, 1e-30))
-                        + _RAW_POWER_DISPLAY_OFFSET_DB
+                        + _RAW_POWER_DISPLAY_OFFSET_DB_SYNC
                     ).astype(np.float32)
                     self._sync_snr_history_h[self._ch_snr_write_idx, :] = raw_sync_db_h
                 else:
@@ -742,7 +750,7 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                     raw_sync_db_v = (
                         sync_metric_v
                         + 10.0 * np.log10(np.maximum(sp25_v, 1e-30))
-                        + _RAW_POWER_DISPLAY_OFFSET_DB
+                        + _RAW_POWER_DISPLAY_OFFSET_DB_SYNC
                     ).astype(np.float32)
                     self._sync_snr_history_v[self._ch_snr_write_idx, :] = raw_sync_db_v
                 else:

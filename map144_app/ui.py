@@ -842,11 +842,12 @@ def _on_show_raw_power_toggled(self, checked):
 
     Implementation note on display scaling: raw squared-FFT power sits
     around −90..−50 dBFS, well below the existing colour-scale slider's
-    reach.  Rather than fight the slider range, processing.py applies
-    a constant offset (``_RAW_POWER_DISPLAY_OFFSET_DB``) so the values
-    land back in the same dB-above-baseline window the sliders are
-    already calibrated for.  Differences between channels remain
-    accurate — only the absolute dBFS axis is shifted.
+    reach; raw sync-correlator output sits already in the slider window.
+    Rather than fight the slider range, processing.py applies path-
+    specific offsets (``_RAW_POWER_DISPLAY_OFFSET_DB_SQ`` = +85 dB,
+    ``_RAW_POWER_DISPLAY_OFFSET_DB_SYNC`` = 0 dB) so both modes use the
+    same slider calibration.  Channel-to-channel differences remain
+    accurate; only the absolute dBFS axis is shifted.
 
     Not persisted across sessions: a diagnostic mode left enabled
     between runs would mislead the live operator into thinking the
