@@ -43,6 +43,7 @@ from .display_block import DisplayBlock, DisplayBlockConfig, DisplayState
 from .flex_source import FLEX_DAXIQ_FULL_SCALE, FlexSource, FlexSourceConfig
 from .graph import Runtime
 from .jsonl_sink import JsonlSink, JsonlSinkConfig
+from .reporter_block import ReporterBlock, ReporterBlockConfig
 from .source import Source, SourceConfig
 from .stream import (
     CoherentPair,
@@ -78,6 +79,8 @@ __all__ = [
     "JsonlSink",
     "JsonlSinkConfig",
     "Record",
+    "ReporterBlock",
+    "ReporterBlockConfig",
     "Runtime",
     "Source",
     "SourceConfig",
