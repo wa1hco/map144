@@ -24,11 +24,17 @@ Patterns considered (rule-based, hierarchy is exclusive, most-specific first):
                     to ~2/sec, so this rule rarely fires in practice.
   LOCAL_EDGE        3+ adjacent channels (±3) co-fire within ±100 ms.
                     Strong-local TX rising edge sidelobes.
-  STATIONARY_SPUR   Channel fires in many periods (across-period
+  PERSISTENT_NODECODE
+                    Channel fires in many periods (across-period
                     persistence ≥ SPUR_PERIOD_FRAC) at <SPUR_DECODE_FRAC
                     decode rate, AND not on the calling frequency.
-                    CW carriers, narrow modulated spurs that fire
-                    1–2 times per period, persistently.
+                    Cause-agnostic — could be CW spurs, narrow modulated
+                    spurs, OR band-edge anti-aliasing rolloff lowering
+                    pct25 (the latter being the actual cause of the
+                    50274–50279 cluster, per user analysis 2026-05-08).
+                    Was originally named STATIONARY_SPUR; renamed
+                    because the rule observes the symptom (persistence
+                    × low decode), not the underlying physical cause.
   SUSTAINED         Same channel, ≥ N_SUSTAINED launches within a
                     single period, but not voice-rapid.  Continuous TX
                     with cooldown re-triggers.
@@ -53,7 +59,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -61,6 +66,23 @@ import numpy as np
 REPO = Path(__file__).resolve().parent
 LAUNCHES = REPO / "MSK144" / "detections" / "launches.jsonl"
 CALLING_KHZ_DEFAULT = 50260.0
+
+
+# Pattern colour map shared with compare_decoders.py — keep in sync with
+# plot_summary().  Importing this from compare_decoders.py keeps the per-class
+# scatter consistent with the standalone analyzer.
+PATTERN_COLOURS: dict[str, str] = {
+    "WIDEBAND_BURST":  "#d62728",
+    "SSB_VOICE":       "#ff7f0e",
+    "LOCAL_EDGE":      "#9467bd",
+    "PERSISTENT_NODECODE": "#8c564b",
+    "SUSTAINED":       "#2ca02c",
+    "ISOLATED":        "#1f77b4",
+}
+PATTERN_ORDER: list[str] = [
+    "WIDEBAND_BURST", "SSB_VOICE", "LOCAL_EDGE",
+    "PERSISTENT_NODECODE", "SUSTAINED", "ISOLATED",
+]
 
 
 # ── Rule thresholds ──────────────────────────────────────────────────────
@@ -71,10 +93,13 @@ LOCAL_EDGE_N_NEAR_CHAN = 3
 SSB_RAPID_PER_SEC      = 5.0
 SUSTAINED_N_PER_PERIOD = 3
 
-# Stationary-spur thresholds.  A channel that's present in ≥ this fraction
-# of all observed periods *and* decodes in < SPUR_DECODE_FRAC of its launches
-# is treated as a stationary spur (NOT applied to the calling channel,
-# which may legitimately be busy + low-decode-rate during noisy bands).
+# Persistent-nodecode thresholds.  A channel that's present in ≥ this
+# fraction of all observed periods *and* decodes in < SPUR_DECODE_FRAC of
+# its launches is flagged.  NOT applied to the calling channel, which may
+# legitimately be busy + low-decode-rate during noisy bands.
+# Note: the rule cannot tell *why* a channel is in this state — could be
+# a CW/modulated spur, OR band-edge anti-aliasing rolloff lowering pct25
+# (which is the cause of the .274–.279 cluster on this Flex setup).
 SPUR_PERIOD_FRAC       = 0.10
 SPUR_DECODE_FRAC       = 0.02
 SPUR_MIN_LAUNCHES      = 30      # don't flag spurs from too few samples
@@ -95,13 +120,25 @@ def parse_ts(s: str) -> datetime | None:
     return None
 
 
-def load_launches(path: Path, since: datetime | None = None) -> dict:
+def load_launches(
+    path: Path,
+    since: datetime | None = None,
+    calling_khz: float | None = None,
+    max_pan_offset_khz: float | None = None,
+    pan_window_s: float = 300.0,
+) -> dict:
     """Load launches.jsonl into a column-oriented numpy structure.
 
     Sorted by time.  Returns a dict of equal-length arrays:
         ts (datetime[]), ts_epoch (float64), t_sec, khz (int),
         outcome_decoded (bool), period_key (int = floor(ts/15)*15)
     plus the raw record list for reporting.
+
+    If ``max_pan_offset_khz`` is set, drop launches that fall in a
+    ``pan_window_s``-second window whose inferred pan-centre (median of the
+    window's radio_khz values) sits more than ``max_pan_offset_khz`` from
+    ``calling_khz``.  Used to suppress sessions where the panadapter was
+    retuned away from the MSK144 calling channel.
     """
     rows: list[dict] = []
     with open(path) as f:
@@ -132,6 +169,44 @@ def load_launches(path: Path, since: datetime | None = None) -> dict:
                 "decoded":      (outcome == "decoded"),
             })
     rows.sort(key=lambda r: r["ts_epoch"])
+
+    # Pan-centre filter.  Bucket launches into ``pan_window_s``-wide windows by
+    # ts_epoch, infer pan-centre as the midpoint of the band edges (min and
+    # max radio_khz seen in the window), drop the whole bucket if it sits
+    # more than ``max_pan_offset_khz`` from the calling channel.
+    #
+    # Why edge-midpoint and not median(khz): heavy persistent-nodecode bins
+    # (e.g. band-edge rolloff at 50279) dominate the per-window count, so
+    # median(khz) can drift +5..+15
+    # kHz from the true pan-centre even on properly tuned sessions.  The
+    # band edges, capped by the Nyquist exclusion gate at the runtime, are
+    # symmetric about the true pan-centre and not pulled by signal density.
+    if max_pan_offset_khz is not None and calling_khz is not None and rows:
+        n_in = len(rows)
+        bucket_rows: dict[int, list[dict]] = defaultdict(list)
+        for r in rows:
+            b = int(r["ts_epoch"] // pan_window_s)
+            bucket_rows[b].append(r)
+
+        kept: list[dict] = []
+        n_buckets_kept = 0
+        n_buckets_drop = 0
+        for b in sorted(bucket_rows):
+            br = bucket_rows[b]
+            khzs = [int(r["khz"]) for r in br]
+            mid = (min(khzs) + max(khzs)) / 2.0
+            if abs(mid - calling_khz) <= max_pan_offset_khz:
+                kept.extend(br)
+                n_buckets_kept += 1
+            else:
+                n_buckets_drop += 1
+        rows = kept
+        print(f"  pan-centre filter: kept {n_buckets_kept} window(s) "
+              f"({len(rows):,} launches), dropped {n_buckets_drop} window(s) "
+              f"({n_in - len(rows):,} launches) — |midpoint(min,max khz) - "
+              f"{calling_khz:.0f}| > {max_pan_offset_khz} kHz over "
+              f"{pan_window_s:.0f}-s windows",
+              flush=True)
 
     n = len(rows)
     return {
@@ -245,8 +320,8 @@ def classify(data: dict, calling_khz: float = CALLING_KHZ_DEFAULT) -> np.ndarray
         else:
             bucket_rate[k] = 0.0
 
-    # ── Stationary-spur detection (cross-period channel persistence) ─
-    print("  detecting stationary spurs…", flush=True)
+    # ── Persistent-nodecode channel detection (cross-period persistence) ─
+    print("  detecting persistent-nodecode channels…", flush=True)
     n_periods_total = len(set(period_key.tolist()))
     # Per-channel: number of distinct periods present + total launches +
     # decoded count.  Use khz (absolute) to keep readable in output.
@@ -272,7 +347,7 @@ def classify(data: dict, calling_khz: float = CALLING_KHZ_DEFAULT) -> np.ndarray
         if period_frac >= SPUR_PERIOD_FRAC and decode_frac < SPUR_DECODE_FRAC:
             spur_channels.add(khz)
 
-    print(f"  identified {len(spur_channels)} stationary-spur channel(s): "
+    print(f"  identified {len(spur_channels)} persistent-nodecode channel(s): "
           f"{sorted(spur_channels)}")
 
     # ── Apply hierarchy ──────────────────────────────────────────────
@@ -283,14 +358,16 @@ def classify(data: dict, calling_khz: float = CALLING_KHZ_DEFAULT) -> np.ndarray
     is_wideband = n_distinct_wide >= WIDE_N_DISTINCT_CHAN
     labels[is_wideband] = "WIDEBAND_BURST"
 
-    # STATIONARY_SPUR — second tier.  All launches on a spur-flagged
+    # PERSISTENT_NODECODE — second tier.  All launches on a flagged
     # channel get this label, regardless of within-period count.
+    # See top-of-file rule docstring for cause caveat (CW spur vs
+    # band-edge anti-aliasing rolloff).
     if spur_channels:
         khz_arr = data["khz"]
         is_spur = np.array([int(k) in spur_channels for k in khz_arr])
         # only relabel ones that aren't already WIDEBAND_BURST
         relabel = is_spur & (labels == "ISOLATED")
-        labels[relabel] = "STATIONARY_SPUR"
+        labels[relabel] = "PERSISTENT_NODECODE"
 
     # SSB_VOICE / SUSTAINED — bucket-driven, only for still-ISOLATED
     for i in range(n):
@@ -330,7 +407,7 @@ def print_summary(data: dict, labels: np.ndarray) -> None:
     print(f"{'pattern':<18} {'launches':>10}  {'%':>6}  {'decoded':>9}  {'decode%':>8}")
     print("-" * 62)
     for pat in ("WIDEBAND_BURST", "SSB_VOICE", "LOCAL_EDGE",
-                "STATIONARY_SPUR", "SUSTAINED", "ISOLATED"):
+                "PERSISTENT_NODECODE", "SUSTAINED", "ISOLATED"):
         nn = label_counts.get(pat, 0)
         if nn == 0:
             continue
@@ -345,7 +422,7 @@ def print_summary(data: dict, labels: np.ndarray) -> None:
     chans = data["khz"]
     print("\nTop channels by launches, per pattern:")
     for pat in ("WIDEBAND_BURST", "SSB_VOICE", "LOCAL_EDGE",
-                "STATIONARY_SPUR", "SUSTAINED", "ISOLATED"):
+                "PERSISTENT_NODECODE", "SUSTAINED", "ISOLATED"):
         mask = labels == pat
         if not mask.any():
             continue
@@ -362,16 +439,8 @@ def plot_summary(
     n = len(labels)
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
 
-    pat_order = ["WIDEBAND_BURST", "SSB_VOICE", "LOCAL_EDGE",
-                 "STATIONARY_SPUR", "SUSTAINED", "ISOLATED"]
-    pat_color = {
-        "WIDEBAND_BURST":  "#d62728",
-        "SSB_VOICE":       "#ff7f0e",
-        "LOCAL_EDGE":      "#9467bd",
-        "STATIONARY_SPUR": "#8c564b",
-        "SUSTAINED":       "#2ca02c",
-        "ISOLATED":        "#1f77b4",
-    }
+    pat_order = list(PATTERN_ORDER)
+    pat_color = dict(PATTERN_COLOURS)
 
     label_counts = Counter(labels.tolist())
     decoded_per_label: dict[str, int] = defaultdict(int)
@@ -450,12 +519,25 @@ def plot_summary(
 
 
 def main() -> int:
+    # CLI usage runs headless — set the backend before any pyplot use.
+    # Importers (e.g. compare_decoders.py running under Qt5Agg) MUST NOT have
+    # this happen at module load time; gating it on main() preserves both.
+    matplotlib.use("Agg")
+
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--since", default=None,
                     help="Restrict analysis to launches after YYYYMMDD (UTC)")
     ap.add_argument("--launches", default=str(LAUNCHES))
     ap.add_argument("--calling-khz", type=float, default=CALLING_KHZ_DEFAULT)
+    ap.add_argument("--max-pan-offset-khz", type=float, default=1.5,
+                    help="Discard launches in any %g-s window whose median "
+                         "radio_khz is more than this many kHz from "
+                         "--calling-khz.  Filters out sessions where the "
+                         "panadapter was retuned off the calling frequency. "
+                         "Set to a large number (e.g. 1000) to disable.")
+    ap.add_argument("--pan-window-s", type=float, default=300.0,
+                    help="Window size for the pan-centre filter (seconds).")
     ap.add_argument("--output", default=str(REPO / "docs" / "launch_patterns.png"))
     args = ap.parse_args()
 
@@ -464,7 +546,13 @@ def main() -> int:
         since = datetime.strptime(args.since, "%Y%m%d").replace(tzinfo=timezone.utc)
 
     print(f"Loading {args.launches}…", flush=True)
-    data = load_launches(Path(args.launches), since=since)
+    data = load_launches(
+        Path(args.launches),
+        since=since,
+        calling_khz=args.calling_khz,
+        max_pan_offset_khz=args.max_pan_offset_khz,
+        pan_window_s=args.pan_window_s,
+    )
     rows = data["rows"]
     if not rows:
         print("No launches.")

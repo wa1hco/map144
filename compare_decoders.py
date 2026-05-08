@@ -1322,6 +1322,152 @@ def _make_snr_scatter_by_class_fig(
     return fig
 
 
+# ── Launch-pattern figure ─────────────────────────────────────────────────────
+
+
+def _make_launch_pattern_fig(
+    launches_path: Path,
+    calling_khz: float,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    date_label: str = '',
+    max_points: int = 50_000,
+    pan_offset_khz: float = 1.5,
+) -> Figure:
+    """Frequency-vs-time scatter of every launch in ``launches_path``,
+    color-coded by ``analyze_launches.classify`` pattern label.
+
+    The pattern labels (WIDEBAND_BURST, SSB_VOICE, LOCAL_EDGE,
+    PERSISTENT_NODECODE, SUSTAINED, ISOLATED) come from the same vectorized
+    rule classifier ``analyze_launches.py`` runs on the full log; this
+    plot shows where in (time × frequency) each class lands so the live
+    spectrogram pattern can be cross-checked against the analysis result.
+
+    Subsampled to ``max_points`` for plot responsiveness — full-density
+    rendering of 600k+ launches stalls Matplotlib without an obvious
+    benefit (overplotting at the same dot saturates the colour anyway).
+    """
+    # Imported lazily so compare_decoders.py still loads if analyze_launches
+    # is unavailable.  PATTERN_COLOURS / PATTERN_ORDER are kept module-level
+    # in analyze_launches.py for exactly this purpose.
+    from analyze_launches import (
+        load_launches, classify, PATTERN_COLOURS, PATTERN_ORDER,
+    )
+
+    fig = Figure(figsize=(13, 6.5))
+    ax = fig.add_subplot(111)
+
+    if not launches_path.exists():
+        ax.set_axis_off()
+        ax.text(0.5, 0.5, f"launches.jsonl not found at\n{launches_path}",
+                ha='center', va='center', transform=ax.transAxes,
+                fontsize=11, color='gray')
+        return fig
+
+    data = load_launches(
+        launches_path,
+        since=since,
+        calling_khz=calling_khz,
+        max_pan_offset_khz=pan_offset_khz,
+    )
+    # ``until`` filter: load_launches only supports ``since``; trim post-load.
+    if until is not None and len(data["ts_epoch"]) > 0:
+        cutoff = until.timestamp()
+        keep = data["ts_epoch"] < cutoff
+        if not keep.all():
+            for k in ("ts_epoch", "khz", "t_sec", "decoded", "period_key"):
+                data[k] = data[k][keep]
+            data["rows"] = [r for r, k in zip(data["rows"], keep) if k]
+
+    n = len(data["ts_epoch"])
+    if n == 0:
+        ax.set_axis_off()
+        ax.text(0.5, 0.5, "no launches in selected window",
+                ha='center', va='center', transform=ax.transAxes,
+                fontsize=11, color='gray')
+        return fig
+
+    labels = classify(data, calling_khz=calling_khz)
+
+    # Subsample evenly across the timeline before scatter — random subsample
+    # preserves both the temporal density and the per-class proportions.
+    if n > max_points:
+        rng = np.random.default_rng(42)
+        idx = np.sort(rng.choice(n, size=max_points, replace=False))
+        ts_epoch = data["ts_epoch"][idx]
+        khz      = data["khz"][idx]
+        labels   = labels[idx]
+    else:
+        ts_epoch = data["ts_epoch"]
+        khz      = data["khz"]
+
+    # Convert epoch seconds to numpy.datetime64 for matplotlib's date locator
+    ts_dt = np.array([datetime.fromtimestamp(t, tz=timezone.utc)
+                      for t in ts_epoch])
+    offset_khz = khz.astype(np.float32) - float(calling_khz)
+
+    # Plot order: reverse PATTERN_ORDER so the dense, less-actionable classes
+    # (ISOLATED, SUSTAINED) form the background and the diagnostically
+    # interesting ones (STATIONARY_SPUR, LOCAL_EDGE, SSB_VOICE, WIDEBAND_BURST)
+    # plot on top.  Legend stays in PATTERN_ORDER for consistency with the
+    # analyzer's bar charts.
+    legend_handles: list = []
+    for pat in reversed(PATTERN_ORDER):
+        mask = labels == pat
+        if not mask.any():
+            continue
+        # Lighter classes get higher alpha so a single rare event still
+        # registers; the dense background uses lower alpha to avoid burying
+        # the foreground.
+        n_pat = int(mask.sum())
+        alpha = 0.20 if pat in ("ISOLATED", "SUSTAINED") else 0.65
+        size  = 3   if pat in ("ISOLATED", "SUSTAINED") else 6
+        ax.scatter(
+            ts_dt[mask], offset_khz[mask],
+            s=size, c=PATTERN_COLOURS[pat],
+            alpha=alpha, edgecolors='none', rasterized=True,
+        )
+    # Build a separate legend (each entry full-opacity, in PATTERN_ORDER).
+    for pat in PATTERN_ORDER:
+        n_pat = int((labels == pat).sum())
+        if n_pat == 0:
+            continue
+        legend_handles.append(Line2D(
+            [0], [0], marker='o', color='none',
+            markerfacecolor=PATTERN_COLOURS[pat], markeredgecolor='none',
+            markersize=8, label=f"{pat}  (n={n_pat:,})",
+        ))
+
+    # Reference lines: calling channel and Nyquist guard edges (±19 kHz).
+    ax.axhline(0,    color='black', ls='-',  lw=0.4, alpha=0.5)
+    ax.axhline(+19,  color='gray',  ls=':',  lw=0.6, alpha=0.5)
+    ax.axhline(-19,  color='gray',  ls=':',  lw=0.6, alpha=0.5)
+    ax.set_ylim(-25, 25)
+    ax.set_ylabel('kHz offset from calling')
+    ax.set_xlabel('Time (UTC)')
+    ax.grid(True, alpha=0.25)
+
+    # X-axis: auto-format dates (handles both single-day and multi-day spans)
+    locator   = mdates.AutoDateLocator(minticks=5, maxticks=10)
+    formatter = mdates.ConciseDateFormatter(locator)
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(formatter)
+
+    title_parts = ['Launches by pattern']
+    if n > max_points:
+        title_parts.append(f"(subsampled {max_points:,} of {n:,})")
+    else:
+        title_parts.append(f"(n={n:,})")
+    if date_label:
+        title_parts.append(date_label)
+    ax.set_title('  '.join(title_parts), fontsize=12)
+    ax.legend(handles=legend_handles, loc='upper right', fontsize=9,
+              framealpha=0.9)
+
+    fig.tight_layout()
+    return fig
+
+
 # ── Legacy CLI plot wrappers (kept for --no-gui mode) ─────────────────────────
 
 def plot_detection_rate(matched, wsjtx_only, out_path, date_label=''):
@@ -1715,12 +1861,32 @@ class CompareGUI(QtWidgets.QMainWindow):
             date_label=f"{date_label} @{my_grid}",
         )
 
+        # Launch-pattern plot: bound to same date window as the rest of the
+        # GUI, computed fresh from launches.jsonl by analyze_launches.
+        if date_str:
+            try:
+                _ds = datetime.strptime(date_str, "%Y%m%d").replace(tzinfo=timezone.utc)
+                launch_since = _ds
+                launch_until = _ds + timedelta(days=1)
+            except ValueError:
+                launch_since = None
+                launch_until = None
+        else:
+            launch_since = None
+            launch_until = None
+        launch_pattern_fig = _make_launch_pattern_fig(
+            MAP144_LAUNCHES, calling_khz=50260.0,
+            since=launch_since, until=launch_until,
+            date_label=date_label,
+        )
+
         # Close old figures to release memory
         for f in self._figs:
             f.clf()
         self._figs = [
             timeline_fig, detrate_fig, scatter_fig,
             detrate_byclass_fig, scatter_byclass_fig,
+            launch_pattern_fig,
         ]
 
         # ── Populate tabs ─────────────────────────────────────────────────────
@@ -1735,6 +1901,9 @@ class CompareGUI(QtWidgets.QMainWindow):
         self._tabs.addTab(_PlotPane(scatter_byclass_fig,
                                     f"{stem}_scatter_byclass"),
                           "SNR Scatter (by class)")
+        self._tabs.addTab(_PlotPane(launch_pattern_fig,
+                                    f"{stem}_launches"),
+                          "Launch Pattern")
 
         self._save_all_btn.setEnabled(True)
         n_total = len(matched) + len(wsjtx_only) + len(map144_only)
