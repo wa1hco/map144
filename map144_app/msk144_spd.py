@@ -290,6 +290,132 @@ def _sync_correlate_batch(c_batch: np.ndarray) -> tuple[np.ndarray, np.ndarray, 
     return _sync_correlate_batch_njit(c_batch, _SYNC_CB_CONJ)
 
 
+# ── Sync phase-derived features (#29) ────────────────────────────────────────
+# Computed at *launch* time only — single-channel, called rarely.  Adds three
+# physical-structure features the magnitude-only sync metric cannot expose:
+#
+#   sync_phase_coherence  ∈ [0, 1]  coherent / noncoherent magnitude ratio at
+#                                   the peak.  Real MSK144 → ≈ 1; impulse
+#                                   noise → ≈ 1/√(2·42) ≈ 0.109.
+#   sync_t_sample                   sub-sample peak position via parabolic
+#                                   interpolation of the three correlation
+#                                   magnitudes around ish_best.
+#   sync_freq_offset_hz             single-frame frequency-offset estimate
+#                                   from the phase rotation between the two
+#                                   sync sub-blocks (336 samples / 28 ms apart
+#                                   at FS = 12 kHz).  Bounded by Nyquist of the
+#                                   sub-block separation: ±FS/(2·336) ≈ ±17.86 Hz
+#                                   per phase wrap.
+
+#: Time separation between the two sync sub-blocks within a single MSK144 frame.
+_SYNC_BLOCK_DT_S: float = 336.0 / FS   # = 28.0 ms at 12 kHz
+
+
+def _sync_phase_features(
+    c: np.ndarray, ish_best: int,
+) -> tuple[float, float, float]:
+    """Compute (coherence, t_sample, freq_offset_hz) for one channel's sync window.
+
+    Parameters
+    ----------
+    c : complex64 array, shape (NSPM,)
+        Sync window for one channel — the same NSPM samples
+        :func:`_sync_correlate` saw on the same detection cycle.
+    ish_best : int
+        Peak shift index returned by the correlator for this channel.
+        Must be in ``[0, NSPM)``.
+
+    Returns
+    -------
+    coherence : float
+        ``|coherent_sum| / noncoherent_sum`` at ``ish_best``.  Bounded
+        ``[0, 1]``.
+    t_sample : float
+        Sub-sample peak position; equals ``ish_best`` plus the parabolic
+        interpolation offset in ``[-0.5, 0.5]``.  Wraps mod NSPM.
+    freq_offset_hz : float
+        Single-frame frequency offset estimate from the phase rotation
+        between the two sync sub-blocks (``ish_best..+41`` and
+        ``ish_best+336..+377``).  Aliasing ambiguity at multiples of
+        ``1/_SYNC_BLOCK_DT_S`` ≈ 35.7 Hz.
+
+    Notes
+    -----
+    Cost ≈ 3 × 42 multiplies + a few transcendentals ≈ sub-microsecond
+    per call.  Pure-Python implementation is fine for launch-rate use;
+    no need to push this into ``_sync_correlate_batch_njit`` (which
+    runs every detector cycle on all 48 channels).
+    """
+    if c.shape != (NSPM,):
+        raise ValueError(f"c.shape={c.shape} != (NSPM={NSPM},)")
+    if not (0 <= ish_best < NSPM):
+        raise ValueError(f"ish_best={ish_best} not in [0, NSPM={NSPM})")
+    cb_conj = _SYNC_CB_CONJ                      # (42,) complex64
+
+    # Doubled-buffer indexing: ct2[i + NSPM] == c[i % NSPM]; lets us
+    # index (ish_best + k) and (ish_best + k + 336) without a modulo.
+    ct2 = np.empty(2 * NSPM, dtype=np.complex64)
+    ct2[:NSPM] = c
+    ct2[NSPM:] = c
+
+    # Per-symbol contributions for the two sync sub-blocks at ish_best.
+    block_a = ct2[ish_best:        ish_best + 42]        # (42,) complex64
+    block_b = ct2[ish_best + 336:  ish_best + 336 + 42]  # (42,)
+    contrib_a = block_a * cb_conj                        # (42,) per-symbol product
+    contrib_b = block_b * cb_conj
+
+    acc_a = contrib_a.sum()
+    acc_b = contrib_b.sum()
+    acc_total = acc_a + acc_b                            # matches xmax magnitude
+
+    # 1. Phase coherence — coherent vs noncoherent at the peak.
+    # The noncoherent denominator is the sum of per-symbol magnitudes
+    # across both sub-blocks; this is what the coherent sum would
+    # equal if all 84 phasors were perfectly aligned.
+    coherent_mag = float(np.abs(acc_total))
+    noncoherent_mag = float(np.abs(contrib_a).sum() + np.abs(contrib_b).sum())
+    coherence = (coherent_mag / noncoherent_mag) if noncoherent_mag > 0 else 0.0
+
+    # 2. Sub-sample peak — parabolic interpolation needs xcc[ish±1].
+    # Re-run the correlator for the two neighbours only (cheap; same
+    # math as the inner loop of _sync_correlate_njit).  Indices wrap
+    # mod NSPM via the doubled buffer.
+    def _xcc_at(ish: int) -> float:
+        i = ish % NSPM
+        ba = ct2[i:        i + 42]
+        bb = ct2[i + 336:  i + 336 + 42]
+        return float(np.abs((ba * cb_conj).sum() + (bb * cb_conj).sum()))
+
+    y0 = coherent_mag                                # = xcc[ish_best]
+    y_neg = _xcc_at(ish_best - 1)
+    y_pos = _xcc_at(ish_best + 1)
+    denom = (y_neg - 2.0 * y0 + y_pos)
+    if denom == 0.0:
+        delta = 0.0
+    else:
+        delta = 0.5 * (y_neg - y_pos) / denom
+        # Clamp to ±0.5 — a parabolic fit can give larger values when
+        # the three points don't form a clean peak (edge of correlation
+        # ridge), and those large values aren't meaningful timing.
+        if delta > 0.5:
+            delta = 0.5
+        elif delta < -0.5:
+            delta = -0.5
+    t_sample = float(ish_best) + delta
+
+    # 3. Single-frame frequency offset — phase rotation between the two
+    # sub-blocks divided by their time separation.  Robust to overall
+    # carrier offset because both sub-blocks correlate against the
+    # same template; only the *relative* phase matters.
+    if abs(acc_a) > 0 and abs(acc_b) > 0:
+        phase_rot = float(np.angle(acc_b * np.conj(acc_a)))
+        freq_offset_hz = phase_rot / (2.0 * np.pi * _SYNC_BLOCK_DT_S)
+    else:
+        freq_offset_hz = 0.0
+
+    return coherence, t_sample, freq_offset_hz
+
+
 # Numba JIT compilation is lazy: the first call to each ``_sync_correlate_*_njit``
 # function triggers compilation (a few seconds to ~1 min depending on CPU and
 # whether fastmath optimisations have to be re-derived).  ``cache=True`` writes

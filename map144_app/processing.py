@@ -98,6 +98,7 @@ from .detection import extract_and_decode
 from .msk144_spd import (
     _sync_correlate as _msk144_sync_correlate,
     _sync_correlate_batch as _msk144_sync_correlate_batch,
+    _sync_phase_features as _msk144_sync_phase_features,
     NSPM as _SYNC_NSPM,
 )
 
@@ -223,7 +224,8 @@ _HI_MASK       = (_SQ_FREQ >=  _SQ_TONE_HZ - _SQ_NTOL_HZ) & \
 
 def _compute_sync_metric_db(sync_window,
                             hist_buf, hist_idx_attr, hist_cnt_attr,
-                            pct25_attr, pct25_ctr_attr, engine) -> np.ndarray:
+                            pct25_attr, pct25_ctr_attr, engine
+                            ) -> tuple[np.ndarray, np.ndarray]:
     """Per-channel coherent sync-correlation peak in dB above 25th-percentile.
 
     ``sync_window`` is shape (N_CHANNELS, NSPM) — the most recent NSPM samples
@@ -238,9 +240,18 @@ def _compute_sync_metric_db(sync_window,
     channels) instead of a Python ``for ch in range(48)`` loop — the loop
     version was the largest single hot spot in py-spy profiling (~25 % of
     total CPU on a 6-core i5 during noise bursts).
+
+    Returns
+    -------
+    metric_db : float32 (N_CHANNELS,)
+        dB above the rolling pct25 baseline.
+    ish_best_arr : int32 (N_CHANNELS,)
+        Per-channel peak shift index from the sync correlator.  Forwarded
+        unchanged from ``_sync_correlate_batch``; consumed at launch time
+        by ``_sync_phase_features`` (#29 phase-derived features).
     """
     sync_window_c64 = np.ascontiguousarray(sync_window, dtype=np.complex64)
-    _, peaks, _ = _msk144_sync_correlate_batch(sync_window_c64)
+    _, peaks, ish_best_arr = _msk144_sync_correlate_batch(sync_window_c64)
 
     # Rolling 25th-percentile baseline of sync magnitudes (one row per hop).
     idx = getattr(engine, hist_idx_attr)
@@ -263,7 +274,10 @@ def _compute_sync_metric_db(sync_window,
         pct25  = np.maximum(tmp[k], 1e-30)
         setattr(engine, pct25_attr, pct25)
 
-    return (10.0 * np.log10(np.maximum(peaks / pct25, 1e-30))).astype(np.float32)
+    return (
+        (10.0 * np.log10(np.maximum(peaks / pct25, 1e-30))).astype(np.float32),
+        ish_best_arr,
+    )
 
 
 def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
@@ -598,6 +612,8 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         sq_metric_v_only = pair_metric_v.copy()
         sync_metric_h = None
         sync_metric_v = None
+        sync_ish_best_h = None
+        sync_ish_best_v = None
 
         if ENABLE_SYNC_DETECT:
             # _sync_buf is FIFO-updated per chunk and always holds the most
@@ -605,7 +621,7 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
             # regardless of _ch_buf's drain state.  No cache fallback needed
             # (which previously produced stale-row banding under live Flex
             # operation where _ch_buf_end never reaches NSPM).
-            sync_metric_h = _compute_sync_metric_db(
+            sync_metric_h, sync_ish_best_h = _compute_sync_metric_db(
                 self._sync_buf,
                 self._sync_metric_hist_buf, '_sync_metric_hist_idx',
                 '_sync_metric_hist_cnt', '_sync_pct25', '_sync_pct25_ctr',
@@ -614,13 +630,15 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
             pair_metric_h = np.maximum(pair_metric_h, sync_metric_h)
 
             if ch_block_v is not None:
-                sync_metric_v = _compute_sync_metric_db(
+                sync_metric_v, sync_ish_best_v = _compute_sync_metric_db(
                     self._sync_buf_v,
                     self._sync_metric_hist_buf_v, '_sync_metric_hist_idx_v',
                     '_sync_metric_hist_cnt_v', '_sync_pct25_v', '_sync_pct25_ctr_v',
                     self,
                 )
                 pair_metric_v = np.maximum(pair_metric_v, sync_metric_v)
+            else:
+                sync_ish_best_v = None
 
         # Trigger on either channel; display the max for the combined heatmap
         pair_metric = np.maximum(pair_metric_h, pair_metric_v)
@@ -874,6 +892,36 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                 'n_cluster_chan':    int(len(_cl_all)),
                 'det_source':        det_source,
             }
+
+            # ── #29: sync-correlator phase-derived features ─────────────────
+            # Three physical-structure features the magnitude-only sync
+            # metric cannot expose.  Computed only at launch time (rare
+            # event), so they don't affect the detector hot path.  None when
+            # the sync detector path is disabled or didn't run on this hop.
+            if sync_ish_best_h is not None:
+                _coh_h, _ts_h, _foff_h = _msk144_sync_phase_features(
+                    np.ascontiguousarray(self._sync_buf[ch_k], dtype=np.complex64),
+                    int(sync_ish_best_h[ch_k]),
+                )
+                launch_metrics['sync_phase_coherence_h'] = round(_coh_h, 3)
+                launch_metrics['sync_t_sample_h']         = round(_ts_h, 2)
+                launch_metrics['sync_freq_offset_hz_h']   = round(_foff_h, 2)
+            else:
+                launch_metrics['sync_phase_coherence_h'] = None
+                launch_metrics['sync_t_sample_h']         = None
+                launch_metrics['sync_freq_offset_hz_h']   = None
+            if sync_ish_best_v is not None:
+                _coh_v, _ts_v, _foff_v = _msk144_sync_phase_features(
+                    np.ascontiguousarray(self._sync_buf_v[ch_k], dtype=np.complex64),
+                    int(sync_ish_best_v[ch_k]),
+                )
+                launch_metrics['sync_phase_coherence_v'] = round(_coh_v, 3)
+                launch_metrics['sync_t_sample_v']         = round(_ts_v, 2)
+                launch_metrics['sync_freq_offset_hz_v']   = round(_foff_v, 2)
+            else:
+                launch_metrics['sync_phase_coherence_v'] = None
+                launch_metrics['sync_t_sample_v']         = None
+                launch_metrics['sync_freq_offset_hz_v']   = None
 
             if not getattr(self, '_analysis_no_decode', False):
                 t = threading.Thread(
