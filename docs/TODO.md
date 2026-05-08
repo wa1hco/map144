@@ -286,6 +286,48 @@ See `project_ml_qso_classifier_plan` memory for the full plan; see
     Requires `compare_decoders.py` linkage to mark each launch with its
     QSO outcome.
 
+40. ⬜ **Polyphase channelizer prototype FIR stopband ripple** —
+    surfaced by the `Diagnostics → Show raw power` toggle (commits
+    `cecce87` / `5358177` / `3272457`). With the rolling pct25
+    normalisation bypassed, the per-channel raw spectrum shows ~7
+    horizontal "bands" between channels separated by 1-channel-wide
+    darker lines, with **non-uniform widths and spacing** in both
+    the squared-FFT and sync detection panels. Source is upstream
+    of both detectors — the channelizer's per-channel output itself.
+
+    User-confirmed evidence (2026-05-08): the amplitude of the
+    energy in the darker bands **varies with nearby-frequency
+    activity**. That's the fingerprint of stopband leakage: a
+    strong signal at one channel leaks into others through the
+    prototype FIR's imperfect stopband, and the leakage amount
+    depends on (a) where the signal sits on the FIR's stopband
+    ripple curve and (b) its amplitude. Channels at FIR ripple
+    notches see less alias (darker), channels at ripple peaks see
+    more.
+
+    Why it matters: cross-channel noise-floor variation that today
+    is partially absorbed by per-channel pct25. With `#32`
+    BandStateTracker Stage 2's cross-channel pct25 reference, the
+    variation becomes a *bias* against ripple-peak channels (their
+    noise floor looks higher than the cross-channel median, so the
+    threshold sits above their actual noise → reduced sensitivity
+    in those channels). Worth flattening at the source.
+
+    Fix path: redesign the channelizer's prototype FIR. Trade-offs
+    are filter length (more taps = sharper transition + more CPU)
+    vs stopband attenuation depth + ripple amplitude (Parks-McClellan
+    or Kaiser-window design with target stopband floor). Today's
+    prototype is in [channelizer.py](../map144_app/channelizer.py);
+    measure its actual stopband response first to set targets.
+
+    Operationally this is lower priority than `#20` (sensitivity
+    Step 2) and the `#33`–`#39` ML programme — it's a second-order
+    cleanup that doesn't generate false triggers, just causes
+    cross-channel sensitivity bias. Worth doing before `#32`'s
+    cross-channel pct25 ships, since otherwise the cross-channel
+    median has to compensate for FIR-induced bias instead of just
+    real-world noise variation.
+
 ---
 
 ## Sequencing — what blocks what
