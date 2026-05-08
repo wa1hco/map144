@@ -12,7 +12,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""DecoderBlock — Phase 4 #11 (skeleton, Stage 1).
+"""DecoderBlock — Phase 4 #11.
 
 See ``docs/block-stream-design.md`` §6 (block contract) and §6.2 (Tap).
 This block consumes both:
@@ -27,20 +27,30 @@ This block consumes both:
 (:class:`ReporterBlock` for PSKReporter / DXcluster, the future
 Decode-panel sub-feature of :class:`DisplayBlock`).
 
-Stage 1 (this commit): structural scaffold.
-  - IQ ring buffer fill from the sample stream
-  - Detection-event drain
-  - Decode-worker dispatch (semaphore-limited, daemon threads)
-  - Worker stub that emits a placeholder DecodeEvent
-  - All four CLAUDE.md-relevant invariants documented
+Build history
+-------------
+- **Stage 1 (commit 23a55d2)**: structural scaffold — IQ ring fill,
+  detection-event drain, worker dispatch with semaphore + daemon
+  threads, stub worker, 8 unit tests.
+- **Stage 2 (this commit)**: workers call ``detection.extract_and_decode``
+  for real SPD + jt9 decode work.  The function is unchanged; we
+  provide it with a per-block ring + ring_state callbacks so it sees
+  the same interface it sees today from the legacy engine.  This
+  minimises risk: the DSP / SPD / jt9 path is bit-for-bit identical
+  between legacy and Block-form runs, validated by the §10 bit-exact
+  replay gate.  ``_DecodeQueueShim`` adapts the function's
+  ``decode_queue.put({…})`` calls into ``DecodeEvent`` emissions on
+  the block's output stream.
 
-Stage 2 (next commit): wire workers to ``detection.extract_and_decode``
-for real SPD + jt9 decode work.  The extract_and_decode function stays
-unchanged; we provide it with a per-block ring + ring_state callbacks
-so it sees the same interface it sees today from the legacy engine.
-This minimises risk: the DSP / SPD / jt9 path is bit-for-bit identical
-between legacy and Block-form runs, validated by the §10 bit-exact
-replay gate.
+Out of scope (separate TODOs)
+-----------------------------
+- **Period-mode decode** for weak-signal propagation modes (forward
+  scatter, tropo, airplane, sporadic-E).  See TODO ``#42`` and
+  ``project_propagation_modes`` memory.  IQ ring is sized to 15 s
+  (a full WSJT period) to ready it for that work; burst mode here
+  only reads ±1.7 s.
+- **Period-end attempt-tracker / signature-aware claim** for
+  per-(channel, period) dedup.  Lands with ``#42`` and ``#36``.
 
 Threading model (§4 — one thread per block, plus pooled decode workers)
 -----------------------------------------------------------------------
@@ -77,6 +87,7 @@ from typing import Any
 
 import numpy as np
 
+from ..detection import extract_and_decode
 from .block import Block
 from .types import BlockConfig, Event, Record, StreamClosed
 
@@ -86,10 +97,6 @@ log = logging.getLogger(__name__)
 #: Decode-event ``kind`` field convention.  Single value to keep the
 #: protocol surface narrow; payload differentiates outcomes.
 DECODE_EVENT_KIND = "decode"
-
-#: Stage-1 placeholder marker for events emitted by the stub decode
-#: worker.  Will be removed in Stage 2 once real decode work is wired.
-_STAGE1_STUB_OUTCOME = "stub_pending"
 
 
 @dataclass
@@ -128,11 +135,24 @@ class DecoderBlockConfig(BlockConfig):
     # Empty string disables WAV save (useful for tests).
     output_dir: str = ""
 
+    # Receiver tuned-centre frequency (MHz) for log/dial reporting.
+    # Combined with the detection event's fc_hz to compute the on-air
+    # carrier frequency for decode logging and PSKReporter spotting.
+    center_freq_mhz: float = 50.260
+
+    # Dual-polarisation flag.  When True the ring is expected to carry
+    # an interleaved H/V signal (legacy convention); CombinerBlock
+    # already merges to mono before this block in the new pipeline,
+    # so default False.
+    dual_pol: bool = False
+
+    # Optional override for jt9 CLI args; None → JT9_BASE_ARGS from
+    # msk144_spd.  Useful for test runs (-d 0 / -p 15 etc.).
+    jt9_args: list | None = None
+
     # Get timeout for blocking stream reads in tick() — short enough
     # for responsive shutdown.
     get_timeout_s: float = 0.250
-
-    # Stage 2 will add: jt9_args, dual_pol, center_freq_mhz, etc.
 
 
 class DecoderBlock(Block):
@@ -444,12 +464,25 @@ class DecoderBlock(Block):
     def _worker_run(self, det_evt: Event, gen_at_dispatch: int) -> None:
         """Decode-worker entry point.  Runs in its own daemon thread.
 
-        Stage 1: stub — emits a placeholder DecodeEvent immediately and
-        returns.  Stage 2 will replace the body with a call into
-        ``map144_app.detection.extract_and_decode`` (or a slimmed-down
-        equivalent), passing it the block's ring + ``_ring_state`` /
-        ``_ring_gen_get`` callbacks so the function sees the same
-        interface it consumes from the legacy engine today.
+        Calls into ``map144_app.detection.extract_and_decode`` — the
+        same battle-tested SPD + jt9 fallback path the legacy engine
+        uses.  We pass the block's ring + ``_ring_state`` / ``_ring_gen_get``
+        callbacks so the function sees the same interface it consumes
+        from the legacy engine today; the DSP / SPD / jt9 path is thus
+        bit-for-bit identical between legacy and Block-form runs
+        (required for the §10 bit-exact replay validation gate).
+
+        Outcomes from extract_and_decode arrive through a queue shim
+        (``_DecodeQueueShim``) that converts ``decode_queue.put({…})``
+        calls into ``_emit_decode_event`` calls on this block's
+        ``decodes`` output stream.
+
+        Burst-mode only for now (1.7-s window).  Period-mode decoding
+        for weak-signal propagation modes (forward scatter / tropo /
+        airplane / Es) is TODO ``#42`` — see ``project_propagation_modes``
+        memory.  Per-(channel, period) attempt-tracking added there;
+        plug-in point is here, after this burst-mode call returns
+        no_decode and CPU budget allows.
         """
         try:
             # Quick generation check before wasting work — if the source
@@ -457,20 +490,89 @@ class DecoderBlock(Block):
             if self._ring_gen_get() != gen_at_dispatch:
                 return
 
-            # Stage-1 placeholder emission.  Carries the source detection
-            # event's payload forward so the contract shape can be
-            # exercised in tests; outcome marks it as the stub.
-            self._emit_decode_event(
-                det_evt=det_evt,
-                outcome=_STAGE1_STUB_OUTCOME,
-                message="",
-                payload_extra={},
+            cfg: DecoderBlockConfig = self.config  # type: ignore[assignment]
+
+            # Construct a per-launch detect_ts string in the same shape
+            # the legacy engine uses (UTC '%Y-%m-%d_%H:%M:%S.%f' truncated
+            # to ms).  Use the detection event's wall clock so the stamp
+            # tracks signal time, not worker-thread time.
+            from datetime import datetime, timezone
+            det_dt = datetime.fromtimestamp(
+                det_evt.wall_clock_at_production, tz=timezone.utc,
             )
+            detect_ts = det_dt.strftime('%Y-%m-%d_%H:%M:%S.%f')[:21]
+
+            # marker_id — used by the legacy GUI overlay to correlate a
+            # heatmap circle with its decode outcome.  In the Block path
+            # the equivalent role is played by the DecodeEvent → marker
+            # join in DisplayBlock; we still pass a unique int so the
+            # extract_and_decode internals work unchanged.
+            marker_id = id(det_evt) & 0x7FFF_FFFF
+
+            # Queue shim: converts decode_queue.put({...}) calls into
+            # DecodeEvent emissions on this block's output stream.
+            shim = _DecodeQueueShim(self, det_evt)
+
+            # Forward any per-launch metric fields the detection event
+            # carries (n_chans_300ms, sync_phase_coherence_h, etc.) to
+            # extract_and_decode so they end up in launches.jsonl.
+            launch_metrics = {
+                k: v for k, v in (det_evt.payload or {}).items()
+                if k not in {
+                    "channel_index", "fc_hz", "source", "cluster_channels",
+                    "cluster_span_ch", "pair_metric_db",
+                    "sync_metric_db", "sq_metric_db",
+                }
+            } or None
+
+            # Lookup via module attribute (not the local name binding) so
+            # tests can monkey-patch ``decoder_block.extract_and_decode``
+            # to a stub.  Production runs see the real function.
+            import sys as _sys
+            _decode_fn = getattr(
+                _sys.modules[__name__], "extract_and_decode",
+            )
+            _decode_fn(
+                iq_ring=self._iq_ring,
+                ring_state_fn=self._ring_state,
+                detect_sample=int(det_evt.occurred_at_sample),
+                sample_rate=int(cfg.sample_rate_hz),
+                fc_hz=float(det_evt.payload.get('fc_hz', 0.0)),
+                output_dir=cfg.output_dir,
+                t_in_window=0.0,
+                decode_queue=shim,
+                marker_id=marker_id,
+                ring_gen=gen_at_dispatch,
+                ring_gen_fn=self._ring_gen_get,
+                center_freq_mhz=cfg.center_freq_mhz,
+                detect_ts=detect_ts,
+                jt9_args=cfg.jt9_args,
+                dual_pol=cfg.dual_pol,
+                iq_t0_wall=self._iq_t0_wall,
+                det_source=str(det_evt.payload.get('source', 'sq')),
+                launch_metrics=launch_metrics,
+            )
+        except Exception:
+            log.exception(
+                "%s: decode worker failed for detection at sample %d",
+                self.name, det_evt.occurred_at_sample,
+            )
+            # Emit an error event so downstream consumers see something.
+            try:
+                self._emit_decode_event(
+                    det_evt=det_evt,
+                    outcome="error",
+                    message="",
+                    payload_extra={},
+                )
+            except Exception:
+                pass
         finally:
             self._decode_sem.release()
             with self._workers_lock:
                 self._workers.discard(threading.current_thread())
             self._n_decode_completed += 1
+
 
     def _emit_decode_event(
         self,
@@ -528,3 +630,46 @@ class DecoderBlock(Block):
             "ring_gen":             self._ring_gen,
         })
         return base
+
+
+class _DecodeQueueShim:
+    """Adapter that lets ``extract_and_decode`` (legacy ``decode_queue.put``
+    interface) emit DecodeEvents on a :class:`DecoderBlock`'s output
+    stream without modification.
+
+    Every dict that ``extract_and_decode`` puts on the queue contains an
+    ``outcome`` key ("decoded" / "no_decode" / "timeout" / "error") plus
+    optional fields (``message``, ``jt9_snr``, ``decoder``, etc.).  We
+    forward all of them as ``payload_extra`` so downstream consumers
+    (``ReporterBlock``, the future Decode-panel sub-feature of
+    DisplayBlock) see the full information.
+    """
+
+    __slots__ = ("_block", "_det_evt")
+
+    def __init__(self, block: "DecoderBlock", det_evt: Event):
+        self._block = block
+        self._det_evt = det_evt
+
+    def put(self, item: dict) -> None:
+        outcome = str(item.get("outcome", "unknown"))
+        message = str(item.get("message", ""))
+        # Strip fields we already place at top level / on the Event itself
+        # so payload_extra carries only the genuinely new info.
+        extra = {
+            k: v for k, v in item.items()
+            if k not in {"outcome", "message", "marker_id"}
+        }
+        # Drop large in-memory blobs — DecodeEventStream readers don't
+        # want raw audio attached to every event (the WAV file already
+        # carries the audio); keep marker_id for legacy correlation
+        # though, by hoisting it in if present.
+        extra.pop("audio", None)
+        if "marker_id" in item:
+            extra["marker_id"] = item["marker_id"]
+        self._block._emit_decode_event(
+            det_evt=self._det_evt,
+            outcome=outcome,
+            message=message,
+            payload_extra=extra,
+        )

@@ -58,6 +58,34 @@ from map144_app.blocks import (  # noqa: E402
     make_event_stream,
     make_sample_stream,
 )
+from map144_app.blocks import decoder_block as _decoder_block_mod  # noqa: E402
+
+
+def _stub_extract_and_decode(decode_queue, marker_id, **kwargs):
+    """Test stub for ``extract_and_decode``.  Emits a deterministic
+    no_decode outcome via the decode_queue so tests can verify the
+    block's queue-shim wiring without invoking real DSP / SPD / jt9.
+    """
+    if decode_queue is not None:
+        decode_queue.put({
+            "marker_id": marker_id,
+            "outcome":   "no_decode",
+            "decoder":   "test_stub",
+        })
+
+
+def _stub_decoded_extract_and_decode(decode_queue, marker_id, **kwargs):
+    """Test stub that emits a 'decoded' outcome (success path)."""
+    if decode_queue is not None:
+        decode_queue.put({
+            "marker_id": marker_id,
+            "outcome":   "decoded",
+            "decoder":   "test_stub",
+            "message":   "TEST DE WA1HCO",
+            "jt9_snr":   12,
+            "t_sec":     7.5,
+            "radio_khz": 50260.5,
+        })
 
 
 SR_IQ = 48_000
@@ -202,6 +230,15 @@ class TestRingIngest(unittest.TestCase):
 
 class TestDetectionDispatch(unittest.TestCase):
 
+    def setUp(self):
+        # Replace the real decoder with a deterministic stub for these
+        # structural tests.  Restored in tearDown.
+        self._real_decode_fn = _decoder_block_mod.extract_and_decode
+        _decoder_block_mod.extract_and_decode = _stub_extract_and_decode
+
+    def tearDown(self):
+        _decoder_block_mod.extract_and_decode = self._real_decode_fn
+
     def test_detection_event_dispatches_one_decode_event(self):
         h = _Harness()
         h.rt.start()
@@ -219,10 +256,36 @@ class TestDetectionDispatch(unittest.TestCase):
         self.assertEqual(e.kind, DECODE_EVENT_KIND)
         self.assertEqual(e.occurred_at_sample, 512)
         self.assertEqual(e.payload.get("channel_index"), 10)
-        self.assertEqual(e.payload.get("outcome"), "stub_pending")
+        self.assertEqual(e.payload.get("outcome"), "no_decode")
+        self.assertEqual(e.payload.get("decoder"), "test_stub")
         # signal_wall_clock forwarded from detection event
         self.assertAlmostEqual(e.payload.get("signal_wall_clock"), 100.0,
                                places=6)
+
+    def test_decoded_outcome_carries_message_and_snr(self):
+        # Override the stub for this test to emit a 'decoded' outcome
+        # with metadata, verifying _DecodeQueueShim forwards extras.
+        _decoder_block_mod.extract_and_decode = _stub_decoded_extract_and_decode
+
+        h = _Harness()
+        h.rt.start()
+        try:
+            h.iq.put(_iq_record(start_sample=0, n=1024))
+            h.det.put(_detection_event(occurred_at_sample=512,
+                                       channel_index=3))
+            time.sleep(0.2)
+            decodes = _drain(h.dec)
+        finally:
+            h.rt.stop(timeout_s=1.0)
+
+        self.assertEqual(len(decodes), 1)
+        e = decodes[0]
+        self.assertEqual(e.payload.get("outcome"), "decoded")
+        self.assertEqual(e.payload.get("message"), "TEST DE WA1HCO")
+        self.assertEqual(e.payload.get("jt9_snr"), 12)
+        self.assertEqual(e.payload.get("decoder"), "test_stub")
+        # marker_id forwarded so legacy GUI overlay correlation still works
+        self.assertIn("marker_id", e.payload)
 
     def test_pool_full_drops_extra_detections(self):
         # max_concurrent=1 so the second simultaneous dispatch loses.
@@ -310,6 +373,13 @@ class TestRingGeneration(unittest.TestCase):
 
 
 class TestStats(unittest.TestCase):
+
+    def setUp(self):
+        self._real_decode_fn = _decoder_block_mod.extract_and_decode
+        _decoder_block_mod.extract_and_decode = _stub_extract_and_decode
+
+    def tearDown(self):
+        _decoder_block_mod.extract_and_decode = self._real_decode_fn
 
     def test_stats_populated_on_shutdown(self):
         h = _Harness()
