@@ -503,14 +503,45 @@ class DetectorBlock(Block):
             k: v - 1 for k, v in self._detect_cooldowns.items() if v > 1
         }
 
-        # Suppress edge / DC channels (legacy convention).
+        # Suppress edge / DC channels.
+        #
+        # Nyquist edge: the legacy "_nyquist_ch = N_CHANNELS // 2" only
+        # works when channel_offset_hz is exactly half the spacing.  In
+        # the USB-convention case (channel_offset_hz=1500, +1.5 channels
+        # off-centre), the actual IF Nyquist sits at
+        #     n_channels/2 - channel_offset_hz/channel_spacing_hz
+        # ≈ 22.5 for the typical 48-channel × 1 kHz bank.  Suppressing
+        # ch 0..3 and 44..47 instead of [22.5 ± edge_skip] leaves the
+        # rolloff zone (ch_k ≈ 19 in IF, ch_signed +19 on-air) unmasked
+        # — observed in launch-pattern analysis as a ~6× false-trigger
+        # rate at 50279 kHz (rule "PERSISTENT_NODECODE", memory entry
+        # ``project_launch_pattern_findings``).  Fix landed in
+        # processing.py commit b318072; we propagate the same wrap-aware
+        # Nyquist computation here so the Block path matches.
+        #
+        # DC: channel 0 is DC plus LO leakage; legacy suppresses ch 0
+        # through dc_skip inclusive.
         edge_skip = cfg.edge_ch_skip
         dc_skip = cfg.dc_ch_skip
         nch = cfg.n_channels
         suppress_mask = np.zeros(nch, dtype=bool)
+
         if edge_skip > 0:
-            suppress_mask[:edge_skip] = True
-            suppress_mask[nch - edge_skip:] = True
+            ch_offset_in_channels = (
+                cfg.channel_offset_hz / float(cfg.channel_spacing_hz)
+            )
+            nyquist_ch_real = (nch / 2.0) - ch_offset_in_channels
+            ch_idx_arr = np.arange(nch, dtype=np.float64)
+            # Wrap-aware distance (handles channels near both ends of
+            # the FFT folding to the same IF location).
+            dist_to_nyquist = np.minimum(
+                np.minimum(
+                    np.abs(ch_idx_arr - nyquist_ch_real),
+                    np.abs(ch_idx_arr - nyquist_ch_real - nch),
+                ),
+                np.abs(ch_idx_arr - nyquist_ch_real + nch),
+            )
+            suppress_mask |= (dist_to_nyquist <= edge_skip)
         if dc_skip > 0:
             suppress_mask[:dc_skip + 1] = True   # ch 0 is DC; skip 0..dc_skip inclusive
         eligible = pair_metric.copy()
@@ -661,8 +692,20 @@ class DetectorBlock(Block):
     # --- Event emission -----------------------------------------------
 
     def _fc_hz_for_channel(self, ch_idx: int) -> float:
+        """Convert unsigned FFT-bin channel index to baseband fc_hz.
+
+        Channel indices 0..N/2 represent positive-frequency offsets from
+        IQ DC; indices N/2+1..N-1 wrap to negative offsets.  The legacy
+        path does the same mapping (processing.py:952), so a signal at
+        ch_idx=42 in a 48-channel bank actually sits at -6 kHz from DC,
+        not +42 kHz.  Without the wrap, fc_hz for negative-side channels
+        comes out 48 kHz too high and extract_and_decode mixes the
+        signal to the wrong audio frequency — no decode possible.
+        """
         cfg: DetectorBlockConfig = self.config  # type: ignore[assignment]
-        return float(ch_idx) * cfg.channel_spacing_hz + cfg.channel_offset_hz
+        n = int(cfg.n_channels)
+        ch_signed = int(ch_idx) if int(ch_idx) <= n // 2 else int(ch_idx) - n
+        return float(ch_signed) * cfg.channel_spacing_hz + cfg.channel_offset_hz
 
     def _emit_metric_record(
         self,

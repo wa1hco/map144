@@ -321,12 +321,15 @@ class TestEdgeChannelSuppress(unittest.TestCase):
         # We can only test this through _detect_one_cycle since the
         # masking happens there, not in _cluster_gate.  Bypass DSP by
         # writing pair_metric directly through a stubbed compute path.
+        # ch 10 is well clear of both DC (0..dc_skip) and the
+        # wrap-aware Nyquist mask (≈ ch 24 ± edge_skip with default
+        # channel_offset_hz=0).
         det = _make_detector()
         nch = det.config.n_channels  # type: ignore[union-attr]
         # Stub the compute methods to return a controlled metric.
         big = np.full(nch, 0.0, dtype=np.float32)
         big[0] = 10.0   # DC channel — should be suppressed
-        big[20] = 10.0  # ordinary — should trigger
+        big[10] = 10.0  # ordinary — should trigger
         det._compute_sq_metric_db = lambda _b: big.copy()  # type: ignore[method-assign]
         det._compute_sync_metric_db = lambda: big.copy()    # type: ignore[method-assign]
 
@@ -342,9 +345,9 @@ class TestEdgeChannelSuppress(unittest.TestCase):
                 out_events.append(events.get(timeout=0.01))
         except Exception:
             pass
-        # Should have exactly one event for ch 20, none for ch 0.
+        # Should have exactly one event for ch 10, none for ch 0.
         self.assertEqual(len(out_events), 1)
-        self.assertEqual(out_events[0].payload["channel_index"], 20)
+        self.assertEqual(out_events[0].payload["channel_index"], 10)
 
 
 # ---------------------------------------------------------------------
@@ -356,12 +359,14 @@ class TestDetectionEventPayload(unittest.TestCase):
     """Detection events carry the §6 payload fields."""
 
     def test_event_fields(self):
+        # Use ch 10 — clear of the wrap-aware Nyquist mask (centred
+        # near ch 23.5 for offset=500) AND of the DC mask.
         det = _make_detector(channel_offset_hz=500.0, channel_spacing_hz=1000.0)
         nch = det.config.n_channels  # type: ignore[union-attr]
         sync_db = np.zeros(nch, dtype=np.float32)
         sq_db = np.zeros(nch, dtype=np.float32)
-        sync_db[20] = 6.0
-        sq_db[20] = 4.5
+        sync_db[10] = 6.0
+        sq_db[10] = 4.5
         det._compute_sync_metric_db = lambda: sync_db.copy()  # type: ignore[method-assign]
         det._compute_sq_metric_db = lambda _b: sq_db.copy()    # type: ignore[method-assign]
 
@@ -375,17 +380,80 @@ class TestDetectionEventPayload(unittest.TestCase):
         self.assertEqual(out.sample_rate_hz, det.config.sample_rate_hz)  # type: ignore[union-attr]
         self.assertAlmostEqual(out.wall_clock_at_production, 42.5, places=6)
         p = out.payload
-        self.assertEqual(p["channel_index"], 20)
-        # fc_hz = 20 * 1000 + 500 = 20500
-        self.assertAlmostEqual(p["fc_hz"], 20_500.0)
+        self.assertEqual(p["channel_index"], 10)
+        # fc_hz = 10 (signed, since 10 <= 24) * 1000 + 500 = 10500
+        self.assertAlmostEqual(p["fc_hz"], 10_500.0)
         self.assertAlmostEqual(p["sync_metric_db"], 6.0, places=4)
         self.assertAlmostEqual(p["sq_metric_db"], 4.5, places=4)
         # max → pair_metric = 6.0
         self.assertAlmostEqual(p["pair_metric_db"], 6.0, places=4)
         # both above threshold (3.0) → "both"
         self.assertEqual(p["source"], "both")
-        self.assertEqual(p["cluster_channels"], [20])
+        self.assertEqual(p["cluster_channels"], [10])
         self.assertEqual(p["cluster_span_ch"], 0)
+
+
+class TestSignedChannelFcHz(unittest.TestCase):
+    """Negative-frequency-half channels (ch_idx > N/2) must wrap to a
+    signed index when computing fc_hz — same convention as legacy
+    processing.py:952.  Without the wrap, fc_hz comes out 48 kHz too
+    high and extract_and_decode mixes the signal to the wrong audio
+    frequency (no decode possible).
+    """
+
+    def test_high_channel_index_wraps_to_negative_fc_hz(self):
+        det = _make_detector(channel_offset_hz=1500.0, channel_spacing_hz=1000.0)
+        # ch_idx 42 = ch_signed -6: fc_hz = -6 * 1000 + 1500 = -4500
+        self.assertAlmostEqual(det._fc_hz_for_channel(42), -4500.0, places=4)
+        # ch_idx 47 = ch_signed -1: fc_hz = -1 * 1000 + 1500 = +500
+        self.assertAlmostEqual(det._fc_hz_for_channel(47), 500.0, places=4)
+        # ch_idx 5 (positive half) unaffected: fc_hz = 5 * 1000 + 1500 = 6500
+        self.assertAlmostEqual(det._fc_hz_for_channel(5), 6500.0, places=4)
+        # ch_idx 24 (boundary): treated as positive: 24 * 1000 + 1500 = 25500
+        self.assertAlmostEqual(det._fc_hz_for_channel(24), 25_500.0, places=4)
+
+
+class TestNyquistMaskUSBConvention(unittest.TestCase):
+    """The Nyquist edge mask must follow the actual IF Nyquist when
+    channel_offset_hz != 0 — not the naive 0..edge_skip / N-edge_skip..N
+    band edges.  See ``project_launch_pattern_findings`` memory: the
+    pre-fix behaviour left the rolloff zone (ch_k ≈ 19 with USB
+    convention) unmasked, producing a ~6× false-trigger rate at
+    50279 kHz.  Same fix as processing.py commit b318072.
+    """
+
+    def test_usb_convention_masks_real_nyquist(self):
+        # USB convention: channel_offset_hz = 1500 → IF Nyquist sits at
+        # ch_k = 24 - 1.5 = 22.5.  With edge_skip=4, channels in
+        # [18.5, 26.5] are suppressed.
+        det = _make_detector(
+            channel_offset_hz=1500.0, channel_spacing_hz=1000.0,
+            edge_ch_skip=4, dc_ch_skip=3,
+        )
+        nch = det.config.n_channels  # type: ignore[union-attr]
+
+        # Strong signal at ch 19 — used to slip through the broken mask.
+        # Should now be SUPPRESSED.
+        big = np.zeros(nch, dtype=np.float32)
+        big[19] = 10.0
+        det._compute_sq_metric_db = lambda _b: big.copy()  # type: ignore[method-assign]
+        det._compute_sync_metric_db = lambda: big.copy()    # type: ignore[method-assign]
+
+        events = make_event_stream("evt", capacity=8, durable=True)
+        det.outputs[det.config.detection_port_name] = events  # type: ignore[union-attr]
+        det._detect_one_cycle(wall_clock_for_events=1.0)
+
+        out_events = []
+        try:
+            while True:
+                out_events.append(events.get(timeout=0.01))
+        except Exception:
+            pass
+        self.assertEqual(
+            len(out_events), 0,
+            "ch_k=19 sits inside the corrected Nyquist mask "
+            "[18.5 ± 4] for USB convention; should be suppressed.",
+        )
 
 
 # ---------------------------------------------------------------------
