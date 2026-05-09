@@ -155,18 +155,22 @@ NB_SHORT_IMPULSE_THRESH = 5    # FFT blocks where ≤ this many samples exceed t
                                 # the sample-precise TD mask is used instead.
 # Alias for readability — value lives in ``channel_plan`` (UI + detect share it).
 _EDGE_CH_SKIP      = NYQUIST_EDGE_CHANNEL_SKIP
-# NOTE: not currently used anywhere in processing.py.  The MAP144
-# operating-point assumption is that the radio is tuned with a small
-# frequency offset from the calling freq so the SDR's DC artifact (real
-# analog-IQ DC on B210, zero on Flex's digital-IQ) lands OUTSIDE the
-# 48 kHz channelizer passband.  Under that assumption channels near
-# ch_signed=0 are LEGITIMATE operating frequencies (real QSOs at
-# calling±1/±2 kHz) and must NOT be suppressed.  The DetectorBlock
-# (Block-pipeline path) carries a configurable ``dc_ch_skip`` so a
-# future deployment that violates the LO-offset assumption can opt in,
-# but its default is 0 to match this legacy behaviour.  This constant
-# is kept for a future opt-in or for documentation; do not re-wire it
-# without revisiting the LO-offset architectural decision.
+# NOTE: not currently used anywhere in processing.py.  MAP144's
+# detection invariant is that the 48 kHz IQ at the engine input
+# always has CLEAN DC — channels at ch_signed = 0, ±1, ±2 are
+# LEGITIMATE operating frequencies (real QSOs at calling±1/±2 kHz
+# happen routinely) and must NOT be suppressed.  How DC stays clean
+# depends on the radio:
+#   - Flex (digital IQ, oversampled): pan center IS the calling freq,
+#     DC genuinely zero by design — no offset, no decimation in MAP144.
+#   - B210 (analog IQ, real DC artifact): handled at the RADIO CONFIG
+#     layer — tune offset + run at higher sample rate + decimate to
+#     48 kHz, which moves the real DC out of band before MAP144 sees
+#     the IQ.  Not MAP144's responsibility.
+# The DetectorBlock (Block-pipeline path) carries a configurable
+# ``dc_ch_skip`` as a last-resort hardware escape hatch, but its
+# default is 0 to match this invariant.  See memory entry
+# ``project_dc_lo_offset`` for the full rationale.
 _DC_CH_SKIP        = 0          # default: no DC suppression (see note above)
 _SQ_TONE_HZ        = 1000.0     # expected squared-domain tone offset from DC
 _SQ_NTOL_HZ        = 200.0      # half-width of each tone search window

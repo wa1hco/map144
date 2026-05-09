@@ -130,13 +130,19 @@ class DetectorBlockConfig(BlockConfig):
     enable_sync_detect: bool = True
     enable_sq_detect: bool = True
     edge_ch_skip: int = _EDGE_CH_SKIP
-    # _DC_CH_SKIP is *defined* in processing.py but not currently
-    # *used* by the legacy detector — i.e. legacy does not suppress
-    # near-DC channels at all.  For the Block path to match legacy
-    # (cut-over parity), default ``dc_ch_skip=0`` here.  Tests that
-    # specifically validate the DC-mask machinery override to 3.
-    # If we ever decide near-DC suppression IS the right default, it
-    # should land in legacy first to keep both paths in sync.
+    # MAP144's detection invariant: the 48 kHz IQ at the engine input
+    # always has clean DC, so ch_signed = 0, ±1, ±2 are LEGITIMATE
+    # operating frequencies (real QSOs at calling±1/±2 kHz happen
+    # routinely) and must NOT be suppressed.  DC handling lives at the
+    # radio-config layer:
+    #   - Flex (digital IQ): pan center IS calling freq, DC genuinely 0
+    #   - B210 (analog IQ):   tune-offset + oversample + decimate moves
+    #                          DC contamination out of band BEFORE MAP144
+    #                          sees the IQ
+    # Either way, the 48 kHz stream MAP144 processes has clean DC.
+    # ``dc_ch_skip`` stays configurable as a last-resort hardware
+    # escape hatch, but the default is 0.  See memory entry
+    # ``project_dc_lo_offset`` and processing.py comment on _DC_CH_SKIP.
     dc_ch_skip: int = 0
 
     # Cluster gate parameters — see CLAUDE.md detection invariants.
