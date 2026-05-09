@@ -532,10 +532,27 @@ class DecoderBlock(Block):
             _decode_fn = getattr(
                 _sys.modules[__name__], "extract_and_decode",
             )
+
+            # Detection events arrive with ``occurred_at_sample`` indexed
+            # at the DETECTOR's sample rate (typically 12 kHz, the
+            # channelized rate), but ``extract_and_decode`` reads from
+            # the IQ ring at the IQ sample rate (typically 48 kHz) and
+            # interprets ``detect_sample`` in that rate.  Convert so the
+            # decoder's ring-window read targets the actual position of
+            # the signal in IQ samples.  This is the contract documented
+            # in §6 of docs/block-stream-design.md: each event carries
+            # its own sample_rate_hz; consumers must rebase to their
+            # local clock when correlating with their own stream.
+            det_sr = int(det_evt.sample_rate_hz) or int(cfg.sample_rate_hz)
+            iq_sr  = int(cfg.sample_rate_hz)
+            detect_sample_iq = int(
+                det_evt.occurred_at_sample * iq_sr // det_sr
+            )
+
             _decode_fn(
                 iq_ring=self._iq_ring,
                 ring_state_fn=self._ring_state,
-                detect_sample=int(det_evt.occurred_at_sample),
+                detect_sample=detect_sample_iq,
                 sample_rate=int(cfg.sample_rate_hz),
                 fc_hz=float(det_evt.payload.get('fc_hz', 0.0)),
                 output_dir=cfg.output_dir,

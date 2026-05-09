@@ -52,6 +52,7 @@ from .stream import (
     make_sample_stream,
 )
 from .synthetic_source import SyntheticSource, SyntheticSourceConfig
+from .tee import TeeBlock, TeeBlockConfig
 from .types import BlockConfig, ChannelMetricRecord, Event, Record, StreamClosed
 from .wav_source import WavSource, WavSourceConfig
 
@@ -88,6 +89,8 @@ __all__ = [
     "StreamClosed",
     "SyntheticSource",
     "SyntheticSourceConfig",
+    "TeeBlock",
+    "TeeBlockConfig",
     "WavSource",
     "WavSourceConfig",
     "make_event_stream",
