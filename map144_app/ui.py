@@ -99,11 +99,25 @@ class _PanelWindow(QtWidgets.QWidget):
         if getattr(self._parent_win, '_app_closing', False):
             event.accept()
             return
-        self._save_geometry()
+        try:
+            self._save_geometry()
+        except Exception:
+            pass  # never block the hide on a settings-write failure
         event.ignore()
         self.hide()
-        if self._view_action is not None:
+        # Menu sync handled by hideEvent below — fires on every path
+        # (X button, programmatic hide(), WM events) so the View-menu
+        # checkbox cannot drift out of sync with actual visibility.
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        if self._view_action is not None and self._view_action.isChecked():
             self._view_action.setChecked(False)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._view_action is not None and not self._view_action.isChecked():
+            self._view_action.setChecked(True)
 
     def _save_geometry(self):
         if self._geo_key is not None:
@@ -198,18 +212,24 @@ def setup_ui(self):
     sync_det_action    = QtWidgets.QAction("Sync Detection",       self)
     iq_nb_action       = QtWidgets.QAction("Noise Blanker",  self)
     reporting_action   = QtWidgets.QAction("Reporting",            self)
-    analysis_action    = QtWidgets.QAction("Analysis",             self)
     flex_action        = QtWidgets.QAction("Flex Radio",           self)
     usrp_action        = QtWidgets.QAction("USRP B210",            self)
     airspy_action      = QtWidgets.QAction("Airspy HF+",           self)
     rtlsdr_action      = QtWidgets.QAction("RTL-SDR",              self)
     sdrangel_action    = QtWidgets.QAction("SDRangel",             self)
+    # Toggle-style View entries — checked state mirrors window visibility.
     for act in (fg_action, det_action, sync_det_action, iq_nb_action, reporting_action,
-                analysis_action,
                 flex_action, usrp_action, airspy_action, rtlsdr_action, sdrangel_action):
         act.setCheckable(True)
         act.setChecked(True)
         view_menu.addAction(act)
+    # Analysis is action-style, not toggle-style: each click opens a
+    # NEW analysis window for a captured WAV (multiple may be open at
+    # once).  Making it checkable would mean "checked = window open"
+    # but with N windows that semantic doesn't fit; non-checkable keeps
+    # the menu honest.
+    analysis_action    = QtWidgets.QAction("Open Analysis Window…", self)
+    view_menu.addAction(analysis_action)
 
     # ── Diagnostics menu ──────────────────────────────────────────────────────
     # Diagnostic toggles that affect *display only* (detection logic remains
@@ -621,8 +641,9 @@ def setup_ui(self):
     reporting_action.triggered.connect(
         lambda checked: self._reporting_win.show() if checked else self._reporting_win.hide()
     )
+    # Action-style: open a fresh AnalysisWindow on each click.
     analysis_action.triggered.connect(
-        lambda checked: _open_analysis_window(self, None) if checked else None
+        lambda: _open_analysis_window(self, None)
     )
     flex_action.triggered.connect(
         lambda checked: self._flex_win.show() if checked else self._flex_win.hide()
