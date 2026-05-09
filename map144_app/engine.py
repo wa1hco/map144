@@ -15,7 +15,10 @@
 """DSP engine — no Qt imports.  Base class for MAP144Visualizer(Engine, QMainWindow)."""
 
 import datetime
+import logging
+import os
 import queue
+from pathlib import Path
 
 import numpy as np
 
@@ -25,15 +28,60 @@ from .processing import (
     N_SNR_HIST, CH_DETECT_SIZE, _METRIC_HIST_DEPTH,
 )
 
+log = logging.getLogger(__name__)
+
+
+# Phase 4 cut-over feature flag (option 1: shadow mode behind a flag).
+#
+# Set this env var to 1 to enable a parallel Block-runtime that consumes
+# the same IQ stream the legacy code does and writes its decodes to a
+# separate JSONL (``MSK144/detections/decodes_blocks.jsonl``) for offline
+# A/B comparison against the legacy ``decodes.jsonl``.
+#
+# When OFF (the default) the engine behaves exactly as before — no
+# Block runtime is started, no overhead.  Easy rollback: unset the flag.
+#
+# This is the SHADOW mode, the lowest-risk first step toward the full
+# cut-over.  After bake-time confidence the next commit promotes the
+# Block path to primary (legacy detect/decode bypassed), and Phase 5
+# cleanup (#13–#16) deletes the legacy paths altogether.
+#
+# See:
+#   - docs/TODO.md §13.7 cut-over strategy options
+#   - project_phase3_progress memory for detailed rationale
+_USE_BLOCKS_ENV = "MAP144_USE_BLOCKS"
+
+
+def _env_use_blocks() -> bool:
+    raw = os.environ.get(_USE_BLOCKS_ENV, "")
+    if not raw:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
 
 class Engine:
     """DSP engine: holds all numpy state and the IQ processing pipeline.
 
     No PyQt5 imports.  ``MAP144Visualizer`` subclasses this for the GUI; IQ
     ingress calls ``process_iq_data`` (implemented in ``processing.py``).
+
+    Phase 4 cut-over (option 1, shadow mode)
+    ----------------------------------------
+    When ``self.use_blocks`` is True (set via ``MAP144_USE_BLOCKS=1`` env var
+    or directly by callers / tests), an internal Block runtime is started
+    on first IQ tick and runs *alongside* the legacy DSP path.  Both
+    consume the same IQ; the legacy path remains authoritative for GUI
+    state / decode reporting; the Block path writes its own decodes.jsonl
+    into ``MSK144/detections/blocks/`` for offline comparison.
+
+    This is the lowest-risk first step toward full cut-over — easy rollback,
+    no behaviour change when the flag is off.
     """
 
-    process_iq_data = _process_iq_data
+    # Class-level default.  ``__init__`` overrides from the env var so a
+    # process started with ``MAP144_USE_BLOCKS=1`` automatically enables
+    # shadow mode without any code change.
+    use_blocks: bool = False
 
     def __init__(self, center_freq_mhz=50.260, sample_rate=48000, fft_size=2048,
                  bind_client_id=None, nb_factor=6.0, calling_freq_mhz=50.260):
@@ -262,6 +310,24 @@ class Engine:
         self._jt9_marker_next_id = 0
         self._decode_queue = queue.SimpleQueue()
 
+        # Phase 4 cut-over (shadow mode).  When the env var is set we
+        # turn on the parallel Block runtime; tests / direct callers can
+        # set ``self.use_blocks = True`` after construction with the same
+        # effect.  The Runtime itself is allocated lazily on first IQ
+        # tick (inside _block_pump_iq) so process startup cost is zero
+        # when the flag is off and small when on.
+        self.use_blocks: bool = _env_use_blocks()
+        self._block_runtime = None       # lazy-initialised Runtime
+        self._block_iq_in_stream = None  # IQ input stream for the Block path
+        self._block_iq_sample_counter: int = 0
+        self._block_iq_anchor_wall: float = 0.0   # set on first push
+        if self.use_blocks:
+            log.info(
+                "Engine: shadow Block runtime ENABLED (env %s); "
+                "legacy DSP path remains authoritative",
+                _USE_BLOCKS_ENV,
+            )
+
         # Frequency axis
         self.fft_bin_axis_mhz = np.fft.fftshift(
             np.fft.fftfreq(self.fft_size, 1 / self.sample_rate)
@@ -309,3 +375,262 @@ class Engine:
     def setup_radio_client(self):
         """No-op base implementation — overridden by MAP144Visualizer for Qt thread."""
         self.radio_client = None
+
+    # ──────────────────────────────────────────────────────────────────
+    # Phase 4 cut-over scaffolding (option 1: shadow Block runtime)
+    # ──────────────────────────────────────────────────────────────────
+
+    def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
+        """IQ ingress dispatch — legacy ``_process_iq_data`` always runs;
+        when ``self.use_blocks`` is True a parallel Block runtime
+        consumes the same IQ for offline A/B validation.
+
+        Behaviour:
+
+        - **Flag off (default):** zero overhead, identical to the
+          pre-feature-flag class-level binding ``process_iq_data =
+          _process_iq_data``.
+        - **Flag on:** legacy still authoritative for GUI / decode
+          reporting; Block runtime writes its own decodes JSONL to
+          ``MSK144/detections/blocks/decodes.jsonl`` for comparison.
+          A failure on the Block side is logged but never propagates
+          back into the legacy path.
+
+        See class docstring + ``project_phase3_progress`` memory.
+        """
+        # Always run legacy first — it owns the engine's GUI state.
+        _process_iq_data(self, iq_samples, timestamp_int, timestamp_frac)
+
+        if not self.use_blocks:
+            return
+
+        # Then mirror the same IQ into the shadow Block runtime.
+        # Failures here must not disturb the legacy path; log + continue.
+        try:
+            self._block_pump_iq(iq_samples)
+        except Exception:
+            log.exception(
+                "Engine: shadow Block runtime raised on IQ pump; "
+                "disabling further Block-side updates this run "
+                "(legacy path unaffected)",
+            )
+            # Disable the flag so we stop pushing IQ; legacy continues.
+            # Caller can reset the runtime via _stop_block_runtime() and
+            # flip the flag back on after fixing the underlying issue.
+            self.use_blocks = False
+
+    def _ensure_block_runtime(self) -> None:
+        """Lazy-init the shadow Block runtime on first IQ tick.
+
+        Wires Source-stand-in (a manually-fed IQ stream) ▶ Tee ▶
+        Channelizer ▶ Detector ▶ Decoder ▶ JsonlSink.  No Reporter — the
+        live PSKReporter / DXcluster uploads come from the LEGACY path
+        in shadow mode, so duplicate spots are not an issue.
+
+        Output dir: ``MSK144/detections/blocks/`` (its own directory so
+        the legacy ``decodes.jsonl`` and ``launches.jsonl`` are not
+        co-mingled with the Block-path output).
+        """
+        if self._block_runtime is not None:
+            return
+
+        # Lazy import — keeps the blocks/ subpackage out of the import
+        # graph when the flag is off.
+        from .blocks import (
+            ChannelizerBlock, ChannelizerBlockConfig,
+            DecoderBlock, DecoderBlockConfig,
+            DetectorBlock, DetectorBlockConfig,
+            JsonlSink, JsonlSinkConfig,
+            Runtime, Stream,
+            TeeBlock, TeeBlockConfig,
+            make_event_stream, make_sample_stream,
+        )
+
+        # Output directory for Block-path decodes (separate from legacy).
+        block_out_dir = (
+            Path(__file__).parent.parent / 'MSK144' / 'detections' / 'blocks'
+        )
+        block_out_dir.mkdir(parents=True, exist_ok=True)
+        block_decode_jsonl = block_out_dir / 'decode_events.jsonl'
+
+        # Channel offset — same as legacy uses for the channelizer NCO.
+        ch_offset_hz = (
+            (self.calling_freq_mhz - self.center_freq_mhz) * 1e6 + 1500.0
+        )
+
+        rt = Runtime()
+
+        # No Source block — IQ is pushed externally via _block_pump_iq.
+        # We wire ``iq_in`` into a Tee whose two output ports feed
+        # Channelizer (for detection) and DecoderBlock (for the IQ ring
+        # window read on each detection event).
+        iq_tee = rt.add(
+            TeeBlock("iq_tee"),
+            TeeBlockConfig(
+                input_port_name="iq_in",
+                output_port_names=["to_chan", "to_dec"],
+                get_timeout_s=0.05,
+            ),
+        )
+
+        chan = rt.add(
+            ChannelizerBlock("chan"),
+            ChannelizerBlockConfig(
+                input_port_name="iq",
+                output_port_name="channels",
+                sample_rate_in_hz=self.sample_rate,
+                channel_offset_hz=ch_offset_hz,
+                get_timeout_s=0.05,
+            ),
+        )
+
+        det = rt.add(
+            DetectorBlock("det"),
+            DetectorBlockConfig(
+                input_port_name="channels",
+                detection_port_name="detections",
+                channel_offset_hz=ch_offset_hz,
+                get_timeout_s=0.05,
+            ),
+        )
+
+        dec = rt.add(
+            DecoderBlock("dec"),
+            DecoderBlockConfig(
+                iq_port_name="iq",
+                detection_port_name="detections",
+                decode_port_name="decodes",
+                sample_rate_hz=self.sample_rate,
+                ring_seconds=15.0,
+                max_concurrent_decodes=4,
+                output_dir=str(block_out_dir),
+                center_freq_mhz=self.center_freq_mhz,
+                get_timeout_s=0.05,
+            ),
+        )
+
+        sink = rt.add(
+            JsonlSink("decode_sink"),
+            JsonlSinkConfig(
+                input_port_name="events",
+                output_path=str(block_decode_jsonl),
+                get_timeout_s=0.05,
+            ),
+        )
+
+        # Manual IQ-input stream — we push records onto it from
+        # _block_pump_iq each time the radio source delivers IQ.
+        # POLICY_DROP_OLDEST: a slow Block consumer must NEVER block
+        # the legacy DSP path that just ran above.  Dropped IQ on the
+        # shadow side is acceptable; a stalled GUI is not.
+        iq_in = make_sample_stream(
+            "engine_iq_in",
+            queue_depth_seconds=2.0,
+            sample_rate_hz=self.sample_rate,
+            n_samples_per_record=4096,
+            on_full=Stream.POLICY_DROP_OLDEST,
+        )
+        # Manual port assignment (no upstream block produced this).
+        iq_tee.inputs["iq_in"] = iq_in
+
+        # Wire the rest with the standard connect API.
+        rt.connect(iq_tee, "to_chan", chan, "iq",
+                   queue_depth_seconds=2.0,
+                   sample_rate_hz=self.sample_rate,
+                   n_samples_per_record=4096)
+        rt.connect(iq_tee, "to_dec", dec, "iq",
+                   queue_depth_seconds=2.0,
+                   sample_rate_hz=self.sample_rate,
+                   n_samples_per_record=4096)
+        rt.connect(chan, "channels", det, "channels",
+                   queue_depth_seconds=2.0,
+                   sample_rate_hz=12_000,
+                   n_samples_per_record=1024)
+        rt.connect(det, "detections", dec, "detections",
+                   kind=Stream.KIND_EVENTS, capacity=64, durable=True)
+        rt.connect(dec, "decodes", sink, "events",
+                   kind=Stream.KIND_EVENTS, capacity=64, durable=True)
+
+        rt.start()
+
+        self._block_runtime = rt
+        self._block_iq_in_stream = iq_in
+        self._block_iq_sample_counter = 0
+        self._block_iq_anchor_wall = 0.0   # set lazily on first push
+
+        log.info(
+            "Engine: shadow Block runtime started; decodes → %s",
+            block_decode_jsonl,
+        )
+
+    def _block_pump_iq(self, iq_samples: np.ndarray) -> None:
+        """Push one chunk of IQ into the shadow Block runtime.
+
+        Handles dual-pol shape (N, 2) by feeding only the H column for
+        now (the production Block path is mono per docs/TODO §6.1; full
+        dual-pol cut-over lands later via DualPolFlexSource +
+        CombinerBlock).
+
+        On first call, lazy-initialises the runtime via
+        ``_ensure_block_runtime`` and anchors the sample-clock to
+        ``time.time()`` so wall-clock-at-production stamps make sense.
+        """
+        import time
+        from .blocks.types import Record, StreamClosed
+
+        self._ensure_block_runtime()
+
+        # Reshape to 1-D mono.  Dual-pol splits into H/V columns; we
+        # send H here.  Pure-V testing would need a different feed point;
+        # not needed for shadow-mode bake-in.
+        data = iq_samples
+        if data.ndim == 2 and data.shape[1] >= 1:
+            data = data[:, 0]
+        data = np.ascontiguousarray(data, dtype=np.complex64)
+        if data.size == 0:
+            return
+
+        if self._block_iq_anchor_wall == 0.0:
+            self._block_iq_anchor_wall = time.time()
+
+        wall_now = (
+            self._block_iq_anchor_wall
+            + self._block_iq_sample_counter / float(self.sample_rate)
+        )
+        rec = Record(
+            data=data,
+            sample_rate_hz=int(self.sample_rate),
+            start_sample=int(self._block_iq_sample_counter),
+            wall_clock_at_production=wall_now,
+        )
+        self._block_iq_sample_counter += data.size
+
+        # The IQ stream uses POLICY_DROP_OLDEST so put() never blocks the
+        # legacy path; if the Block side is slow, IQ records get evicted
+        # and the Block path simply has gaps.  StreamClosed only happens
+        # if the runtime has been torn down between calls — log and
+        # continue.
+        try:
+            self._block_iq_in_stream.put(rec)
+        except StreamClosed:
+            log.warning(
+                "Engine: shadow Block runtime IQ stream closed; "
+                "skipping push (legacy unaffected)",
+            )
+
+    def _stop_block_runtime(self, timeout_s: float = 2.0) -> None:
+        """Tear down the shadow Block runtime if running.  Idempotent.
+
+        Called from GUI shutdown / source switch / test cleanup.
+        """
+        rt = self._block_runtime
+        if rt is None:
+            return
+        try:
+            rt.stop(timeout_s=timeout_s)
+        except Exception:
+            log.exception("Engine: shadow Block runtime stop raised")
+        self._block_runtime = None
+        self._block_iq_in_stream = None
+        self._block_iq_sample_counter = 0
+        self._block_iq_anchor_wall = 0.0
