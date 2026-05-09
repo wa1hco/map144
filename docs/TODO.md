@@ -59,15 +59,67 @@ landed-uncommitted; ML / clustering / classifier items added as #29–#39).
       `_ch_snr_history` + markers + scrolling state. Boundary detection
       mirrors legacy bit-for-bit (UTC-grid period via wall clock,
       hop-count row index within period). 10 tests; commit `aea7086`.
-    - 10b. ⬜ IQ waterfall + squared-domain spectrogram. Deferred —
-      lands alongside `#11` Decoder which also taps `IQStream`.
-    - 10c. ⬜ Decode panel + noise-floor curves + status bar. Needs
-      `DecodeEventStream` from `#11` and uses `Block.stats()` for the
-      status bar.
-11. ⬜ DecoderBlock — consumes `DetectionEventStream` + `IQStream` window
-    via Tap; runs SPD + jt9 fallback; emits `DecodeEventStream`
-12. ⬜ ReporterBlock — durable consumer of `DecodeEventStream` →
-    PSKReporter + DXcluster
+    - 10b. ✅ IQ waterfall — `_sbuf` accumulator + Hanning FFT writes
+      `spec_staging` / `spectrogram_data` matching legacy semantics;
+      commit `5eb4775`.  Squared-domain spectrogram remains for follow-up
+      (needs DetectorBlock to expose squared-FFT power as a separate
+      stream).
+    - 10c. ✅ Decode panel — DecodeEventStream → rolling
+      `decode_panel_entries` list with same fields the legacy
+      decode_panel widget consumes; commit `d0b8472`.
+11. ✅ DecoderBlock — `_DecodeQueueShim` adapts `decode_queue.put`
+    interface; daemon worker pool with semaphore; ring buffer; sample-rate
+    rebase from detection-event clock to IQ clock; commits `23a55d2`
+    (Stage 1 skeleton) + `743895d` (Stage 2 wiring) + `4a1b698`
+    (rate-conversion bug fix found by Stage 1 e2e test).
+12. ✅ ReporterBlock — durable consumer of `DecodeEventStream` →
+    PSKReporter + DXcluster + WSJT-X UDP; pre-configure settings buffering;
+    commit `b5e6d13`.
+
+## ✅ Phase 4 §10 — pre-cut-over validation gates (all green)
+
+13.5 Functional / parity / smoke gates that must pass before the
+    cut-over commit lands.  All green as of 2026-05-09.
+
+    - **Stage 1** (`commit 4a1b698`,
+      [tests/test_block_pipeline_e2e.py](../tests/test_block_pipeline_e2e.py)):
+      synthetic MSK144 IQ → full Block graph (Source ▶ Tee ▶ Channelizer
+      ▶ Detector ▶ Decoder ▶ Reporter+JsonlSink) → decoded "CQ K1JT FN20"
+      via SPD.  Introduces TeeBlock (1-to-N fan-out primitive); fixes
+      sample-rate-conversion bug in DecoderBlock (events at 12 kHz →
+      IQ ring at 48 kHz; production-blocking).
+    - **Stage 2** (`commit a5c23eb`,
+      [tests/test_block_pipeline_replay.py](../tests/test_block_pipeline_replay.py)):
+      same IQ → both pipelines decode the same (msg-token, freq ±1 kHz)
+      pair.  Result: shared = ['CQ', 'FN20', 'K1JT'] @ 50265 kHz.
+    - **Stage 3a** sensitivity smoke (2 seeds × 1 SNR): Block ≥ legacy.
+      Result: legacy=1, block=2.
+    - **Stage 3b** CPU regression bound: Block / legacy < 3×.  Result:
+      0.86× (Block slightly faster than legacy on the strong-ping case).
+    - **Stage 3c** drift injection: pipeline decodes under 1000 ppm
+      injected drift.  Confirms sample-counter ring is drift-immune.
+    - All Stage 3 in `commit a7d5a21`,
+      [tests/test_block_pipeline_stage3.py](../tests/test_block_pipeline_stage3.py).
+
+## ⬜ Cut-over commit
+
+13.7 ⬜ Switch `engine.process_iq_data` from the legacy `_hop_loop` in
+    [processing.py](../map144_app/processing.py) to a Runtime-driven
+    Block graph.  Three viable strategies (recommended order):
+
+    1. **Behind a feature flag** (`engine.use_blocks: bool` or env var) —
+       lowest risk; Engine.process_iq_data delegates to either path; GUI
+       state still updated by legacy until each piece is fully blockified.
+    2. **Replace detect+decode only** — keep noise blanker + spectrogram
+       inline in processing.py; route IQ from there into a Runtime that
+       owns Channelizer + Detector + Decoder; Block path's
+       DetectionEvents drive the same `_jt9_markers` / `decode_panel`
+       updates the legacy code feeds.
+    3. **Full replacement** — move noise blanker + spectrogram into
+       blocks; replace `process_iq_data` wholesale.  Cleaner;
+       significantly more code change; lands as part of Phase 5.
+
+    See [project_phase3_progress](../README.md) memory for context.
 
 ## ⬜ Phase 5 — cleanup after the cut-over
 
