@@ -11,6 +11,10 @@ MSK144/
 *.out
 *wisdom.dat
 
+# Allow committed test fixtures (sim WAV+JSON for parity tests)
+!tests/fixtures/*.wav
+!tests/fixtures/*.json
+
 # Distribution / packaging
 .Python
 build/

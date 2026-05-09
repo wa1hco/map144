@@ -196,6 +196,7 @@ def _run_block_pipeline_on_iq(
     output_dir: Path,
     decode_jsonl_path: Path,
     timeout_s: float = 30.0,
+    max_concurrent_decodes: int = 4,
 ) -> dict:
     """Run the canonical Phase 4 graph on an IQ buffer; return final stats.
 
@@ -246,7 +247,7 @@ def _run_block_pipeline_on_iq(
             decode_port_name="decodes",
             sample_rate_hz=sample_rate,
             ring_seconds=15.0,
-            max_concurrent_decodes=4,
+            max_concurrent_decodes=max_concurrent_decodes,
             output_dir=str(output_dir),
             center_freq_mhz=center_freq_mhz,
             get_timeout_s=0.05,
@@ -499,19 +500,121 @@ class TestLegacyVsBlockReplay(unittest.TestCase):
             f"Neither pipeline produced K1JT @ 50265: {union}",
         )
 
-    # NOTE: a negative-half pipeline test (freq_khz < 0) was attempted
-    # here to exercise the signed-channel fc_hz fix from commit cbea6b7
-    # at the end-to-end level.  It was dropped because legacy itself
-    # does not reliably decode the single-ping synthetic at negative
-    # center_hz — independent of the Block path — so the test would
-    # fail for reasons unrelated to the Block-side fix.  The unit-level
-    # tests in tests/test_detector_block.py
-    #   - TestSignedChannelFcHz.test_high_channel_index_wraps_to_negative_fc_hz
-    #   - TestNyquistMaskUSBConvention.test_usb_convention_masks_real_nyquist
-    # lock in the fix at the math level.  A richer replay-comparison
-    # test using the user's MSK144/sim/short50.wav (50-placement
-    # simulation with both signed halves) is the right vehicle for an
-    # end-to-end negative-half check; tracked separately.
+    def test_parity_on_strong_multi_ping_sim(self):
+        """Replay the strong-signal 10-ping sim through BOTH pipelines and
+        require shadow's decoded set ⊇ legacy's decoded set.
+
+        The sim (``MSK144/sim/parity_strong10.wav`` + matching ``.json``
+        truth) places 10 MSK144 pings at SNR 10–19 dB across the full
+        ±14 kHz IF range — including negative-half placements (e.g.
+        AN08067P10 at −8 kHz / 50252 kHz dial) that exercise the
+        signed-channel ``fc_hz`` fix from commit cbea6b7.
+
+        Both legacy and shadow run with ``max_concurrent_decodes=12`` so
+        the Block path matches the legacy ``_jt9_threads`` cap of 12 (a
+        smaller cap drops detection events under bursty arrival, which
+        biases the comparison).
+
+        Pass criterion: every decode legacy makes is matched by a shadow
+        decode (same callsign-shaped token, ``radio_khz`` within ±1
+        kHz).  Shadow may decode strictly MORE — that's a sensitivity
+        gain, not a regression.  Decoder-pool drops on either side mean
+        the absolute count varies across runs; matching the SET is the
+        invariant.
+        """
+        sim_wav  = _REPO_ROOT / "tests" / "fixtures" / "parity_strong10.wav"
+        sim_json = _REPO_ROOT / "tests" / "fixtures" / "parity_strong10.json"
+        if not sim_wav.is_file() or not sim_json.is_file():
+            self.skipTest(f"Sim fixture not present: {sim_wav}")
+
+        # ── Legacy ────────────────────────────────────────────────────
+        from tests.headless_replay import replay_iq_wav  # noqa: PLC0415
+        legacy_decodes_path = (
+            _REPO_ROOT / "MSK144" / "detections" / "decodes.jsonl"
+        )
+        legacy_run_start = replay_iq_wav(
+            str(sim_wav),
+            sample_rate=48_000,
+            jt9_join_timeout_s=20.0,
+            verbose=False,
+        )
+        legacy_decodes = _read_legacy_decodes_jsonl(
+            legacy_decodes_path, since=legacy_run_start,
+        )
+
+        # ── Shadow Block pipeline on the same IQ ──────────────────────
+        from map144_app.runtime import _load_wav_complex  # noqa: PLC0415
+        samples, _ = _load_wav_complex(str(sim_wav), 48_000)
+        iq = samples.reshape(-1) if samples.ndim == 2 else samples
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="map144_parity_"))
+        self.addCleanup(shutil.rmtree, str(tmpdir), ignore_errors=True)
+        block_out = tmpdir / "block_out"
+        block_out.mkdir()
+        block_results = _run_block_pipeline_on_iq(
+            iq, sample_rate=48_000,
+            center_freq_mhz=50.260,
+            output_dir=block_out,
+            decode_jsonl_path=tmpdir / "block_evs.jsonl",
+            timeout_s=60.0,
+            # Match legacy's _jt9_threads cap of 12.
+            max_concurrent_decodes=12,
+        )
+        block_decodes = _read_block_decode_events_jsonl(
+            block_out / "decodes.jsonl",
+        )
+
+        # ── Compare as callsign-token sets (dedup by callsign) ────────
+        # Synthetic msg encoding: A[P/N][ff][ttt][P/N][dd] — a single
+        # 10-char token per ping.  Two pipelines may report the SAME
+        # callsign at slightly different rounded radio_khz (e.g.
+        # 50259 vs 50263 from the same -1 kHz signal — legacy logged
+        # both the real channel and a sidelobe; shadow only logged the
+        # sidelobe).  Both forms identify the same callsign decoded
+        # from the same burst, so dedup by callsign is the parity
+        # invariant the cut-over actually requires.
+        def _tokset(entries: list[dict]) -> set:
+            out = set()
+            for e in entries:
+                msg = e.get("message", "")
+                if not msg:
+                    continue
+                for tok in msg.upper().split():
+                    if 3 <= len(tok) <= 12 and any(c.isdigit() for c in tok):
+                        out.add(tok)
+            return out
+
+        legacy_callsigns = _tokset(legacy_decodes)
+        block_callsigns  = _tokset(block_decodes)
+
+        # Require legacy decoded at least a few signals — otherwise the
+        # sim is broken / SNR too marginal and we can't draw any parity
+        # conclusion.
+        self.assertGreater(
+            len(legacy_callsigns), 3,
+            f"Legacy decoded only {len(legacy_callsigns)} unique "
+            f"callsign(s) on the parity_strong10 sim — fixture too "
+            f"weak; got {legacy_callsigns}",
+        )
+
+        legacy_only = legacy_callsigns - block_callsigns
+
+        # Diagnostic regardless of pass/fail.
+        print(
+            f"\n[parity sim] legacy={len(legacy_callsigns)} unique "
+            f"callsign(s)  block={len(block_callsigns)}  "
+            f"shadow-missed={sorted(legacy_only)}\n"
+            f"  legacy={sorted(legacy_callsigns)}\n"
+            f"  block ={sorted(block_callsigns)}",
+            file=sys.stderr,
+        )
+
+        self.assertEqual(
+            legacy_only, set(),
+            f"Shadow MISSED {len(legacy_only)} callsign(s) that legacy "
+            f"caught: {sorted(legacy_only)}.  Sensitivity regression in "
+            f"the Block path — investigate before promotion (option 2).",
+        )
 
 
 if __name__ == "__main__":

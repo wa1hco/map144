@@ -321,10 +321,12 @@ class TestEdgeChannelSuppress(unittest.TestCase):
         # We can only test this through _detect_one_cycle since the
         # masking happens there, not in _cluster_gate.  Bypass DSP by
         # writing pair_metric directly through a stubbed compute path.
+        # Default ``dc_ch_skip=0`` matches legacy parity — explicitly
+        # set 3 here to exercise the DC-mask code path itself.
         # ch 10 is well clear of both DC (0..dc_skip) and the
         # wrap-aware Nyquist mask (≈ ch 24 ± edge_skip with default
         # channel_offset_hz=0).
-        det = _make_detector()
+        det = _make_detector(dc_ch_skip=3)
         nch = det.config.n_channels  # type: ignore[union-attr]
         # Stub the compute methods to return a controlled metric.
         big = np.full(nch, 0.0, dtype=np.float32)

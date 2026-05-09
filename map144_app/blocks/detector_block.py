@@ -130,7 +130,14 @@ class DetectorBlockConfig(BlockConfig):
     enable_sync_detect: bool = True
     enable_sq_detect: bool = True
     edge_ch_skip: int = _EDGE_CH_SKIP
-    dc_ch_skip: int = _DC_CH_SKIP
+    # _DC_CH_SKIP is *defined* in processing.py but not currently
+    # *used* by the legacy detector — i.e. legacy does not suppress
+    # near-DC channels at all.  For the Block path to match legacy
+    # (cut-over parity), default ``dc_ch_skip=0`` here.  Tests that
+    # specifically validate the DC-mask machinery override to 3.
+    # If we ever decide near-DC suppression IS the right default, it
+    # should land in legacy first to keep both paths in sync.
+    dc_ch_skip: int = 0
 
     # Cluster gate parameters — see CLAUDE.md detection invariants.
     coincidence_max_clusters: int = _COINCIDENCE_MAX_CLUSTERS  # 6
