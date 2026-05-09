@@ -101,25 +101,31 @@ landed-uncommitted; ML / clustering / classifier items added as #29–#39).
     - All Stage 3 in `commit a7d5a21`,
       [tests/test_block_pipeline_stage3.py](../tests/test_block_pipeline_stage3.py).
 
-## ⬜ Cut-over commit
+## ✅/⬜ Cut-over commits
 
-13.7 ⬜ Switch `engine.process_iq_data` from the legacy `_hop_loop` in
+13.7 Switch `engine.process_iq_data` from the legacy `_hop_loop` in
     [processing.py](../map144_app/processing.py) to a Runtime-driven
-    Block graph.  Three viable strategies (recommended order):
+    Block graph.  Three-stage rollout per
+    [project_phase3_progress](../README.md) memory:
 
-    1. **Behind a feature flag** (`engine.use_blocks: bool` or env var) —
-       lowest risk; Engine.process_iq_data delegates to either path; GUI
-       state still updated by legacy until each piece is fully blockified.
-    2. **Replace detect+decode only** — keep noise blanker + spectrogram
-       inline in processing.py; route IQ from there into a Runtime that
-       owns Channelizer + Detector + Decoder; Block path's
-       DetectionEvents drive the same `_jt9_markers` / `decode_panel`
-       updates the legacy code feeds.
-    3. **Full replacement** — move noise blanker + spectrogram into
-       blocks; replace `process_iq_data` wholesale.  Cleaner;
-       significantly more code change; lands as part of Phase 5.
-
-    See [project_phase3_progress](../README.md) memory for context.
+    1. ✅ **Behind a feature flag** (`MAP144_USE_BLOCKS=1` env var or
+       `Engine.use_blocks=True`).  Lowest risk; legacy still authoritative
+       for GUI/decode reporting; Block path runs in parallel and writes
+       shadow JSONL to `MSK144/detections/blocks/decode_events.jsonl` for
+       offline A/B.  Default off = zero behaviour change.  Lands in
+       commit `294169f`; 6 new tests in
+       [tests/test_engine_block_shadow.py](../tests/test_engine_block_shadow.py).
+       **Live bake-in pending** before option 2 lands.
+    2. ⬜ **Replace detect+decode only** — when flag on, BYPASS the
+       legacy detect/decode portion of `process_iq_data` (channelizer
+       + hop loop + extract_and_decode dispatch).  Block path becomes
+       primary; updates the same `_jt9_markers` / `decode_panel` /
+       `_decode_queue` the GUI reads via a small adapter.  Legacy noise
+       blanker + spectrogram still run inline.  Lands AFTER bake-in.
+    3. ⬜ **Full replacement** — move noise blanker into a
+       `NoiseBlankerBlock` and the spectrogram into its own block;
+       replace `process_iq_data` wholesale.  Cleanest architecturally;
+       lands as part of Phase 5 cleanup (#13–#16).
 
 ## ⬜ Phase 5 — cleanup after the cut-over
 
