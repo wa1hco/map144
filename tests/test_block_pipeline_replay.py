@@ -197,6 +197,9 @@ def _run_block_pipeline_on_iq(
     decode_jsonl_path: Path,
     timeout_s: float = 30.0,
     max_concurrent_decodes: int = 4,
+    iq_stream_on_full: str | None = None,
+    iq_stream_queue_seconds: float = 2.0,
+    source_realtime_pacing: bool = False,
 ) -> dict:
     """Run the canonical Phase 4 graph on an IQ buffer; return final stats.
 
@@ -210,6 +213,7 @@ def _run_block_pipeline_on_iq(
         _PrebakedIQSourceConfig(
             sample_rate_hz=sample_rate,
             samples_per_record=4096,
+            realtime_pacing=source_realtime_pacing,
         ),
     )
     iq_tee = rt.add(
@@ -278,11 +282,16 @@ def _run_block_pipeline_on_iq(
             ),
         )
 
-        # Wire the graph.
+        # Wire the graph.  ``iq_stream_on_full`` lets a caller match
+        # production engine.py's POLICY_DROP_OLDEST (so the test exposes
+        # drop-pressure failure modes) — defaults to None, which means
+        # POLICY_BLOCK and no drops, keeping the existing parity test
+        # fast and deterministic.
         rt.connect(src, "iq", iq_tee, "iq",
-                   queue_depth_seconds=2.0,
+                   queue_depth_seconds=iq_stream_queue_seconds,
                    sample_rate_hz=sample_rate,
-                   n_samples_per_record=4096)
+                   n_samples_per_record=4096,
+                   on_full=iq_stream_on_full)
         rt.connect(iq_tee, "to_chan", chan, "iq",
                    queue_depth_seconds=2.0,
                    sample_rate_hz=sample_rate,
@@ -498,6 +507,278 @@ class TestLegacyVsBlockReplay(unittest.TestCase):
         self.assertTrue(
             any("K1JT" in m and abs(f - 50265) <= 1 for m, f in union),
             f"Neither pipeline produced K1JT @ 50265: {union}",
+        )
+
+    def test_shadow_decodes_after_injected_gap(self):
+        """Reproduce the 2026-05-09 bake-in failure mode deterministically.
+
+        Background
+        ----------
+        The bake-in observed: shadow runtime decoded fine for ~73
+        minutes (9 NA6MG decodes), then for the next ~187 minutes
+        detected 1576 launches and decoded ZERO of them.  Diagnosis:
+        production ``engine.py`` configures the shadow IQ stream with
+        ``POLICY_DROP_OLDEST`` so the legacy DSP path can never
+        backpressure; under busy-band conditions records get evicted
+        from ``iq_in``.  The surviving records carry non-contiguous
+        ``rec.start_sample`` values.  Pre-fix (before commit a5bde7e),
+        ``DecoderBlock._abs_sample`` advanced by RECEIVED-record size
+        while detection events used ENGINE-counter positions — once
+        drops accumulated, engine-position ↔ ring-offset alignment
+        diverged and SPD/jt9 read garbage at every detect_sample.
+
+        Why an injected gap rather than a real drop-pressure scenario
+        ----------------------------------------------------------
+        Forcing organic drops in an integration test is unreliable
+        even under realtime pacing + tiny ``iq_in`` queue: Tee +
+        Channelizer + Decoder.tick are all fast enough that iq_in
+        rarely fills.  In production drops happen because the radio
+        source emits in bursts (UDP packet bursts from FlexDAXIQ,
+        VITA frames from B210, etc.) interacting with momentary
+        consumer stalls.  Reproducing that timing precisely is
+        flaky.
+
+        Instead we inject a deterministic gap by overriding
+        ``_PrebakedIQSource`` to skip one record in the middle of the
+        push sequence — same effect on the Decoder: a record arrives
+        whose ``rec.start_sample`` jumps past the expected next
+        position.  Under the post-fix code the Decoder ring's
+        ``_abs_sample`` re-anchors to the engine-counter and bursts
+        AFTER the gap still decode correctly.  Pre-fix, those bursts
+        would silently fail.
+
+        Pass criterion
+        --------------
+        ``iq_gaps == 1`` (the injected one) AND shadow decodes at
+        least one callsign whose transmission was AFTER the gap.
+        """
+        sim_wav  = _REPO_ROOT / "tests" / "fixtures" / "parity_strong10.wav"
+        sim_json = _REPO_ROOT / "tests" / "fixtures" / "parity_strong10.json"
+        if not sim_wav.is_file() or not sim_json.is_file():
+            self.skipTest(f"Sim fixture not present: {sim_wav}")
+
+        # Pick a gap insertion point that:
+        # - lands in a quiet (no-burst) section of the sim, so we don't
+        #   destroy the very burst we're trying to catch,
+        # - is AFTER at least one burst, so we have a "before-gap" anchor,
+        # - is BEFORE several bursts, so the test has bursts to catch
+        #   after-gap.
+        #
+        # Sim placements (from parity_strong10.json):
+        #   1  AP07037P18  +7   delay=3.7s   snr 18
+        #   2  AN10117P17  -10  delay=11.7s  snr 17
+        #   3  AP17060P19  +17  delay=6.0s   snr 19
+        #   4  AP02089P12  +2   delay=8.9s   snr 12
+        #   5  AN09099P16  -9   delay=9.9s   snr 16
+        #   6  AP08099P11  +8   delay=9.9s   snr 11
+        #   7  AN08067P10  -8   delay=6.7s   snr 10
+        #   8  AN01103P12  -1   delay=10.3s  snr 12
+        #   9  AN13108P18  -13  delay=10.8s  snr 18
+        #   10 AP08016P14  +8   delay=1.6s   snr 14
+        #
+        # Earliest burst: AP08016P14 at delay=1.6s.  Latest: AN10117P17
+        # at delay=11.7s.  Inject the gap at ~5.0s — past AP08016P14
+        # and AP07037P18 (which provide the "before-gap" anchor) but
+        # well before the AN09099P16 / AP02089P12 / AN01103P12 cluster
+        # at 8.9–10.3s (after-gap targets).
+        gap_at_sample = int(5.0 * 48_000)   # 240,000
+
+        # ── Load IQ ───────────────────────────────────────────────────
+        from map144_app.runtime import _load_wav_complex  # noqa: PLC0415
+        samples, _ = _load_wav_complex(str(sim_wav), 48_000)
+        iq = samples.reshape(-1) if samples.ndim == 2 else samples
+
+        # ── Subclass _PrebakedIQSource to inject one gap ──────────────
+        class _GapInjectingSource(_PrebakedIQSource):
+            """Skip exactly one ``samples_per_record``-sized chunk
+            starting at ``gap_start_sample`` — emulates a single
+            ``POLICY_DROP_OLDEST`` eviction.  ``self._sample_counter``
+            still advances over the dropped chunk so the NEXT emitted
+            record carries a ``start_sample`` that JUMPS past the
+            gap, exactly the way production drops manifest.
+            """
+
+            def __init__(self, name, samples, gap_start, gap_n):
+                super().__init__(name, samples)
+                self._gap_start = int(gap_start)
+                self._gap_n = int(gap_n)
+                self._gap_done = False
+
+            def produce(self):
+                cfg = self.config
+                # If our cursor has reached the gap window, skip the
+                # source array's gap_n samples AND advance the base
+                # ``_sample_counter`` by gap_n so subsequent records'
+                # ``start_sample`` reflects the engine-counter jump.
+                if (not self._gap_done) and self._cursor >= self._gap_start:
+                    self._cursor += self._gap_n
+                    self._sample_counter += self._gap_n
+                    self._gap_done = True
+                return super().produce()
+
+        # ── Build pipeline manually to use the gap-injecting source ───
+        from map144_app.blocks import (  # noqa: PLC0415
+            ChannelizerBlock, ChannelizerBlockConfig,
+            DecoderBlock, DecoderBlockConfig,
+            DetectorBlock, DetectorBlockConfig,
+            JsonlSink, JsonlSinkConfig,
+            ReporterBlock, ReporterBlockConfig,
+            Runtime, Stream,
+            TeeBlock, TeeBlockConfig,
+        )
+        import time
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="map144_gapinj_"))
+        self.addCleanup(shutil.rmtree, str(tmpdir), ignore_errors=True)
+        block_out = tmpdir / "block_out"
+        block_out.mkdir()
+
+        # Fake Reporter so no sockets open.
+        fake = _FakeReporter()
+        import map144_app.reporting as _rep
+        real_cls = _rep.Reporter
+        _rep.Reporter = lambda: fake
+        self.addCleanup(setattr, _rep, "Reporter", real_cls)
+
+        rt = Runtime()
+        src = rt.add(
+            _GapInjectingSource("src", iq,
+                                gap_start=gap_at_sample,
+                                gap_n=4096),
+            _PrebakedIQSourceConfig(
+                sample_rate_hz=48_000,
+                samples_per_record=4096,
+                realtime_pacing=False,    # fast — gap is the only "drop"
+            ),
+        )
+        iq_tee = rt.add(TeeBlock("iq_tee"),
+                        TeeBlockConfig(input_port_name="iq",
+                                       output_port_names=["to_chan", "to_dec"],
+                                       get_timeout_s=0.05))
+        chan = rt.add(ChannelizerBlock("chan"),
+                      ChannelizerBlockConfig(input_port_name="iq",
+                                             output_port_name="channels",
+                                             sample_rate_in_hz=48_000,
+                                             channel_offset_hz=1500.0,
+                                             get_timeout_s=0.05))
+        det  = rt.add(DetectorBlock("det"),
+                      DetectorBlockConfig(input_port_name="channels",
+                                          detection_port_name="detections",
+                                          channel_offset_hz=1500.0,
+                                          get_timeout_s=0.05))
+        dec  = rt.add(DecoderBlock("dec"),
+                      DecoderBlockConfig(iq_port_name="iq",
+                                         detection_port_name="detections",
+                                         decode_port_name="decodes",
+                                         sample_rate_hz=48_000,
+                                         ring_seconds=15.0,
+                                         max_concurrent_decodes=12,
+                                         output_dir=str(block_out),
+                                         center_freq_mhz=50.260,
+                                         get_timeout_s=0.05))
+        rep  = rt.add(ReporterBlock("rep"),
+                      ReporterBlockConfig(decode_port_name="decodes",
+                                          get_timeout_s=0.05))
+        rep.apply_settings(my_call="W1AW", my_grid="FN31",
+                           wsjtx_enabled=False,
+                           pskreporter_enabled=False,
+                           dx_enabled=False)
+        sink = rt.add(JsonlSink("decode_sink"),
+                      JsonlSinkConfig(input_port_name="events",
+                                      output_path=str(tmpdir / "evs.jsonl"),
+                                      get_timeout_s=0.05))
+
+        rt.connect(src,    "iq",       iq_tee,  "iq",
+                   queue_depth_seconds=2.0,
+                   sample_rate_hz=48_000, n_samples_per_record=4096)
+        rt.connect(iq_tee, "to_chan",  chan,    "iq",
+                   queue_depth_seconds=2.0,
+                   sample_rate_hz=48_000, n_samples_per_record=4096)
+        rt.connect(iq_tee, "to_dec",   dec,     "iq",
+                   queue_depth_seconds=2.0,
+                   sample_rate_hz=48_000, n_samples_per_record=4096)
+        rt.connect(chan,   "channels", det,     "channels",
+                   queue_depth_seconds=2.0,
+                   sample_rate_hz=12_000, n_samples_per_record=1024)
+        rt.connect(det,    "detections", dec,   "detections",
+                   kind=Stream.KIND_EVENTS, capacity=64, durable=True)
+
+        decode_tee = rt.add(TeeBlock("decode_tee"),
+                            TeeBlockConfig(input_port_name="in",
+                                           output_port_names=["to_rep","to_sink"],
+                                           get_timeout_s=0.05))
+        rt.connect(dec,        "decodes", decode_tee, "in",
+                   kind=Stream.KIND_EVENTS, capacity=64, durable=True)
+        rt.connect(decode_tee, "to_rep",  rep,        "decodes",
+                   kind=Stream.KIND_EVENTS, capacity=64, durable=True)
+        rt.connect(decode_tee, "to_sink", sink,       "events",
+                   kind=Stream.KIND_EVENTS, capacity=64, durable=True)
+
+        rt.start()
+        try:
+            deadline = time.monotonic() + 60.0
+            while time.monotonic() < deadline:
+                if src._cursor >= src._samples.size:
+                    time.sleep(2.0)
+                    break
+                time.sleep(0.05)
+        finally:
+            rt.stop(timeout_s=5.0)
+
+        block_decodes = _read_block_decode_events_jsonl(
+            block_out / "decodes.jsonl",
+        )
+        dec_stats = dec.stats()
+
+        # ── Sanity: the gap injection actually happened ───────────────
+        self.assertEqual(
+            dec_stats["iq_gaps"], 1,
+            f"Expected exactly one injected gap; got iq_gaps={dec_stats['iq_gaps']}.  "
+            f"dec_stats={dec_stats}",
+        )
+        self.assertEqual(
+            dec_stats["iq_gap_samples"], 4096,
+            f"Expected gap_samples=4096; got {dec_stats['iq_gap_samples']}",
+        )
+
+        # ── Decode set must include AT LEAST ONE callsign whose burst
+        #    is timed AFTER the gap (delay > 5.0 s).  Pre-fix this would
+        #    fail because every burst after the gap reads the wrong ring
+        #    offset.
+        callsigns_after_gap = {
+            "AP17060P19",   # delay=6.0
+            "AN08067P10",   # delay=6.7
+            "AP02089P12",   # delay=8.9
+            "AP08099P11",   # delay=9.9
+            "AN09099P16",   # delay=9.9
+            "AN01103P12",   # delay=10.3
+            "AN13108P18",   # delay=10.8
+            "AN10117P17",   # delay=11.7
+        }
+        decoded_after_gap = set()
+        for d in block_decodes:
+            msg = (d.get("message", "") or "").upper()
+            for tok in msg.split():
+                if tok in callsigns_after_gap:
+                    decoded_after_gap.add(tok)
+
+        print(
+            f"\n[gap-injection regression] iq_gaps={dec_stats['iq_gaps']} "
+            f"gap_samples={dec_stats['iq_gap_samples']}  "
+            f"after-gap callsigns decoded: {sorted(decoded_after_gap)}",
+            file=sys.stderr,
+        )
+
+        self.assertGreater(
+            len(decoded_after_gap), 0,
+            f"Shadow failed to decode any callsign whose burst was "
+            f"AFTER the injected gap.  This is the exact regression "
+            f"the 2026-05-09 bake-in saw — pre-fix decoder ring's "
+            f"engine-position ↔ ring-offset alignment broke after "
+            f"the first drop, and SPD/jt9 read wrong window "
+            f"contents on every subsequent burst.\n"
+            f"  block decoded: {[d.get('message') for d in block_decodes]}\n"
+            f"  dec_stats: {dec_stats}",
         )
 
     def test_parity_on_strong_multi_ping_sim(self):

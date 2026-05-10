@@ -119,15 +119,23 @@ class _PrebakedIQSourceConfig(SourceConfig):
     block instance directly (not via config) — the test owns the array."""
 
     samples_per_record: int = 4096
+    # When True, ``produce()`` paces output so the sample-clock advances
+    # at real-time rate — needed when a test must reproduce the
+    # backpressure dynamics of a live radio source (drops happen
+    # during decode-busy moments, not because the source out-runs the
+    # consumer).  Default False so the existing fast functional tests
+    # keep their wall-clock budget.
+    realtime_pacing: bool = False
 
 
 class _PrebakedIQSource(Source):
     """Replay a pre-built complex64 IQ array as :class:`Record`s.
 
     Functionally a simplified WavSource that doesn't need the disk I/O.
-    Pacing is *not* real-time — runs as fast as downstream consumers
-    accept records.  For functional tests we want the pipeline to run
-    fast; for drift / cadence tests use a real-time-paced source.
+    Default pacing is *not* real-time — pipeline runs as fast as
+    downstream consumers accept records.  Set
+    ``realtime_pacing=True`` for tests that need radio-like timing
+    (drift, cadence, drop-pressure regression).
     """
 
     config_type = _PrebakedIQSourceConfig
@@ -136,11 +144,34 @@ class _PrebakedIQSource(Source):
         super().__init__(name)
         self._samples = np.ascontiguousarray(samples, dtype=np.complex64)
         self._cursor: int = 0
+        self._produce_anchor_wall: float = 0.0
+
+    def on_start(self) -> None:
+        super().on_start()
+        self._produce_anchor_wall = self._real_anchor_wall
 
     def produce(self) -> np.ndarray | None:
         cfg: _PrebakedIQSourceConfig = self.config  # type: ignore[assignment]
         if self._cursor >= self._samples.size:
             raise StopIteration
+
+        if cfg.realtime_pacing:
+            import time
+            target_wall = (
+                self._produce_anchor_wall
+                + (self._sample_counter + cfg.samples_per_record) / cfg.sample_rate_hz
+            )
+            slack = target_wall - time.time()
+            if slack > 0:
+                end_at = time.time() + slack
+                while not self._stopping.is_set():
+                    remaining = end_at - time.time()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(remaining, 0.050))
+                if self._stopping.is_set():
+                    return None
+
         end = min(self._cursor + cfg.samples_per_record, self._samples.size)
         chunk = self._samples[self._cursor:end]
         self._cursor = end
