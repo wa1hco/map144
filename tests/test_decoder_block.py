@@ -228,6 +228,163 @@ class TestRingIngest(unittest.TestCase):
         self.assertEqual(ring_pos, (50 * 1024) % h.blk._ring_n)
 
 
+class TestRingGapHandling(unittest.TestCase):
+    """When upstream drops records (engine ``iq_in`` POLICY_DROP_OLDEST under
+    sustained load), the surviving records carry their original engine-
+    counter ``start_sample``.  The decoder's ``_abs_sample`` must follow
+    those engine-counter positions — not just the count of received
+    samples — so detection events (which the channelizer's gap-recovery
+    logic also re-anchors to engine-counter coordinates) map to the
+    correct ring offset.
+
+    Without this fix, the bake-in observed: shadow runtime decoded fine
+    for the first ~73 minutes (no drops yet), then once the band got
+    busy and queue overflows accumulated, decoded zero of the next ~187
+    minutes' worth of detection events (1576 launches → 0 decodes).
+    With this fix the engine-position ↔ ring-offset alignment survives
+    drops; samples in the gap range are lost (correct — they were
+    dropped) but every other burst's window still reads cleanly.
+    """
+
+    def test_gap_advances_abs_sample_to_engine_counter(self):
+        """Drop one record in a sequence: ``_abs_sample`` should jump
+        to ``last_rec.start_sample + last_rec.n``, not just the
+        running sum of received-record sizes."""
+        h = _Harness()
+        h.rt.start()
+        try:
+            # Records 0..3 contiguous, then SKIP record 4 (drop), then 5..7.
+            # Each record is 1024 samples.  start_samples emitted: 0, 1024,
+            # 2048, 3072, [4096 dropped], 5120, 6144, 7168.
+            sent_starts = [0, 1024, 2048, 3072, 5120, 6144, 7168]
+            for ss in sent_starts:
+                h.iq.put(_iq_record(start_sample=ss, n=1024,
+                                    fill=complex(ss, 0)))
+            time.sleep(0.20)
+            ring_pos, abs_sample = h.blk._ring_state()
+            stats = h.blk.stats()
+        finally:
+            h.rt.stop(timeout_s=1.0)
+
+        # ``_abs_sample`` reflects engine-counter position right after
+        # the last received record's tail: 7168 + 1024 = 8192.
+        # Pre-fix behaviour was 7 × 1024 = 7168 (off by one record's
+        # worth = the dropped 1024 samples).
+        self.assertEqual(abs_sample, 8192)
+        # Ring pos preserves the engine-position ↔ ring-offset
+        # relationship: 8192 % ring_n.
+        self.assertEqual(ring_pos, 8192 % h.blk._ring_n)
+        # Gap accounting was tracked.
+        self.assertEqual(stats["iq_gaps"], 1)
+        self.assertEqual(stats["iq_gap_samples"], 1024)
+        self.assertEqual(stats["iq_records"], len(sent_starts))
+        self.assertEqual(stats["iq_samples"], len(sent_starts) * 1024)
+
+    def test_late_first_record_anchors_correctly(self):
+        """If the source has been emitting for a while before the
+        decoder attaches (e.g. shadow runtime started lazily after
+        the engine's first IQ tick), the first record's start_sample
+        is non-zero.  ``_abs_sample`` should anchor to that, so
+        subsequent gap-checks work from the correct baseline."""
+        h = _Harness()
+        h.rt.start()
+        try:
+            # First record arrives at engine-position 100_000 (e.g. ~2 s
+            # of source emission before shadow attached).
+            h.iq.put(_iq_record(start_sample=100_000, n=1024))
+            h.iq.put(_iq_record(start_sample=101_024, n=1024))
+            time.sleep(0.15)
+            _, abs_sample = h.blk._ring_state()
+            stats = h.blk.stats()
+        finally:
+            h.rt.stop(timeout_s=1.0)
+        # 100_000 + 1024 + 1024 = 102_048
+        self.assertEqual(abs_sample, 102_048)
+        # No gaps — these two records are contiguous.
+        self.assertEqual(stats["iq_gaps"], 0)
+
+    def test_out_of_order_record_dropped(self):
+        """A record with start_sample < ``_abs_sample`` is discarded
+        silently — real radios don't reorder, so this only fires on
+        test injection / corrupted upstream."""
+        h = _Harness()
+        h.rt.start()
+        try:
+            h.iq.put(_iq_record(start_sample=0, n=1024))
+            h.iq.put(_iq_record(start_sample=1024, n=1024))
+            # Now an out-of-order record (engine-position before head).
+            h.iq.put(_iq_record(start_sample=512, n=1024))
+            # And a valid forward record.
+            h.iq.put(_iq_record(start_sample=2048, n=1024))
+            time.sleep(0.15)
+            _, abs_sample = h.blk._ring_state()
+            stats = h.blk.stats()
+        finally:
+            h.rt.stop(timeout_s=1.0)
+        # Out-of-order one is dropped; abs_sample reflects the 3 forward
+        # records: 2048 + 1024 = 3072.
+        self.assertEqual(abs_sample, 3072)
+        self.assertEqual(stats["iq_records"], 3)   # only valid ones counted
+
+    def test_decode_window_after_gap_aligned_to_engine_counter(self):
+        """End-to-end: a detection event after a gap drops should
+        target the correct engine-counter position in the ring, not
+        a position offset by the gap size."""
+        from map144_app.blocks import decoder_block as _dmod  # noqa: PLC0415
+
+        # Stub extract_and_decode to record (detect_sample, ring_pos,
+        # abs_sample) so we can verify the worker sees the right
+        # engine-counter coordinates.
+        captured = {}
+
+        def _stub(iq_ring, ring_state_fn, detect_sample, sample_rate,
+                  fc_hz, output_dir, decode_queue, marker_id, **_):
+            ring_pos, abs_sample = ring_state_fn()
+            captured["detect_sample"] = detect_sample
+            captured["ring_pos_at_dispatch"] = ring_pos
+            captured["abs_sample_at_dispatch"] = abs_sample
+            decode_queue.put({"outcome": "no_decode", "marker_id": marker_id})
+
+        original = _dmod.extract_and_decode
+        _dmod.extract_and_decode = _stub
+
+        h = _Harness()
+        h.rt.start()
+        try:
+            # Push 3 contiguous records, drop one, push 2 more.
+            # All records 4096 samples (one tick at 48k = 85ms).
+            for ss in [0, 4096, 8192, 16384, 20480]:   # gap at 12288
+                h.iq.put(_iq_record(start_sample=ss, n=4096))
+            time.sleep(0.10)
+
+            # Detection event at engine-position 19000 — well after the gap.
+            # Note the event uses the full sample rate (48 kHz) here so the
+            # rebase logic in _worker_run is a 1:1 pass-through.
+            from map144_app.blocks import Event
+            evt = Event(
+                kind="detection",
+                occurred_at_sample=19000,
+                sample_rate_hz=SR_IQ,
+                wall_clock_at_production=100.0,
+                payload={"channel_index": 5, "fc_hz": 6500.0,
+                         "source": "sync"},
+            )
+            h.det.put(evt)
+            time.sleep(0.20)
+        finally:
+            _dmod.extract_and_decode = original
+            h.rt.stop(timeout_s=1.0)
+
+        # Decode worker should have been dispatched, and it should
+        # receive the detect_sample value as engine-counter position.
+        self.assertIn("detect_sample", captured)
+        self.assertEqual(captured["detect_sample"], 19000)
+        # The decoder's abs_sample at dispatch reflects engine-counter
+        # position after the 5 received records:
+        #   last_rec.start_sample + last_rec.n = 20480 + 4096 = 24576
+        self.assertEqual(captured["abs_sample_at_dispatch"], 24576)
+
+
 class TestDetectionDispatch(unittest.TestCase):
 
     def setUp(self):

@@ -216,6 +216,8 @@ class DecoderBlock(Block):
         # Stats.
         self._n_iq_records:         int = 0
         self._n_iq_samples:         int = 0
+        self._n_iq_gaps:            int = 0   # times rec.start_sample > _abs_sample
+        self._n_iq_gap_samples:     int = 0   # total samples lost to gaps
         self._n_detection_events:   int = 0
         self._n_decode_attempts:    int = 0
         self._n_decode_completed:   int = 0
@@ -346,18 +348,54 @@ class DecoderBlock(Block):
             return
 
         with self._ring_lock:
-            # Capture the wall-clock anchor at the *first* IQ record.
-            # This is the t0 for sample-counter -> wall-clock conversion;
-            # used by decode workers for period-end stamps.
+            rec_start = int(rec.start_sample)
             if self._iq_t0_wall is None:
-                # rec.start_sample is the source's monotonic counter.
-                # wall_clock_at_production is the source's wall-clock
-                # for the same instant.  t0_wall = the wall clock for
-                # sample 0 of THIS source's stream:
+                # First record sets the anchors:
+                # - ``_iq_t0_wall``  : source wall-clock at sample 0
+                # - ``_abs_sample``  : engine-counter at the start of
+                #                      this record (so the +=n below
+                #                      lands at rec_start + n)
+                # - ``_ring_pos``    : engine-counter modulo ring size
+                #                      (preserves abs↔ring alignment)
                 self._iq_t0_wall = (
                     rec.wall_clock_at_production
-                    - rec.start_sample / float(rec.sample_rate_hz)
+                    - rec_start / float(rec.sample_rate_hz)
                 )
+                self._abs_sample = rec_start
+                self._ring_pos = rec_start % self._ring_n
+            else:
+                # Gap detection.  Under sustained load the engine's
+                # ``iq_in`` stream uses POLICY_DROP_OLDEST and may evict
+                # records — the ones that DO arrive carry their original
+                # ``rec.start_sample`` (the engine's monotonic
+                # sample-counter).  ``_abs_sample`` was the engine
+                # position immediately AFTER the previous record; if
+                # ``rec_start`` is higher, that delta is the dropped-
+                # samples count.  Advance ``_ring_pos`` by the gap so
+                # the engine-position ↔ ring-offset relationship stays
+                # consistent — detection events are anchored to the
+                # engine counter (via the channelizer's gap-recovery
+                # logic) and decode workers convert them to ring
+                # offsets via ``ring_state_fn`` + ``_read_ring``.  Stale
+                # ring data in the gap range will be returned for any
+                # read that spans the gap; that's acceptable (the
+                # data was lost), and strictly better than the
+                # pre-fix behaviour where decode workers read good
+                # samples at the WRONG ring offsets and SPD/jt9
+                # silently failed on every burst after the first
+                # drop.
+                gap = rec_start - self._abs_sample
+                if gap > 0:
+                    self._ring_pos = (self._ring_pos + gap) % self._ring_n
+                    self._abs_sample = rec_start
+                    self._n_iq_gap_samples += gap
+                    self._n_iq_gaps += 1
+                elif gap < 0:
+                    # Out-of-order or duplicate record — drop silently.
+                    # Real radios don't reorder, so this only fires on
+                    # test injection; logging would be noise on live
+                    # traffic.
+                    return
 
             # Append, wrapping.  Two-segment copy if needed.
             ring = self._iq_ring
@@ -638,6 +676,8 @@ class DecoderBlock(Block):
         base.update({
             "iq_records":           self._n_iq_records,
             "iq_samples":           self._n_iq_samples,
+            "iq_gaps":              self._n_iq_gaps,
+            "iq_gap_samples":       self._n_iq_gap_samples,
             "detection_events":     self._n_detection_events,
             "decode_attempts":      self._n_decode_attempts,
             "decode_completed":     self._n_decode_completed,
