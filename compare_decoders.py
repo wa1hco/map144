@@ -149,14 +149,37 @@ def normalise_msg(msg: str) -> str:
     return ' '.join(msg.upper().split())
 
 
-def parse_launches(path: Path) -> list[dict]:
+def parse_launches(path: Path, date_str: str | None = None) -> list[dict]:
+    """Parse ``launches.jsonl`` into a list of decode-attempt dicts.
+
+    ``date_str`` is an optional ``YYYYMMDD`` prefix.  If supplied, lines
+    not starting with that day's timestamp are skipped via a fast
+    string check BEFORE the expensive ``json.loads`` + ``strptime``
+    parse — this keeps GUI refresh responsive when the file has grown
+    to hundreds of thousands of entries (the file accumulates ~700/hr
+    indefinitely; after a month it can hit 700k+ lines).
+
+    The prefix the file uses is ``{"timestamp": "YYYY-MM-DD_…``.
+    Without a date prefilter, parsing the full file on every Update
+    click in the GUI takes 10–30 s and produces "not responding" UX.
+    """
     launches = []
     if not path.exists():
         return launches
+    line_prefix = None
+    if date_str:
+        # Convert YYYYMMDD → '{"timestamp": "YYYY-MM-DD_'
+        try:
+            d_iso = (date_str[0:4] + "-" + date_str[4:6] + "-" + date_str[6:8])
+            line_prefix = '{"timestamp": "' + d_iso + '_'
+        except Exception:
+            line_prefix = None
     with open(path) as f:
         for line in f:
             line = line.strip()
             if not line:
+                continue
+            if line_prefix is not None and not line.startswith(line_prefix):
                 continue
             try:
                 d = json.loads(line)
@@ -1772,9 +1795,14 @@ class CompareGUI(QtWidgets.QMainWindow):
             map144_all = [d for d in map144_all if _in_win(d['ts'])]
 
         # ── Launches ──────────────────────────────────────────────────────────
+        # Prefilter by the same YYYYMMDD the user typed in the date box so
+        # we don't json.loads the entire file (700k+ lines after a month).
         launches: list[dict] = []
         if not self._no_launches_cb.isChecked():
-            launches = parse_launches(MAP144_LAUNCHES)
+            launches = parse_launches(
+                MAP144_LAUNCHES,
+                date_str=date_str if date_str else None,
+            )
 
         # ── Match ─────────────────────────────────────────────────────────────
         win = self._win_spin.value()
@@ -2186,7 +2214,10 @@ def main():
 
         launches: list[dict] = []
         if not args.no_launches:
-            launches = parse_launches(Path(args.launches))
+            launches = parse_launches(
+                Path(args.launches),
+                date_str=args.date if args.date else None,
+            )
 
         matched, wsjtx_only, map144_only = match_decodes(wsjtx_all, map144_all, args.window)
         wsjtx_tags, tag_counts = _build_wsjtx_tags(wsjtx_only, launches) if launches else ({}, {})
