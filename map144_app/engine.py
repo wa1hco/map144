@@ -372,6 +372,22 @@ class Engine:
         self._sbuf_end   = 0
         self._sbuf_v_end = 0
 
+        # Mirror the rebuild on the shadow side.  The Block-pipeline
+        # ChannelizerBlock + DetectorBlock are configured ONCE at
+        # ``_ensure_block_runtime`` time using the THEN-current
+        # channel_offset_hz.  When the operator moves the panadapter
+        # center, legacy rebuilds its NCO and detector grid; if shadow
+        # keeps its old grid, detection events fire on the wrong
+        # channels (the 50263 vs 50260 divergence that bug 2 from the
+        # 2026-05-09 bake-in audit captured).  Tear down so the next
+        # IQ tick lazy-rebuilds shadow with the new offset.
+        if self._block_runtime is not None:
+            log.info(
+                "Engine: channelizer rebuild; tearing down shadow Block "
+                "runtime to refresh its channel_offset_hz"
+            )
+            self._stop_block_runtime(timeout_s=1.0)
+
     def setup_radio_client(self):
         """No-op base implementation — overridden by MAP144Visualizer for Qt thread."""
         self.radio_client = None
@@ -398,10 +414,49 @@ class Engine:
 
         See class docstring + ``project_phase3_progress`` memory.
         """
+        # Snapshot ``_tx_settle_remaining`` BEFORE legacy runs (legacy
+        # decrements it by len(iq_samples) per call).  We need both the
+        # at-entry value (for the post-TX settle gate) and the previous
+        # tick's at-entry value (to detect TX→RX transitions, since
+        # ``_tx_settle_remaining`` is set to 24000 in runtime.py BEFORE
+        # process_iq_data is called for the first post-TX packet —
+        # so by the time we see it here it's already non-zero).
+        settle_at_entry = int(getattr(self, '_tx_settle_remaining', 0))
+        prev_settle = getattr(self, '_block_prev_tx_settle', 0)
+        self._block_prev_tx_settle = settle_at_entry
+
         # Always run legacy first — it owns the engine's GUI state.
         _process_iq_data(self, iq_samples, timestamp_int, timestamp_frac)
 
         if not self.use_blocks:
+            return
+
+        # Mirror legacy's TX→RX state purge: legacy deleted ``_pct25``,
+        # reset ``_nb_spec_avg``, zeroed ``_ch_buf``, rebuilt
+        # ``_ch_state`` (runtime.py:1379-1406).  The Block path has
+        # equivalent state inside DetectorBlock / ChannelizerBlock that
+        # we can't surgically reset without per-block teardown
+        # plumbing — so tear the whole runtime down and let
+        # ``_ensure_block_runtime`` lazy-rebuild it on the first IQ
+        # tick after settle ends.  TX leakback into the pct25 baseline
+        # is a measured pollution source that lasts ~30 s post-TX
+        # without this purge (project_post_burst_rebound memory).
+        if (prev_settle == 0 and settle_at_entry > 0
+                and self._block_runtime is not None):
+            log.info(
+                "Engine: TX→RX transition detected; tearing down shadow "
+                "Block runtime to mirror legacy state purge"
+            )
+            self._stop_block_runtime(timeout_s=1.0)
+
+        # Honor legacy's post-TX settle gate (processing.py:571 — detection
+        # is skipped while ``_tx_settle_remaining > 0``).  During this
+        # 500 ms window AGC transients dominate the channelizer output;
+        # shadow detection sees them as broadband false triggers and
+        # contaminates its rolling pct25 baseline.  Skip the pump
+        # entirely; ``_ensure_block_runtime`` will lazy-rebuild on
+        # the first IQ tick after settle reaches 0.
+        if settle_at_entry > 0:
             return
 
         # Then mirror the same IQ into the shadow Block runtime.

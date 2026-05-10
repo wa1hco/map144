@@ -176,5 +176,166 @@ class TestShadowRuntimeLifecycle(unittest.TestCase):
             e._stop_block_runtime(timeout_s=2.0)
 
 
+class TestShadowTxStateHandling(unittest.TestCase):
+    """Shadow runtime must mirror legacy's TX-aware state handling.
+
+    Legacy (runtime.py:1356-1406, processing.py:503-516, 571) does THREE
+    things on the TX→RX boundary:
+
+      1. During TX: drain loop discards packets; process_iq_data not called.
+      2. On TX→RX: purge ``_pct25``, ``_nb_spec_avg``, ``_ch_buf``;
+         set ``_tx_settle_remaining = 0.5 s`` of samples.
+      3. During the 500 ms post-TX settle window: detection skipped
+         (channelizer accumulation discarded); NB still learns.
+
+    Without these, AGC transients on TX→RX would contaminate the
+    rolling pct25 baseline for ~30 s.
+
+    The shadow runtime's pre-fix behaviour on TX:
+      - silent during TX (gated for free, since process_iq_data isn't
+        called)
+      - DOES NOT purge state on TX→RX
+      - DOES NOT skip the 500 ms settle window
+
+    Engine commits the fix in process_iq_data:
+      - if previous-tick settle was 0 and current-tick settle is > 0
+        (the TX→RX transition signature), tear shadow down
+      - if current-tick settle > 0 (we're inside the settle window),
+        skip the IQ pump
+      - the next IQ tick after settle ends lazy-rebuilds shadow with
+        a fresh detector baseline
+    """
+
+    def setUp(self):
+        os.environ["MAP144_USE_BLOCKS"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("MAP144_USE_BLOCKS", None)
+
+    def test_pump_gated_during_tx_settle_window(self):
+        """While ``_tx_settle_remaining > 0``, no IQ should reach
+        the shadow runtime — even if the runtime is up and the flag
+        is on."""
+        from map144_app.engine import Engine
+        e = Engine()
+        try:
+            # Boot the runtime by sending one normal tick.
+            e.process_iq_data(_silent_iq_chunk(4096), 0, 0)
+            self.assertIsNotNone(e._block_runtime)
+            iq_samples_before = e._block_iq_sample_counter
+
+            # Simulate the engine being in a post-TX settle window
+            # (legacy's runtime drain loop sets this on TX→RX).
+            # We've already consumed one tick so prev_settle is 0 and
+            # the next call's settle_at_entry will be 24000 — that
+            # matches the TX→RX transition signature, so the runtime
+            # gets torn down.
+            e._tx_settle_remaining = 24_000   # 0.5 s @ 48 kHz
+            e.process_iq_data(_silent_iq_chunk(4096), 0, 0)
+
+            # Tear-down on TX→RX: shadow runtime should be None now.
+            self.assertIsNone(
+                e._block_runtime,
+                "TX→RX transition should have torn down the shadow runtime "
+                "to mirror legacy's _pct25 / _nb / _ch_state purge",
+            )
+
+            # Subsequent ticks while still in settle should NOT
+            # restart the runtime (settle gate skips the pump
+            # entirely).  legacy decremented _tx_settle_remaining by
+            # 4096 on the first call, so it's now 19904.
+            e.process_iq_data(_silent_iq_chunk(4096), 0, 0)
+            self.assertIsNone(
+                e._block_runtime,
+                "Shadow runtime should stay torn down during settle",
+            )
+
+            # Force settle to complete — next tick should lazy-rebuild
+            # shadow with a fresh detector baseline.
+            e._tx_settle_remaining = 0
+            e.process_iq_data(_silent_iq_chunk(4096), 0, 0)
+            self.assertIsNotNone(
+                e._block_runtime,
+                "After settle ends, shadow runtime should lazy-rebuild "
+                "on next IQ tick",
+            )
+        finally:
+            e._stop_block_runtime(timeout_s=1.0)
+
+    def test_pump_runs_when_settle_zero(self):
+        """Sanity: with no TX-settle in progress, the pump runs as
+        normal (no behaviour change to the non-TX path)."""
+        from map144_app.engine import Engine
+        e = Engine()
+        try:
+            self.assertEqual(getattr(e, '_tx_settle_remaining', 0), 0)
+            sample_counter_before = e._block_iq_sample_counter
+            e.process_iq_data(_silent_iq_chunk(4096), 0, 0)
+            # Pump fired — sample counter advanced.
+            self.assertGreater(e._block_iq_sample_counter, sample_counter_before)
+        finally:
+            e._stop_block_runtime(timeout_s=1.0)
+
+
+class TestShadowChannelizerRebuild(unittest.TestCase):
+    """When the operator moves the panadapter centre, legacy calls
+    ``_rebuild_channelizer_state`` which rebuilds its NCO grid for
+    the new channel_offset_hz.  Shadow's ChannelizerBlock + DetectorBlock
+    were configured at lazy-init with the THEN-current offset; without
+    a parallel rebuild, shadow's NCO stays anchored to the old offset
+    and emits detection events on stale channels — bug 2 from the
+    2026-05-09 bake-in (50263 vs 50260 divergence on the NA6MG QSO).
+    """
+
+    def setUp(self):
+        os.environ["MAP144_USE_BLOCKS"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("MAP144_USE_BLOCKS", None)
+
+    def test_rebuild_tears_down_shadow_runtime(self):
+        from map144_app.engine import Engine
+        e = Engine()
+        try:
+            # Boot shadow with one IQ tick.
+            e.process_iq_data(_silent_iq_chunk(4096), 0, 0)
+            self.assertIsNotNone(e._block_runtime)
+
+            # Operator moves the pan: legacy _rebuild_channelizer_state
+            # is called.  Shadow should tear down so the next IQ tick
+            # lazy-rebuilds with the new offset.
+            e._rebuild_channelizer_state()
+            self.assertIsNone(
+                e._block_runtime,
+                "_rebuild_channelizer_state should tear down shadow so "
+                "the new channel_offset_hz takes effect on next IQ tick",
+            )
+
+            # Next IQ tick brings shadow back, lazy-rebuilt with the
+            # NEW channel_offset_hz computed inside
+            # _rebuild_channelizer_state.
+            e.process_iq_data(_silent_iq_chunk(4096), 0, 0)
+            self.assertIsNotNone(e._block_runtime)
+        finally:
+            e._stop_block_runtime(timeout_s=1.0)
+
+    def test_rebuild_when_shadow_not_started_is_noop(self):
+        """If shadow hasn't been lazy-init'd yet, _rebuild_channelizer_state
+        must not raise — it's the same path the GUI invokes whenever
+        the user retunes, regardless of bake-in flag state."""
+        prev = os.environ.pop("MAP144_USE_BLOCKS", None)
+        try:
+            from map144_app.engine import Engine
+            e = Engine()
+            self.assertFalse(e.use_blocks)
+            self.assertIsNone(e._block_runtime)
+            # No raise.
+            e._rebuild_channelizer_state()
+            self.assertIsNone(e._block_runtime)
+        finally:
+            if prev is not None:
+                os.environ["MAP144_USE_BLOCKS"] = prev
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
