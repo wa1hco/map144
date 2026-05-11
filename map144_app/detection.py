@@ -105,7 +105,17 @@ from .msk144_spd import msk144_spd_decode
 
 _JT9_FTOL          = 100   # Hz — tight search for automated pipeline (fast)
 _JT9_FTOL_ANALYSIS = 400   # Hz — wider default for analysis window (human click accuracy)
-_JT9_DEPTH   = 3
+# jt9 decode depth.  Depth 3 (deep) widens the hypothesis search and adds
+# hash-based LDPC parity shortcuts using the master callsign/grid table.
+# That makes it prone to phantom decodes on noise — popular calls
+# (e.g. K1JT, WA2FZW) appear with arbitrary grids when LDPC parity
+# happens to pass on noise that hashes to a known call.  WSJT-X itself
+# defaults to depth 1 (normal) for live operation; matching here.
+# Observed 2026-05-11: -d 3 produced a 24-decode "CQ K1JT FN20" phantom
+# cluster over 3 hours from a persistent narrowband signal at 50265 kHz
+# (K1JT operates from FN42, FN20 grid is wrong — hash artifact).  Those
+# were going out over UDP/PSKReporter as spurious reports.
+_JT9_DEPTH   = 1
 
 JT9_BASE_ARGS = [
     'jt9', "--msk144",
