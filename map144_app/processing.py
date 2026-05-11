@@ -313,12 +313,20 @@ def _compute_sync_metric_db(sync_window,
     pct25_ctr = getattr(engine, pct25_ctr_attr, 0) + 1
     setattr(engine, pct25_ctr_attr, pct25_ctr)
     pct25 = getattr(engine, pct25_attr, None)
-    if pct25_ctr % 10 == 0 or pct25 is None:
+    # Guard against an empty history when #41c's blanker-gate
+    # suppressed the very first hop's append.  ``cnt == 0`` means
+    # hist_s would be a zero-length array and ``tmp[k]`` would raise
+    # IndexError.  Defer the recompute and fall back to ones until
+    # a clean hop populates real history.
+    if (pct25_ctr % 10 == 0 or pct25 is None) and cnt > 0:
         hist_s = hist[::_METRIC_HIST_STRIDE]
         k      = max(0, int(len(hist_s) * 0.25))
         tmp    = hist_s.copy()
         tmp.partition(k, axis=0)
         pct25  = np.maximum(tmp[k], 1e-30)
+        setattr(engine, pct25_attr, pct25)
+    if pct25 is None:
+        pct25 = np.ones(peaks.shape, dtype=np.float32)
         setattr(engine, pct25_attr, pct25)
 
     return (
@@ -639,12 +647,27 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                  if self._metric_hist_cnt < _METRIC_HIST_DEPTH
                  else self._metric_hist_buf)
         self._pct25_ctr = getattr(self, '_pct25_ctr', 0) + 1
-        if self._pct25_ctr % 10 == 0 or not hasattr(self, '_pct25'):
+        # Guard against an empty history — possible when #41c's
+        # blanker-gate suppresses the FIRST chunk's append (a noise
+        # impulse on chunk 0 happens to trip the blanker before any
+        # clean hop has populated the history).  Without this guard
+        # ``tmp[k]`` indexes into a zero-length array and raises
+        # IndexError.  When hist is empty, defer the recompute — the
+        # ``pct25 = self._pct25`` below uses whatever default was
+        # set in engine.__init__ (np.full(n_channels, 1.0)) until a
+        # clean hop populates real history.
+        if (self._pct25_ctr % 10 == 0 or not hasattr(self, '_pct25')) and self._metric_hist_cnt > 0:
             hist_s = hist[::_METRIC_HIST_STRIDE]
             k      = max(0, int(len(hist_s) * 0.25))
             tmp = hist_s.copy()
             tmp.partition(k, axis=0)          # in-place, bypasses _wrapfunc
             self._pct25 = np.maximum(tmp[k], 1e-30)
+        # Defensive: if neither the recompute fired nor was _pct25
+        # ever set (rare — only on engine restart where the first
+        # chunk had blanking), fall back to ones so detection
+        # thresholds compute without raising AttributeError.
+        if not hasattr(self, '_pct25'):
+            self._pct25 = np.ones(raw_lin.shape, dtype=np.float32)
         pct25 = self._pct25
 
         pair_metric_h = (
@@ -666,12 +689,15 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                       if self._metric_hist_cnt_v < _METRIC_HIST_DEPTH
                       else self._metric_hist_buf_v)
             self._pct25_ctr_v = getattr(self, '_pct25_ctr_v', 0) + 1
-            if self._pct25_ctr_v % 10 == 0 or not hasattr(self, '_pct25_v'):
+            # Same empty-history guard as the H path (TODO #41c).
+            if (self._pct25_ctr_v % 10 == 0 or not hasattr(self, '_pct25_v')) and self._metric_hist_cnt_v > 0:
                 hist_vs = hist_v[::_METRIC_HIST_STRIDE]
                 kv      = max(0, int(len(hist_vs) * 0.25))
                 tmp_v = hist_vs.copy()
                 tmp_v.partition(kv, axis=0)       # in-place, bypasses _wrapfunc
                 self._pct25_v = np.maximum(tmp_v[kv], 1e-30)
+            if not hasattr(self, '_pct25_v'):
+                self._pct25_v = np.ones(raw_lin_v.shape, dtype=np.float32)
             pair_metric_v = (
                 10.0 * np.log10(np.maximum(raw_lin_v / self._pct25_v, 1e-30))
             ).astype(np.float32)

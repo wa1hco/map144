@@ -191,6 +191,34 @@ class TestPct25BlankerGate(unittest.TestCase):
             "must NOT advance the sync history counter.",
         )
 
+    def test_blanker_on_very_first_chunk_does_not_crash(self):
+        """REGRESSION: if the VERY FIRST chunk after engine start
+        happens to trip the blanker, the #41c gate would prevent
+        ``_metric_hist_cnt`` from growing — leaving the history at
+        size 0.  The pct25 recompute then did ``hist_s[k]`` with
+        ``k = 0`` on a zero-length array → IndexError.  Reported
+        2026-05-10 from a real Flex source where chunk-0 had a
+        spike strong enough to be blanked.
+
+        Fix: skip the recompute when history is empty AND fall back
+        to ones() so detection thresholds still compute.
+        """
+        # Fresh engine; force blanker on first chunk.
+        self.engine.blanker.force_blanking = True
+        # This should NOT raise, even though history will never grow
+        # during this chunk's hops.
+        for _ in range(3):
+            self._push()
+        # And once we stop forcing blanker, normal operation resumes.
+        self.engine.blanker.force_blanking = False
+        for _ in range(5):
+            self._push()
+        self.assertGreater(
+            self.engine._metric_hist_cnt, 0,
+            "After blanker stops firing, history should resume "
+            "growing normally.",
+        )
+
     def test_default_blanker_no_blanking_no_skip(self):
         """The Engine's default real blanker (LinradBlanker) on weak
         noise input should NOT fire — the gate flag should be False
