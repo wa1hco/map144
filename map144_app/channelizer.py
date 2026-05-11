@@ -356,7 +356,17 @@ def _nb_mix_fir_sp(b_rev, raw, mix_phase, mix_step, zi, y, new_zi, new_mix_phase
         # Save updated state
         for j in range(ntaps - 1):
             new_zi[k, j] = buf[N + j]
-        new_mix_phase[k] = ph
+        # Renormalize NCO phasor to unit magnitude before storing.
+        # Without this, ph *= st (complex64) accumulates float32 rounding
+        # asymmetries across chunks; |ph| drifts at a per-channel rate
+        # (depends on binary representation of mix_step[k]) and produces
+        # per-channel multiplicative gain drift → ~6 dB P-P banding after
+        # ~5 min, doubled to ~12 dB by the squared-FFT detector.
+        # The pre-2026-04-21 angle-based NCO was implicitly renormalized
+        # each chunk via cos+j*sin reconstruction; this restores that
+        # invariant for the Numba-fused phasor formulation.
+        mag = np.sqrt(ph.real * ph.real + ph.imag * ph.imag)
+        new_mix_phase[k] = ph / mag
 
 
 @numba.njit(parallel=True, cache=True)
@@ -395,7 +405,11 @@ def _nb_mix_fir_dp(b_rev, raw_h, raw_v, mix_phase, mix_step,
         for j in range(ntaps - 1):
             new_zi_h[k, j] = buf_h[N + j]
             new_zi_v[k, j] = buf_v[N + j]
-        new_mix_phase[k] = ph
+        # Renormalize NCO phasor to unit magnitude — see _nb_mix_fir_sp
+        # for the full explanation.  H and V share the same NCO so a
+        # single renormalization here covers both pol paths.
+        mag = np.sqrt(ph.real * ph.real + ph.imag * ph.imag)
+        new_mix_phase[k] = ph / mag
 
 
 def _mix_fir_lp_sp(b_rev, raw, mix_phase, mix_step, zi):
