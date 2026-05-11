@@ -103,7 +103,15 @@ from scipy.signal import decimate, firwin, filtfilt
 
 from .msk144_spd import msk144_spd_decode
 
-_JT9_FTOL          = 100   # Hz — tight search for automated pipeline (fast)
+_JT9_FTOL          = 200   # Hz — search half-width around 1500 Hz audio centre.
+                            # Observed 2026-05-11: 85% of WSJT-X-decoded MSK144
+                            # signals on calling channel land at audio 1600-1640 Hz
+                            # (peak at 1603-1606 Hz), well above the prior 100 Hz
+                            # half-width.  Widening to 200 Hz brings MAP144 in line
+                            # with SPD's ntol=200 default and with the audio-freq
+                            # distribution we actually see in operation.  Costs
+                            # ~30-50% more jt9 CPU per decode — covered by the
+                            # 4-process semaphore.
 _JT9_FTOL_ANALYSIS = 400   # Hz — wider default for analysis window (human click accuracy)
 # jt9 decode depth.  Depth 3 (deep) widens the hypothesis search and adds
 # hash-based LDPC parity shortcuts using the master callsign/grid table.
