@@ -265,7 +265,8 @@ _HI_MASK       = (_SQ_FREQ >=  _SQ_TONE_HZ - _SQ_NTOL_HZ) & \
 
 def _compute_sync_metric_db(sync_window,
                             hist_buf, hist_idx_attr, hist_cnt_attr,
-                            pct25_attr, pct25_ctr_attr, engine
+                            pct25_attr, pct25_ctr_attr, engine,
+                            skip_history_update: bool = False,
                             ) -> tuple[np.ndarray, np.ndarray]:
     """Per-channel coherent sync-correlation peak in dB above 25th-percentile.
 
@@ -295,13 +296,18 @@ def _compute_sync_metric_db(sync_window,
     _, peaks, ish_best_arr = _msk144_sync_correlate_batch(sync_window_c64)
 
     # Rolling 25th-percentile baseline of sync magnitudes (one row per hop).
+    # When the upstream chunk had blanker activity (TODO #41c), skip the
+    # history append so blanker zeros don't pollute the baseline — same
+    # rationale as the squared-FFT path.  pct25 recompute still runs on
+    # the existing history so thresholding stays current.
     idx = getattr(engine, hist_idx_attr)
     cnt = getattr(engine, hist_cnt_attr)
-    hist_buf[idx] = peaks
-    setattr(engine, hist_idx_attr, (idx + 1) % _METRIC_HIST_DEPTH)
-    if cnt < _METRIC_HIST_DEPTH:
-        setattr(engine, hist_cnt_attr, cnt + 1)
-        cnt += 1
+    if not skip_history_update:
+        hist_buf[idx] = peaks
+        setattr(engine, hist_idx_attr, (idx + 1) % _METRIC_HIST_DEPTH)
+        if cnt < _METRIC_HIST_DEPTH:
+            setattr(engine, hist_cnt_attr, cnt + 1)
+            cnt += 1
     hist = hist_buf[:cnt] if cnt < _METRIC_HIST_DEPTH else hist_buf
 
     pct25_ctr = getattr(engine, pct25_ctr_attr, 0) + 1
@@ -408,6 +414,33 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
     blank_mask_v = _nb_result.blank_mask_v if _nb_result.blank_mask_v is not None else blank_mask
     mag_v_disp   = (_nb_result.mag_v if _nb_result.mag_v is not None else
                     (np.abs(raw_v).astype(np.float32) if dual_pol and raw_v is not None else None))
+
+    # TODO #41c: skip pct25 baseline update for hops whose underlying
+    # input chunk had any blanked samples.  Without this gate, the
+    # blanker zeroes (or Hann-tapers) noise-burst samples, which the
+    # squared-FFT measures as LOW power; that pollutes the rolling
+    # 25-percentile baseline downward, and once the burst ends the
+    # baseline is too low — normal noise looks elevated, producing
+    # the 100× post-burst false-trigger spike documented in
+    # ``project_post_burst_rebound`` memory.  The fix freezes the
+    # baseline during blanking; pct25 stays at its pre-burst value,
+    # so post-burst normal noise reads as normal.  The detection
+    # threshold still fires on real signals (raw_lin / pct25 is
+    # still computed every hop), it just doesn't pollute the
+    # rolling reference any more.
+    #
+    # Per-chunk granularity (one chunk → 1-3 detection hops, all
+    # derived from the same input samples) is the natural unit; if
+    # any sample in the chunk was blanked, every hop derived from
+    # that chunk is tainted.
+    _chunk_had_blank_h = bool(blank_mask.any())
+    _chunk_had_blank_v = (
+        bool(_nb_result.blank_mask_v.any())
+        if (dual_pol and _nb_result.blank_mask_v is not None)
+        else _chunk_had_blank_h   # single-pol: H mask applies to V
+    )
+    self._skip_pct25_update_h = _chunk_had_blank_h
+    self._skip_pct25_update_v = _chunk_had_blank_v
 
 
     # ── 1. Write cleaned IQ into the circular ring buffer ────────────────────
@@ -592,10 +625,16 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         raw_lin   = (lo_peak + hi_peak) / 2.0                   # (48,) linear
 
         # ── H-channel rolling 25th-percentile baseline ───────────────────────
-        self._metric_hist_buf[self._metric_hist_idx] = raw_lin
-        self._metric_hist_idx = (self._metric_hist_idx + 1) % _METRIC_HIST_DEPTH
-        if self._metric_hist_cnt < _METRIC_HIST_DEPTH:
-            self._metric_hist_cnt += 1
+        # Skip the history append when this chunk had blanker activity
+        # (TODO #41c — see _skip_pct25_update_h set after the blanker
+        # call above).  The pct25 recompute still runs on the existing
+        # history so detection thresholding stays current; only the
+        # *update* is gated so blanker zeros don't pollute the baseline.
+        if not getattr(self, '_skip_pct25_update_h', False):
+            self._metric_hist_buf[self._metric_hist_idx] = raw_lin
+            self._metric_hist_idx = (self._metric_hist_idx + 1) % _METRIC_HIST_DEPTH
+            if self._metric_hist_cnt < _METRIC_HIST_DEPTH:
+                self._metric_hist_cnt += 1
         hist  = (self._metric_hist_buf[:self._metric_hist_cnt]
                  if self._metric_hist_cnt < _METRIC_HIST_DEPTH
                  else self._metric_hist_buf)
@@ -617,10 +656,12 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
             plin_v    = np.abs(X_sq_v) / CH_DETECT_SIZE
             raw_lin_v = (plin_v[:, _LO_MASK].max(axis=1) +
                          plin_v[:, _HI_MASK].max(axis=1)) / 2.0
-            self._metric_hist_buf_v[self._metric_hist_idx_v] = raw_lin_v
-            self._metric_hist_idx_v = (self._metric_hist_idx_v + 1) % _METRIC_HIST_DEPTH
-            if self._metric_hist_cnt_v < _METRIC_HIST_DEPTH:
-                self._metric_hist_cnt_v += 1
+            # Same blanker-gate as the H path above (TODO #41c).
+            if not getattr(self, '_skip_pct25_update_v', False):
+                self._metric_hist_buf_v[self._metric_hist_idx_v] = raw_lin_v
+                self._metric_hist_idx_v = (self._metric_hist_idx_v + 1) % _METRIC_HIST_DEPTH
+                if self._metric_hist_cnt_v < _METRIC_HIST_DEPTH:
+                    self._metric_hist_cnt_v += 1
             hist_v = (self._metric_hist_buf_v[:self._metric_hist_cnt_v]
                       if self._metric_hist_cnt_v < _METRIC_HIST_DEPTH
                       else self._metric_hist_buf_v)
@@ -667,6 +708,7 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                 self._sync_metric_hist_buf, '_sync_metric_hist_idx',
                 '_sync_metric_hist_cnt', '_sync_pct25', '_sync_pct25_ctr',
                 self,
+                skip_history_update=getattr(self, '_skip_pct25_update_h', False),
             )
             pair_metric_h = np.maximum(pair_metric_h, sync_metric_h)
 
@@ -676,6 +718,7 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                     self._sync_metric_hist_buf_v, '_sync_metric_hist_idx_v',
                     '_sync_metric_hist_cnt_v', '_sync_pct25_v', '_sync_pct25_ctr_v',
                     self,
+                    skip_history_update=getattr(self, '_skip_pct25_update_v', False),
                 )
                 pair_metric_v = np.maximum(pair_metric_v, sync_metric_v)
             else:

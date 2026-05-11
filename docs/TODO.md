@@ -401,11 +401,17 @@ See `project_ml_qso_classifier_plan` memory for the full plan; see
       transition)." Catches ~225 launches/day on 2026-05-08 data
       at zero decode cost. Hold for ML soft-mode rollout (`#37`)
       so the classifier learns the rule before we hard-code it.
-    - 41c. ⬜ Principled DSP fix: exclude blanked samples from
-      the pct25 update path in `_compute_sq_metric_db` so the
-      noise blanker stops biasing the noise-floor estimator —
-      addresses the *cause* of the burst-end adaptive transient
-      rather than just recognising it. ~20 LOC.
+    - 41c. ✅ Principled DSP fix landed: blanker activity on a chunk
+      sets `_skip_pct25_update_h` / `_v` flags on the Engine.  The
+      per-hop loop checks the flag and skips the `_metric_hist_buf`
+      append when set (pct25 recompute still runs on existing
+      history so detection thresholding stays current; only the
+      *update* is gated).  Same gate plumbed through
+      `_compute_sync_metric_db` for the sync-correlator path.  4
+      regression tests in `tests/test_pct25_blanker_gate.py` cover:
+      clean chunks grow history, blanker-firing chunks freeze it,
+      LinradBlanker on quiet noise doesn't false-trigger the gate,
+      and the same flag propagates to the sync-correlator history.
     - 41d. ⬜ Verification of the blanker→pct25 mechanism:
       requires `nb_blanked_pct` per launch (TODO `#27b`
       heartbeat). Run correlation analysis once available.
