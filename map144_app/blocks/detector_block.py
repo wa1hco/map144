@@ -410,7 +410,19 @@ class DetectorBlock(Block):
         # Shift contents left by s.
         self._ch_buf[:, :cfg.fft_size - s] = self._ch_buf[:, s:cfg.fft_size]
         self._ch_buf[:, cfg.fft_size - s:] = 0
-        self._ch_buf_end -= s
+        # Clamp to non-negative.  ``_detect_one_cycle``'s cluster-gate
+        # too-many branch resets ``_ch_buf_end`` to 0 inline (it wants a
+        # clean restart after broadband suppression), and the caller
+        # then runs us anyway since the outer ``while _ch_buf_end >=
+        # fft_size`` loop entered before the reset.  Without the clamp
+        # ``_ch_buf_end`` goes negative; the NEXT outer-loop iteration
+        # mixes a negative start with a positive end in the slice
+        # arithmetic — ``arr[:, -256:-256+512]`` becomes
+        # ``arr[:, 256:256]`` (empty) and we crash trying to write a
+        # full-size record into a zero-width slot.  Caught live during
+        # the 2026-05-11 shadow-runtime run, ~17 s after start, when
+        # the cluster gate fired its first too_many on a burst.
+        self._ch_buf_end = max(0, self._ch_buf_end - s)
         self._n_in_consumed += s
 
     # --- Helpers: per-detector metrics --------------------------------

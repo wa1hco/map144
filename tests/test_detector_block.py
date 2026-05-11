@@ -458,6 +458,90 @@ class TestNyquistMaskUSBConvention(unittest.TestCase):
         )
 
 
+class TestTooManyResetAndAdvanceInteraction(unittest.TestCase):
+    """REGRESSION: when ``_detect_one_cycle``'s cluster-gate too-many
+    branch fires (broadband suppression), it sets ``_ch_buf_end = 0``
+    inline.  The caller then runs ``_advance_one_stride`` anyway
+    because the outer ``while _ch_buf_end >= fft_size`` loop entered
+    before the reset.  Without clamping ``_ch_buf_end`` to non-negative
+    in ``_advance_one_stride``, it goes to ``-stride_samples``.
+
+    The NEXT outer-loop iteration's slice arithmetic then mixes a
+    negative start with a positive end:
+
+        _ch_buf[:, -256 : -256 + 512]   →   _ch_buf[:, 256 : 256]
+
+    which evaluates to an EMPTY slice — numpy resolves -256 to
+    arr.shape[1]-256 = 256 but leaves the positive end as 256
+    literally.  Writing a (48, 512) record into a (48, 0) slot raises
+    ``ValueError: could not broadcast input array from shape (48,512)
+    into shape (48,0)``.
+
+    Caught live during the 2026-05-11 shadow-runtime run, ~17 s after
+    start, when the cluster gate fired its first too_many on a burst.
+    """
+
+    def test_too_many_then_drain_then_advance_does_not_underflow(self):
+        det = _make_detector()
+        cfg = det.config
+
+        # Stub the per-channel metric to produce 6+ fresh clusters,
+        # tripping the too_many gate.  pair_metric ≥ threshold (3.0)
+        # on widely-spaced channels guarantees N independent
+        # clusters (gap > 3 channels each).
+        big = np.zeros(cfg.n_channels, dtype=np.float32)
+        # Pick 7 channels with gap > 3 between each pair so they
+        # become 7 distinct clusters.  Avoid the Nyquist mask zone
+        # (default channel_offset_hz=0 → mask centred near ch 24).
+        cluster_channels = [4, 8, 12, 16, 28, 32, 36]
+        for ch in cluster_channels:
+            big[ch] = 10.0
+        det._compute_sq_metric_db   = lambda _b: big.copy()  # type: ignore[method-assign]
+        det._compute_sync_metric_db = lambda: big.copy()      # type: ignore[method-assign]
+
+        # Fill the buffer to fft_size so _detect_one_cycle is allowed
+        # to run.
+        det._ch_buf[:] = 0.5 + 0.5j   # nonzero so cluster gate processes
+        det._ch_buf_end = cfg.fft_size
+
+        # Trigger the gate.  After this, too_many should have fired
+        # and _ch_buf_end = 0 (the inline reset).
+        det._detect_one_cycle(wall_clock_for_events=1.0)
+        self.assertEqual(
+            det._ch_buf_end, 0,
+            "too_many gate should reset _ch_buf_end to 0 inline",
+        )
+        self.assertGreater(
+            det._n_too_many_clusters_gates, 0,
+            "test fixture must actually trip the too_many gate; "
+            "if zero, the cluster construction needs adjustment",
+        )
+
+        # Now _advance_one_stride runs (the caller does this
+        # unconditionally inside the inner drain loop).  Pre-fix this
+        # would leave _ch_buf_end at -stride_samples = -256.  Post-fix
+        # the clamp keeps it at 0.
+        det._advance_one_stride()
+        self.assertGreaterEqual(
+            det._ch_buf_end, 0,
+            f"_ch_buf_end must not go negative after a too_many reset "
+            f"+ advance — got {det._ch_buf_end}",
+        )
+
+        # And the subsequent slice arithmetic must produce a slot
+        # matching the record's data shape.  Simulate the tick()
+        # writing a 512-sample record into the buffer.
+        space = cfg.fft_size - det._ch_buf_end
+        take = min(space, 512)
+        slot = det._ch_buf[:, det._ch_buf_end:det._ch_buf_end + take]
+        self.assertEqual(
+            slot.shape, (cfg.n_channels, take),
+            f"slice [_ch_buf_end : _ch_buf_end + take] must produce a "
+            f"slot with width=take; got shape {slot.shape} "
+            f"(buf_end={det._ch_buf_end}, take={take})",
+        )
+
+
 # ---------------------------------------------------------------------
 # End-to-end smoke test
 # ---------------------------------------------------------------------
