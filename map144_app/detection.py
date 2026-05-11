@@ -583,11 +583,17 @@ def extract_and_decode(
     launch_ts = detect_ts or datetime.now(timezone.utc).strftime('%Y-%m-%d_%H:%M:%S.%f')[:21]
     _ts_file  = launch_ts[:10].replace('-', '') + '_' + launch_ts[11:19].replace(':', '') + 'Z'
 
-    # MSK144 period timestamp: WSJT-X convention is the END of the Rx period
-    # (= start of the next 15-second window).  A ping received at 09:40:12 is
-    # in the period 09:40:00–09:40:15; WSJT-X logs it as 09:40:15.
-    # Using the same convention ensures MAP144 decodes match the correct QSO
-    # period in WSJT-X (1st/2nd checkbox) and in PSKReporter/DXcluster reports.
+    # MSK144 period timestamp: WSJT-X convention is the START of the Rx
+    # period (the 15-second boundary that contains the ping).  A ping
+    # received at 09:40:12 is in the period 09:40:00–09:40:15; both
+    # WSJT-X and MAP144 log it as 09:40:00.  This matches WSJT-X's
+    # ALL.TXT trigger-time-plus-dt convention floored to the 15-second
+    # boundary, and the way compare_decoders.parse_wsjtx() canonicalises
+    # WSJT-X timestamps — so periods line up at ±0 tolerance.
+    #
+    # (Prior convention was period END / start-of-next-window;
+    #  changed 2026-05-11 to floor instead of ceiling.  Old data in
+    #  decodes.jsonl from before this change is offset +15 s.)
     #
     # PERIOD_SLIP correction: anchor the period to the IQ sample index, not to
     # ``launch_ts``.  ``detect_sample`` is the absolute ring sample of the burst
@@ -604,7 +610,7 @@ def extract_and_decode(
         _ping_epoch_est = iq_t0_wall + detect_sample / sample_rate
     else:
         _ping_epoch_est = _launch_dt.timestamp() - pre_n / sample_rate
-    _period_epoch   = int(_ping_epoch_est // 15) * 15 + 15           # period END
+    _period_epoch   = int(_ping_epoch_est // 15) * 15                # period START
     _period_dt      = datetime.fromtimestamp(_period_epoch, tz=timezone.utc)
     period_ts       = _period_dt.strftime("%Y-%m-%d_%H:%M:%S")
 
@@ -768,7 +774,9 @@ def extract_and_decode(
                         else:
                             _burst_epoch = _launch_dt.timestamp()
                         _ping_epoch_jt9 = _burst_epoch - _wav_offset + _dt_jt9
-                        _period_epoch   = int(_ping_epoch_jt9 // 15) * 15 + 15
+                        # period START (floor); see SPD-path comment above
+                        # for the convention rationale.
+                        _period_epoch   = int(_ping_epoch_jt9 // 15) * 15
                         _period_dt      = datetime.fromtimestamp(_period_epoch, tz=timezone.utc)
                         period_ts       = _period_dt.strftime("%Y-%m-%d_%H:%M:%S")
                     except (ValueError, IndexError, TypeError):
