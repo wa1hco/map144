@@ -689,3 +689,80 @@ class Engine:
         self._block_iq_in_stream = None
         self._block_iq_sample_counter = 0
         self._block_iq_anchor_wall = 0.0
+
+    # ──────────────────────────────────────────────────────────────────
+    # Diagnostic state dump — operator-triggered snapshot of all the
+    # internal arrays that contribute to the detection-spectrum display.
+    # Used when the displayed banding doesn't match what offline tests
+    # produce, so we can analyse the live system's actual state offline.
+    # ──────────────────────────────────────────────────────────────────
+
+    def dump_diagnostic_state(self, path: str) -> None:
+        """Save a snapshot of every internal array that feeds the
+        detection / sync displays.  Output is a single ``.npz`` file
+        suitable for offline analysis.
+
+        Captures:
+        - ``ch_snr_history_h/v``: the buffer the heatmap displays
+        - ``sync_snr_history_h/v``: same for the sync-detector panel
+        - ``metric_hist_buf{_v}``: rolling pct25 history (squared-FFT)
+        - ``sync_metric_hist_buf{_v}``: rolling pct25 history (sync)
+        - ``pct25{_v}``, ``sync_pct25{_v}``: current baseline values
+        - ``nb_spec_avg{_v}``: noise-blanker per-bin running average
+        - Engine counters (``pct25_ctr``, ``metric_hist_cnt/idx``,
+          ``ch_snr_hop_count``, ``iq_abs_sample``, etc.)
+        - Wall-clock timestamp + sample-clock anchor for cross-referencing.
+        """
+        import time as _time
+        snapshot = {
+            "wall_clock":              _time.time(),
+            "sample_rate":             self.sample_rate,
+            "iq_abs_sample":           int(self._iq_abs_sample),
+            "iq_t0_wall":              float(self._iq_t0_wall or 0.0),
+            "ch_snr_history_h":        self._ch_snr_history_h.copy(),
+            "ch_snr_history_v":        self._ch_snr_history_v.copy(),
+            "ch_snr_write_idx":        int(self._ch_snr_write_idx),
+            "ch_snr_hop_count":        int(self._ch_snr_hop_count),
+            "sync_snr_history_h":      self._sync_snr_history_h.copy(),
+            "sync_snr_history_v":      self._sync_snr_history_v.copy(),
+            "metric_hist_buf":         self._metric_hist_buf.copy(),
+            "metric_hist_buf_v":       self._metric_hist_buf_v.copy(),
+            "metric_hist_cnt":         int(self._metric_hist_cnt),
+            "metric_hist_cnt_v":       int(self._metric_hist_cnt_v),
+            "metric_hist_idx":         int(self._metric_hist_idx),
+            "metric_hist_idx_v":       int(self._metric_hist_idx_v),
+            "pct25":                   (self._pct25.copy()
+                                        if hasattr(self, "_pct25") else None),
+            "pct25_v":                 (self._pct25_v.copy()
+                                        if hasattr(self, "_pct25_v") else None),
+            "pct25_ctr":               int(getattr(self, "_pct25_ctr", 0)),
+            "pct25_ctr_v":             int(getattr(self, "_pct25_ctr_v", 0)),
+            "sync_metric_hist_buf":    self._sync_metric_hist_buf.copy(),
+            "sync_metric_hist_buf_v":  self._sync_metric_hist_buf_v.copy(),
+            "sync_metric_hist_cnt":    int(self._sync_metric_hist_cnt),
+            "sync_metric_hist_cnt_v":  int(self._sync_metric_hist_cnt_v),
+            "sync_pct25":              (getattr(self, "_sync_pct25", None).copy()
+                                        if getattr(self, "_sync_pct25", None) is not None else None),
+            "sync_pct25_v":            (getattr(self, "_sync_pct25_v", None).copy()
+                                        if getattr(self, "_sync_pct25_v", None) is not None else None),
+            # Noise-blanker state.
+            "nb_spec_avg":             (self._nb_spec_avg.copy()
+                                        if self._nb_spec_avg is not None else None),
+            "nb_spec_avg_v":           (self._nb_spec_avg_v.copy()
+                                        if self._nb_spec_avg_v is not None else None),
+            "nb_blkrms_median":        float(self._nb_blkrms_median
+                                              if self._nb_blkrms_median is not None else 0.0),
+            "nb_blanked_count":        int(self._nb_blanked_count),
+            "nb_total_count":          int(self._nb_total_count),
+            # Diagnostic toggle + blanker class.
+            "show_raw_power":          bool(getattr(self, "_show_raw_power", False)),
+            "blanker_class":           type(self.blanker).__name__,
+            "dual_pol":                bool(getattr(self, "dual_pol", False)),
+            "source_mode":             str(getattr(self, "source_mode", "unknown")),
+            "center_freq_mhz":         float(self.center_freq_mhz),
+            "calling_freq_mhz":        float(self.calling_freq_mhz),
+        }
+        # Drop None values (numpy savez complains).
+        snapshot = {k: v for k, v in snapshot.items() if v is not None}
+        np.savez(path, **snapshot)
+        log.info("Engine: diagnostic state dumped to %s", path)

@@ -251,6 +251,23 @@ def setup_ui(self):
     self.show_raw_power_action.toggled.connect(self._on_show_raw_power_toggled)
     diagnostics_menu.addAction(self.show_raw_power_action)
 
+    # Save a snapshot of every internal array that feeds the detection /
+    # sync displays.  Operator-triggered so we can compare live-engine
+    # state against what offline tests produce.  Used to chase
+    # phenomena (e.g. heatmap banding) that only manifest in
+    # long-running live sessions.
+    self.dump_state_action = QtWidgets.QAction(
+        "Save state snapshot…", self)
+    self.dump_state_action.setToolTip(
+        "Save a .npz file containing the rolling pct25 history, current "
+        "pct25 baseline, noise-blanker state, and the detection-heatmap "
+        "buffer.  Used to diagnose live-engine behaviour offline."
+    )
+    self.dump_state_action.triggered.connect(
+        lambda: _save_state_snapshot(self)
+    )
+    diagnostics_menu.addAction(self.dump_state_action)
+
     # ── Band selector toolbar ─────────────────────────────────────────────────
     from .visualizer import _SETTINGS as _VS
     band_toolbar = self.addToolBar("Band")
@@ -1070,6 +1087,28 @@ def _on_about(self):
         f"Copyright &copy; 2026 Jeff Millar, WA1HCO<br>"
         f"GNU General Public License v3",
     )
+
+
+def _save_state_snapshot(self):
+    """Diagnostics → Save State Snapshot — dumps the engine's internal
+    arrays (rolling pct25 history, current pct25, blanker state, the
+    detection-heatmap buffer) to a timestamped ``.npz`` file.  Used to
+    diagnose live-engine behaviour that doesn't reproduce in offline
+    tests.
+    """
+    from datetime import datetime
+    from pathlib import Path
+    out_dir = Path(__file__).parent.parent / "MSK144" / "diagnostics"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = out_dir / f"state_snapshot_{stamp}.npz"
+    try:
+        self.dump_diagnostic_state(str(path))
+        self.statusBar().showMessage(f"State snapshot saved: {path.name}", 4000)
+    except Exception as exc:
+        self.statusBar().showMessage(
+            f"State snapshot failed: {exc}", 6000,
+        )
 
 
 def _on_fast_graph_click(self, x_sec, y_mhz, modifiers, window='current'):
