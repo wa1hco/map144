@@ -222,10 +222,13 @@ def coherent_burst_freq_estimate(
         # 3. Sync-correlate the summed frame
         _, xmax, _ = _sync_correlate(summed)
         magnitudes[i] = float(xmax)
-    # n_syncs_used semantics: WSJT-X-equivalent integration uses 2 syncs per
-    # summed frame regardless of n_frames; the integration gain comes from
-    # the n_frames sum, not from extra sync positions.
-    n_syncs_used = 2
+    # n_syncs_used: the *energy* from 2*n_frames syncs (2 per frame) is what
+    # gets coherently integrated into the summed frame.  The sync correlator
+    # then makes a single pass against a 2-sync template applied to that
+    # summed frame, but the physical gain is the √(2·n_frames) coherent sum.
+    # Reporting 2·n_frames here matches the operator's intuition for
+    # "how many syncs went into this estimate".
+    n_syncs_used = 2 * n_frames
 
     # Find the peak and refine via parabolic interpolation
     i_peak = int(np.argmax(magnitudes))
