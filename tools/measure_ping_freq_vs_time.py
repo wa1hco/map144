@@ -64,6 +64,87 @@ BURST_THRESH_DB = 4.0               # burst above (median + 4 dB)
 MIN_BURST_S     = 0.050             # ignore < 50 ms transients
 
 
+# ── Sync-correlation-based carrier tracker (matched filter, low-SNR robust) ──
+# The squared-FFT carrier estimator (used for σ_f stats elsewhere in this
+# file) is noise-limited: it needs the signal to dominate the squared
+# spectrum, which requires roughly +4 dB envelope above noise.  For weak
+# signals where coherent integration would actually help, that method gives
+# noise.
+#
+# A sync-correlation-vs-freq scan is a matched filter against the known
+# MSK144 sync sequence.  It gains the matched-filter processing gain
+# (~6 dB for the 42-chip sync), extending reliable carrier estimation
+# into the sub-+4-dB regime where coherent-integration design changes
+# matter.  This is exactly the inner search WSJT-X's msk144_freq_search
+# already does internally — we expose the full curve instead of just the
+# winning frequency.
+
+def sync_corr_freq_track(
+    audio_real: np.ndarray,
+    sr: int = SR_AUDIO,
+    f_min_hz: float = -150.0,
+    f_max_hz: float = +150.0,
+    f_step_hz: float = 5.0,
+    frame_n: int | None = None,        # 864 = 72 ms at 12 kHz (one MSK frame)
+    step_s: float = 0.020,             # 20 ms hop between estimates
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (t, f_peak_hz, mag_peak) arrays — sync-correlator carrier
+    estimate over time.
+
+    For each ``step_s`` hop, takes a ``frame_n``-sample window, scans the
+    candidate frequency range, applies the freq shift, correlates against
+    the MSK144 sync template, and records the freq at peak magnitude.
+    """
+    from scipy.signal import hilbert as _hilbert
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from map144_app.msk144_spd import _sync_correlate, NSPM
+
+    if frame_n is None:
+        frame_n = NSPM    # 864 = 72 ms = one MSK144 frame
+    step_n = max(1, int(round(step_s * sr)))
+
+    # Real audio → complex analytic → mix down by 1500 Hz so signal at DC.
+    # Then RMS-normalise to 1.0 and scale by √2 so the sync correlator sees
+    # the amplitude convention its sync threshold was calibrated for
+    # (matches the complex_baseband normalisation in msk144_spd_decode).
+    analytic = _hilbert(audio_real.astype(np.float64)).astype(np.complex64)
+    t_full = np.arange(len(analytic), dtype=np.float64) / sr
+    baseband = (analytic * np.exp(-2j * np.pi * 1500.0 * t_full)).astype(np.complex64)
+    rms = float((np.abs(baseband.astype(np.complex128)) ** 2).mean() ** 0.5)
+    if rms > 1e-12:
+        baseband = (baseband * (np.sqrt(2.0) / rms)).astype(np.complex64)
+
+    freqs = np.arange(f_min_hz, f_max_hz + f_step_hz/2, f_step_hz, dtype=np.float64)
+    n_steps = max(0, (len(baseband) - frame_n) // step_n + 1)
+
+    t_arr = np.empty(n_steps, dtype=np.float32)
+    f_arr = np.empty(n_steps, dtype=np.float32)
+    m_arr = np.empty(n_steps, dtype=np.float32)
+
+    t_frame = np.arange(frame_n, dtype=np.float64) / sr
+    # Pre-compute all freq-shift phasors (frame_n × n_freqs is small)
+    phasors = np.exp(-2j * np.pi * np.outer(t_frame, freqs)).astype(np.complex64)
+    # phasors[:, k] is the shift for freqs[k]
+
+    for i in range(n_steps):
+        start = i * step_n
+        frame = baseband[start:start + frame_n]
+        # Apply each candidate shift and pick the one with the highest
+        # sync-correlation peak magnitude.
+        best_f, best_m = 0.0, -1.0
+        for k in range(len(freqs)):
+            shifted = (frame * phasors[:, k]).astype(np.complex64)
+            _, xmax, _ = _sync_correlate(shifted)
+            if xmax > best_m:
+                best_m = xmax
+                best_f = float(freqs[k])
+        t_arr[i] = (start + frame_n / 2) / sr
+        f_arr[i] = best_f
+        m_arr[i] = best_m
+
+    return t_arr, f_arr, m_arr
+
+
 @dataclass
 class BurstFreqStat:
     t_start: float
@@ -313,7 +394,8 @@ def analyse_wav(path: Path) -> tuple[np.ndarray, np.ndarray, float, list[BurstFr
 def plot_wav(path: Path, env_db: np.ndarray, freq_t: np.ndarray, env_bin_s: float,
              bursts: list[BurstFreqStat], out_path: Path | None = None,
              pre_post_buffer_s: float = 0.5,
-             decoded_msgs: list[str] | None = None) -> Path:
+             decoded_msgs: list[str] | None = None,
+             sync_track: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None) -> Path:
     """Plot envelope + instantaneous freq, zoomed to the ping(s) with a
     pre/post-burst buffer for noise-floor reference.
 
@@ -399,9 +481,35 @@ def plot_wav(path: Path, env_db: np.ndarray, freq_t: np.ndarray, env_bin_s: floa
     # Plot tier B first so tier A appears on top
     fb = np.where(tier_b_mask, freq_t - 1500.0, np.nan)
     fa = np.where(tier_a_mask, freq_t - 1500.0, np.nan)
-    ax_f.plot(t, fb, 'o', color='lightgrey', markersize=3, label='sub-threshold (1-4 dB)')
+    ax_f.plot(t, fb, 'o', color='lightgrey', markersize=3, label='sq-FFT  sub-threshold')
     ax_f.plot(t, fa, 'o-', color='C2', markersize=3.5, lw=0.8,
-              label=f'in-burst (>{BURST_THRESH_DB:.0f} dB)')
+              label=f'sq-FFT  in-burst (>{BURST_THRESH_DB:.0f} dB)')
+    # Optional: overlay sync-correlation carrier track (matched filter).
+    # Threshold-filter to show only the high-confidence picks — the
+    # correlator returns *some* freq for every window even on noise, and
+    # plotting all of them clutters the plot beyond use.
+    #
+    # Threshold = median magnitude + 1.5 × MAD (robust against the long tail
+    # of high-signal samples).  Empirically this keeps the in-burst markers
+    # and the strongest sub-threshold matches, while suppressing the
+    # noise-floor scatter.  Marker size within the kept set scales with
+    # confidence so the strongest locks visually dominate.
+    if sync_track is not None:
+        ts, fs, ms = sync_track
+        if len(ms) > 0:
+            med = float(np.median(ms))
+            mad = float(np.median(np.abs(ms - med)))
+            thr = med + 1.5 * max(mad, 1.0)
+            keep = ms > thr
+            ts_k, fs_k, ms_k = ts[keep], fs[keep], ms[keep]
+            if len(ms_k) > 0:
+                m_norm = (ms_k - thr) / max(1e-6, ms_k.max() - thr)
+                sizes = 10.0 + 40.0 * m_norm    # 10 (just above thr) .. 50 (strongest)
+                # fs is already the offset from 1500 Hz audio — do NOT subtract 1500
+                ax_f.scatter(ts_k, fs_k, s=sizes, marker='x', color='C3',
+                             alpha=0.85, linewidths=1.4,
+                             label=f'sync-corr peak  (mag > {thr:.0f}, '
+                                   f'{keep.sum()}/{len(ms)} pts kept)')
     ax_f.axhline(0.0, color='k', ls=':', lw=0.5)
     ax_f.set_ylabel('Inst. freq − 1500 Hz')
     ax_f.set_xlabel('Time within WAV (s)')
@@ -482,6 +590,11 @@ def main(argv: list[str] | None = None) -> int:
                     help='In batch mode, generate a freq-vs-time plot for every '
                          'WAV that has at least one burst, saving into DIR.  '
                          'Filenames: freqtime_<wav-stem>.png')
+    ap.add_argument('--sync-corr', action='store_true',
+                    help='Overlay the sync-correlation-peak carrier track on the '
+                         'freq panel.  Matched filter against the MSK144 sync '
+                         'template — works at lower SNR than the squared-FFT '
+                         'estimator that drives the dots/lines.  Slower (~5-10x).')
     args = ap.parse_args(argv)
 
     save_dir = args.wsjtx_dir / 'save'
@@ -498,8 +611,19 @@ def main(argv: list[str] | None = None) -> int:
         # Look up decoded messages from WSJT-X ALL.TXT for the title
         msg_index = _load_wsjtx_messages(args.wsjtx_dir / 'ALL.TXT')
         decoded_msgs = _msgs_for_wav(wav_path, msg_index) if msg_index else []
+        # Optional sync-correlation freq track overlay
+        sync_track = None
+        if args.sync_corr:
+            import wave
+            with wave.open(str(wav_path), 'rb') as wf:
+                _sr = wf.getframerate()
+                _audio = (np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+                          .astype(np.float32) / 32768.0)
+            print("  computing sync-correlation freq track...", file=sys.stderr)
+            sync_track = sync_corr_freq_track(_audio, _sr)
+            print(f"  sync-corr: {len(sync_track[0])} samples", file=sys.stderr)
         png = plot_wav(wav_path, env_db, freq_t, bin_s, bursts,
-                       decoded_msgs=decoded_msgs)
+                       decoded_msgs=decoded_msgs, sync_track=sync_track)
         msgs_str = '  /  '.join(decoded_msgs) if decoded_msgs else '(no decoded message)'
         print(f"{wav_path.name}  ({len(bursts)} bursts)  WSJT-X: {msgs_str}")
         for b in bursts:
