@@ -563,7 +563,14 @@ def plot_wav(path: Path, env_db: np.ndarray, freq_t: np.ndarray, env_bin_s: floa
         )
 
     if out_path is None:
-        out_path = Path('/tmp') / f'freqtime_{path.stem}.png'
+        # Default: docs/figures/freq_vs_time_single/ — keeps single-WAV outputs
+        # inside the project tree so they're a click away in VS Code's file
+        # explorer instead of buried in /tmp.  Distinct from
+        # freq_vs_time_corpus/ (full batch outputs) and the curated
+        # doppler_sample_*.png at the docs/figures/ root.
+        default_dir = Path(__file__).resolve().parent.parent / 'docs' / 'figures' / 'freq_vs_time_single'
+        default_dir.mkdir(parents=True, exist_ok=True)
+        out_path = default_dir / f'freqtime_{path.stem}.png'
     plt.tight_layout()
     plt.savefig(str(out_path), dpi=110)
     plt.close()
