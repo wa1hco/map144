@@ -538,7 +538,7 @@ def main() -> int:
                          "Set to a large number (e.g. 1000) to disable.")
     ap.add_argument("--pan-window-s", type=float, default=300.0,
                     help="Window size for the pan-centre filter (seconds).")
-    ap.add_argument("--output", default=str(REPO / "docs" / "launch_patterns.png"))
+    ap.add_argument("--output", default=str(REPO / "docs" / "figures" / "launch_patterns.png"))
     args = ap.parse_args()
 
     since = None

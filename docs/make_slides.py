@@ -2,6 +2,7 @@
 """Generate map144 presentation as map144_presentation.pptx.
 
 Run from the project root:
+    pip install python-pptx        # one-time; not a runtime dep
     python docs/make_slides.py
 
 Produces docs/map144_presentation.pptx  (open in LibreOffice Impress or PowerPoint).
@@ -46,9 +47,11 @@ MONO_FONT  = "Courier New"
 W = Inches(13.333)
 H = Inches(7.5)
 
-_DOCS_DIR = Path(__file__).parent
+_DOCS_DIR    = Path(__file__).parent
+_FIGURES_DIR = _DOCS_DIR / "figures"          # all PNG assets live here
+_FIGURES_DIR.mkdir(exist_ok=True)
 
-_PIPELINE_PNG = _DOCS_DIR / "map144_pipeline.png"
+_PIPELINE_PNG = _FIGURES_DIR / "map144_pipeline.png"
 
 _PIPELINE_DOT = """\
 digraph pipeline {
@@ -126,7 +129,7 @@ digraph pipeline {
 }
 """
 
-_SPD_DETAIL_PNG = _DOCS_DIR / "map144_spd_detail.png"
+_SPD_DETAIL_PNG = _FIGURES_DIR / "map144_spd_detail.png"
 
 _SPD_DETAIL_DOT = """\
 digraph spd_detail {
@@ -499,7 +502,7 @@ def image_slide(prs, title, label, caption="", notes="", png=None):
                 Inches(0.4), Inches(0.15), Inches(12.5), Inches(0.85),
                 color=NAVY, size=32, bold=True)
     img_h = Inches(5.4) if caption else Inches(6.1)
-    png_path = _DOCS_DIR / png if png else None
+    png_path = _FIGURES_DIR / png if png else None
     if png_path and png_path.exists():
         _add_picture_fit(slide, png_path,
                          int(Inches(0.4)), int(Inches(1.1)),
@@ -540,7 +543,7 @@ def bullets_image_slide(prs, title, items, label, caption="", notes="", png=None
     _def_img_h = Inches(5.5) if not caption else Inches(5.0)
     _i_top     = img_top if img_top is not None else int(_txt_top)
     _i_h       = img_h   if img_h   is not None else int(_def_img_h)
-    png_path   = _DOCS_DIR / png if png else None
+    png_path = _FIGURES_DIR / png if png else None
     if png_path and png_path.exists():
         _add_picture_fit(slide, png_path,
                          int(_IMG_LEFT), _i_top, int(_IMG_W), _i_h,
@@ -600,7 +603,7 @@ def stacked_image_slide(prs, title, items, label, notes="", png=None):
     _min_txt_h  = Inches(1.0)                 # minimum height reserved for bullets
 
     # ── Compute image geometry from actual pixel dimensions ───────────────
-    png_path = _DOCS_DIR / png if png else None
+    png_path = _FIGURES_DIR / png if png else None
     if png_path and png_path.exists():
         with _PILImage.open(png_path) as im:
             iw, ih = im.size

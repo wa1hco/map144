@@ -15,7 +15,7 @@
 """Screenshot capture window — save any combination of MAP144 windows to PNG.
 
 Accessible via View → Screenshots.  Each window has a checkbox; pressing
-"Capture Selected" or "Capture All" writes PNG files to docs/.
+"Capture Selected" or "Capture All" writes PNG files to docs/figures/.
 
 Filename mode (radio buttons):
   Standard name  — overwrites the canonical name used by the slide deck,
@@ -34,8 +34,9 @@ from PyQt5 import QtCore, QtWidgets
 from .visualizer import _SETTINGS
 
 
-# Output directory relative to the project root (parent of map144_app/).
-_DOCS_DIR = Path(__file__).parent.parent / "docs"
+# Output directory: docs/figures/ at the project root (all PNGs live there).
+_DOCS_DIR = Path(__file__).parent.parent / "docs" / "figures"
+_DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def setup_screenshot_window(self, view_action):
@@ -50,7 +51,7 @@ def setup_screenshot_window(self, view_action):
     self._screenshot_win = win
 
     # ── Title label ──────────────────────────────────────────────────────────
-    title = QtWidgets.QLabel("Capture windows to PNG files in docs/")
+    title = QtWidgets.QLabel("Capture windows to PNG files in docs/figures/")
     title.setStyleSheet("QLabel { font-weight: bold; font-size: 10pt; }")
     layout.addWidget(title)
 
@@ -182,7 +183,7 @@ def setup_screenshot_window(self, view_action):
 
 
 def _do_capture(self, capture_all: bool):
-    """Capture selected (or all) windows and write PNG files to docs/."""
+    """Capture selected (or all) windows and write PNG files to docs/figures/."""
     _WINDOWS = self._screenshot_win._window_entries
     _DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -229,7 +230,7 @@ def _do_capture(self, capture_all: bool):
             status_lines.append(f"  FAIL  {filename}  (save error)")
             print(f"[screenshot] failed to save {out_path}", flush=True)
 
-    summary = f"Captured {captured} window(s) → docs/"
+    summary = f"Captured {captured} window(s) → docs/figures/"
     status_lines.insert(0, summary)
     self._screenshot_status.setPlainText("\n".join(status_lines))
     print(f"[screenshot] {summary}", flush=True)

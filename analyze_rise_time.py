@@ -44,7 +44,7 @@ Usage::
         --weak-fading WA2FZW \\
         --strong-local N1KWF,KB1MGI \\
         --max-wavs-per-call 6 \\
-        --output docs/rise_time_compare.png
+        --output docs/figures/rise_time_compare.png
 """
 from __future__ import annotations
 
@@ -549,7 +549,7 @@ def main() -> int:
                                 / "WSJT-X - Local" / "save"),
                     help="WSJT-X SaveAll/SaveDecoded directory (15-s WAVs).  "
                          "Pass empty string to disable.")
-    ap.add_argument("--output", default=str(_REPO / "docs" / "rise_time_compare.png"))
+    ap.add_argument("--output", default=str(_REPO / "docs" / "figures" / "rise_time_compare.png"))
     ap.add_argument("--summary-only", action="store_true",
                     help="Print summary table only; skip plot")
     args = ap.parse_args()
