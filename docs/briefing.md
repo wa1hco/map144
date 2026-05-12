@@ -172,6 +172,51 @@ The FlexRadio VITA-49 stream delivers ~375 packets/second. A previous design pro
 
 ---
 
+## Propagation Physics: Meteor-Scatter Doppler and Coherence
+
+MSK144 coherent integration is limited by the frequency stability of the signal over the integration window.  For 6 m (50 MHz, λ ≈ 6 m) the path applies Doppler from three sources:
+
+| Source | Magnitude | Time scale |
+|---|---|---|
+| **Trail wind drift** — 100-200 m/s wind at 90-100 km altitude | ±30-65 Hz radial | Quasi-constant over a ping; varies slowly across a session |
+| **Trail expansion** — ambipolar diffusion of the ionized column, 1-5 m/s | ±0.3-1.7 Hz | Monotonic decay toward zero as the trail expands |
+| **Multipath between reflection points** | A few to tens of Hz | Fast — the time-domain signature is *amplitude flutter* |
+
+The third source is the most relevant to decoder design.  Multiple ionized regions along the trail reflect simultaneously, each at a slightly different radial velocity and therefore slightly different Doppler.  The decoded signal is the coherent sum of these reflections.  **Amplitude flutter and frequency flutter are the same phenomenon** — both are interference between multiple-Doppler paths producing time-varying constructive/destructive combinations.
+
+### Implication for coherent integration
+
+For coherent averaging to gain SNR linearly with the number of averaged frames `N`, the signal phase must stay within roughly π/4 over the full integration window.  The bound this places on frequency stability:
+
+| Coherent window | Max Δf within window |
+|---|---|
+| 1 frame (72 ms) | ±1.7 Hz |
+| 2 frames (144 ms) | ±0.87 Hz |
+| 3 frames (216 ms) | ±0.58 Hz |
+| 5 frames (360 ms) | ±0.35 Hz |
+| 7 frames (504 ms) | ±0.25 Hz |
+
+WSJT-X's MSK144 decoder (Deep mode, `-d 3`) attempts 5- and 7-frame coherent averages.  Those work on smooth overdense trails dominated by a single reflection and **fail silently on fluttery signals** — the algorithm has no in-burst frequency tracking, so when the signal drifts the coherent gain degrades but is still attempted and counted.  This is one source of phantom decodes during noise/multipath events.
+
+### Where MAP144 could differ from WSJT-X
+
+Existing WSJT-X coherent integration assumes the signal is stationary in frequency over the averaging window.  A measurement-driven extension for MAP144:
+
+1. Split the burst into sub-windows (e.g., 5 × ~72 ms slices) and estimate fest in each.
+2. Compute the frequency-vs-time track for the burst.
+3. Either **mix-correct** the signal against the tracked frequency *before* coherent averaging, recovering coherent gain on fluttery signals, or **gate** the coherent-averaging length based on the measured drift variance vs the coherence bound above.
+
+This is a genuine algorithmic step beyond WSJT-X — not a port but a measurement-validated extension.  Open questions answerable from a per-burst dataset of WAV files + per-burst frequency-vs-time measurements:
+
+- How much does frequency change within a typical burst?
+- Does amplitude flutter correlate with frequency flutter (and how strongly)?
+- What is the practical upper bound on coherent-integration length for 6 m MS?
+- For what fraction of pings would mix-correction during integration meaningfully improve decode SNR?
+
+These distributions do not appear to be published in measured form anywhere in the literature; building this dataset locally is a meaningful contribution.
+
+---
+
 ## Current Limitations
 
 **RTL-SDR gain calibration**: The 20 dB fixed manual gain is a starting point. The R820T2 accepts only discrete gain steps; the nearest step is applied silently. No UI control for gain adjustment — requires editing `runtime.py`.
