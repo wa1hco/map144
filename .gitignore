@@ -101,3 +101,7 @@ fortran_bp_test/*.mod
 fortran_bp_test/bp_test
 fortran_bp_test/mf_test
 
+
+# Intentional documentation figures — override the global *.png
+!docs/figures/
+!docs/figures/*.png
