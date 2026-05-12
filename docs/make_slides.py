@@ -780,8 +780,10 @@ def build():
         (0, "9 · Performance engineering — iterative profiling and optimization"),
         (0, "10 · Decoder sensitivity investigation"),
         (0, "11 · MAP144 vs WSJT-X real-world comparison"),
-        (0, "12 · Support and resources"),
-    ], notes="Overview of the talk. Skip or reorder sections to suit the audience.")
+        (0, "12 · Doppler measurements & design opportunities"),
+        (0, "13 · Support and resources"),
+    ], notes="Overview of the talk. Skip or reorder sections to suit the audience. "
+             "Section 12 is the original-research half — skip for general audiences.")
 
     content_slide(prs, "Why MAP144?", [
         (0, "Normal MSK144 activity is concentrated on the calling frequency"),
@@ -998,6 +1000,44 @@ def build():
         (1, "Hardware phase error and trail phase shift both corrected implicitly"),
     ], notes="The implicit search approach means no calibration procedure is needed. "
              "The system self-corrects for cable differences every ping.")
+
+    content_slide(prs, "Doppler on the Propagation Path", [
+        (0, "On 6 m (50 MHz, λ ≈ 6 m) the path applies Doppler from three sources"),
+        (0, "Trail wind drift  —  upper-atmosphere wind at 90-100 km altitude"),
+        (1, "Wind speed 100-200 m/s, radial Doppler ±30-65 Hz"),
+        (1, "Quasi-constant within a ping; varies slowly across a session"),
+        (0, "Trail expansion  —  ambipolar diffusion of the ionised column"),
+        (1, "Expansion 1-5 m/s, Doppler ±0.3-1.7 Hz"),
+        (1, "Monotonic decay toward zero as the trail spreads"),
+        (0, "Multipath between reflection points  —  the fast component"),
+        (1, "Multiple ionised regions along the trail reflect simultaneously"),
+        (1, "Each at slightly different radial velocity → slightly different Doppler"),
+        (1, "Their coherent sum modulates both amplitude and frequency"),
+        (0, "Key insight:  amplitude flutter and frequency flutter are the same phenomenon"),
+        (1, "Both are interference between paths with different Doppler"),
+        (1, "A ping that flutters in amplitude is also fluttering in frequency"),
+    ], notes="Set up the physics context for the coherent-integration slide that follows. "
+             "Magnitudes are order-of-magnitude — the actual radial component depends on geometry. "
+             "The multipath insight is what motivates the design discussion in Section 12.")
+
+    content_slide(prs, "Coherent Integration Has a Doppler Ceiling", [
+        (0, "Coherent averaging gains SNR linearly with N frames  —  IF phase is stable"),
+        (1, "Signal sums as N · A (vectors add)"),
+        (1, "Noise sums as √N · σ (random phases add as variance)"),
+        (1, "Net gain ∝ √N when coherent — none when phase walks freely"),
+        (0, "Phase must stay within ~π/4 over the full integration window"),
+        (0, "Maximum allowable frequency drift per window length:"),
+        (1, "1 frame  (72 ms):   ±1.70 Hz"),
+        (1, "2 frames (144 ms):  ±0.87 Hz"),
+        (1, "3 frames (216 ms):  ±0.58 Hz"),
+        (1, "5 frames (360 ms):  ±0.35 Hz"),
+        (1, "7 frames (504 ms):  ±0.25 Hz"),
+        (0, "WSJT-X Deep mode (-d 3) attempts 5- and 7-frame averages"),
+        (1, "Works on smooth overdense trails (one dominant reflection, stable phase)"),
+        (1, "Fails silently on fluttery signals — coherent gain degrades, decoder still tries"),
+        (1, "Phantom decodes during noise events come partly from this"),
+    ], notes="The π/4 criterion is a standard rule of thumb for matched-filter coherent gain. "
+             "Real-world measurements show this ceiling is hard to reach — see Section 12.")
 
     content_slide(prs, "MSK144 — The Protocol", [
         (0, "Part of the WSJT-X suite by K1JT et al."),
@@ -2390,9 +2430,106 @@ def _nb_mix_fir_sp(b_rev, raw, mix_phase, mix_step, zi, y, new_zi, new_mix_phase
           "If no_decode >> decoded, the threshold may be too low.")
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # SECTION 12 — SUPPORT
+    # SECTION 12 — DOPPLER MEASUREMENTS & DESIGN OPPORTUNITIES
     # ═══════════════════════════════════════════════════════════════════════════
-    section_slide(prs, 12, "Support and Resources",
+    section_slide(prs, 12, "Doppler Measurements & Design Opportunities",
+        subtitle="What measured signal physics tells us about future decoder design",
+        audience="Technical",
+        notes="This section is the original research half of the project — measurements "
+              "of within-burst Doppler statistics from a captured corpus, and the "
+              "architectural extensions to WSJT-X that the measurements motivate.  "
+              "Skip for a general-audience talk.")
+
+    content_slide(prs, "Measuring Frequency vs Time", [
+        (0, "Standard MS decoders (WSJT-X, jt9) report one frequency per decode"),
+        (1, "No information about how the frequency changes during the burst"),
+        (0, "MAP144 tool:  tools/measure_ping_freq_vs_time.py"),
+        (1, "For each WSJT-X-saved WAV in a session corpus:"),
+        (2, "Bandpass to MSK144 audio band (1300-1700 Hz)"),
+        (2, "Square the signal — modulation tones become CW lines at 2·f₀ ± 1000 Hz"),
+        (2, "Sliding short FFT, ±300 Hz peak search around each squared tone"),
+        (2, "Carrier estimate = (low_tone + high_tone) / 4   at 10-ms resolution"),
+        (1, "Suppresses MSK modulation contamination that breaks Hilbert-derivative methods"),
+        (0, "Per-burst statistics computed:"),
+        (1, "σ(f), Δf  —  frequency stability within the burst"),
+        (1, "Pearson r(|A|, f)  —  direct test of the multipath hypothesis"),
+        (1, "Burst duration, peak above noise floor"),
+        (0, "These distributions are not in the published literature for 6 m MS"),
+    ], mono_items={2, 3},
+    notes="The squared-spectrum approach is the same trick MAP144's tone-pair detector uses. "
+          "Hilbert-phase-derivative measurements gave inflated σ(f) due to MSK modulation leak — "
+          "squared FFT is cleaner.  Validated against the same WAV with both methods.")
+
+    image_slide(prs, "Ping vs Continuous Signal — Same Metric, Different Physics",
+        label="doppler_ping_vs_continuous",
+        caption="Left: meteor-scatter ping (KB8OTK, 90 ms, σ_f = 7.7 Hz).  "
+                "Right: strong-local continuous signal (N1KWF, 15 s, σ_f = 44.8 Hz).",
+        notes="The ping has stable frequency over its short lifetime — coherent integration "
+              "could in principle gain on it.  The continuous signal drifts substantially "
+              "over 15 s — a single frequency estimate is wrong by tens of Hz at the "
+              "session edges.  Period-mode decode (TODO #42) needs in-window tracking.",
+        png="doppler_ping_vs_continuous.png")
+
+    image_slide(prs, "Doppler Statistics from 145 Bursts",
+        label="doppler_burst_stats_distributions",
+        caption="2026-05-11 corpus.  Top-left: σ(f) histogram with coherent-gain ceilings.  "
+                "Top-right: σ(f) vs duration.  Bottom-left: |r(|A|, f)| distribution.  "
+                "Bottom-right: |r| vs σ(f), peak-SNR coloured.",
+        notes="Vertical red dashed lines in top-left are the coherent-gain ceilings for "
+              "N=1,2,3,5,7 frames.  Most bursts exceed even the 1-frame ceiling.  "
+              "Bottom-right shows that bursts with higher σ(f) tend to have stronger |r| — "
+              "the multipath signature.",
+        png="doppler_burst_stats_distributions.png")
+
+    content_slide(prs, "Findings from 145 Bursts", [
+        (0, "σ(f) within burst"),
+        (1, "median 7.5 Hz, p75 13.1 Hz, max 128 Hz"),
+        (1, "Grows monotonically with burst duration"),
+        (2, "<100 ms bursts:  median 6.6 Hz"),
+        (2, "100-200 ms:        median 10.8 Hz"),
+        (2, "200-400 ms:        median 13.5 Hz"),
+        (0, "Fraction satisfying the worst-case coherent-gain ceiling"),
+        (1, "N=1 frame  (σ<1.70 Hz):  4.8% of bursts"),
+        (1, "N=2 frames (σ<0.87 Hz):  1.4%"),
+        (1, "N=3 frames (σ<0.58 Hz):  0%   ← zero"),
+        (1, "N=5, N=7:                0%   ← zero"),
+        (0, "Amplitude-frequency correlation"),
+        (1, "Strong (|r|>0.5):    26% of bursts"),
+        (1, "Moderate (|r|>0.3):  50%"),
+        (1, "Confirms the multipath mechanism — flutter is correlated"),
+        (0, "Ceiling formula is conservative (worst-case random walk)"),
+        (1, "Linear drift is easier — decoder partially tolerates it"),
+        (1, "But the trend is unambiguous: 5/7-frame integration is Doppler-limited"),
+    ], notes="The N=3 row at 0% is the striking result.  Conservative formula, yes, "
+             "but the message holds: -d 3 Deep mode's longer averages have very little "
+             "physics-allowed signal to integrate on real-world pings at this site.")
+
+    content_slide(prs, "Architectural Opportunities for MAP144", [
+        (0, "WSJT-X averages with no in-burst frequency tracking"),
+        (1, "Coherent gain degrades silently when signal drifts"),
+        (1, "Operator sees no signal that drift caused the miss"),
+        (0, "MAP144 has the data to do better"),
+        (1, "Already landed: detection-stage fine-frequency pre-correction"),
+        (2, "Sync correlator → audio mix shift → jt9 FTOL drops 200 → 50 Hz"),
+        (2, "~4× CPU reduction per decode attempt"),
+        (1, "Next step: per-burst drift correction inside the integration loop"),
+        (2, "Split burst into sub-windows, estimate f(t) per window"),
+        (2, "Fit linear (or polynomial) drift model"),
+        (2, "Mix-correct against the drift  before  coherent averaging"),
+        (2, "Recovers coherent gain on linearly drifting bursts (most pings)"),
+        (0, "Gate the averaging length"),
+        (1, "Measure σ(f) on-the-fly during sub-window scan"),
+        (1, "Use N=2 if σ < 1 Hz, N=1 otherwise"),
+        (1, "Stops decoder from trying integrations physics won't support"),
+        (0, "Genuine algorithmic step beyond WSJT-X — measurement-driven, not a port"),
+    ], notes="The per-burst drift correction is the key idea — WSJT-X assumes the signal is "
+             "stationary, MAP144 would estimate the drift and undo it before averaging.  "
+             "TODO #20 and TODO #42 are versions of this.")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SECTION 13 — SUPPORT
+    # ═══════════════════════════════════════════════════════════════════════════
+    section_slide(prs, 13, "Support and Resources",
         audience="Everyone",
         notes="Close on a light note.")
 
