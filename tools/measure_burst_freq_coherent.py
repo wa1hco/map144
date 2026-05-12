@@ -107,6 +107,7 @@ class CoherentFreqEstimate:
     f0_hz:            float    # carrier offset from 1500 Hz, parabolic-refined
     peak_mag:         float    # matched-filter peak magnitude
     peak_width_hz:    float    # FWHM of the matched-filter peak (a freq-resolution proxy)
+    peak_to_noise:    float    # peak / noise-floor (confidence proxy; >2 = clear peak)
     freqs_hz:         np.ndarray
     magnitudes:       np.ndarray
 
@@ -235,16 +236,42 @@ def coherent_burst_freq_estimate(
         if denom != 0:
             f0 += 0.5 * (a - c) / denom * (freqs[1] - freqs[0])
 
-    # FWHM (full-width-half-maximum) of the matched-filter peak — a proxy
-    # for effective frequency resolution under the present SNR.
-    half = magnitudes[i_peak] / 2.0
-    above = magnitudes > half
-    if above.any():
-        lo = freqs[np.argmax(above)]
-        hi = freqs[len(above) - 1 - np.argmax(above[::-1])]
-        fwhm = float(hi - lo)
+    # Effective frequency resolution: width of the central peak measured
+    # AGAINST THE NOISE FLOOR, not against zero.  The matched-filter
+    # response has a slow envelope on top of which the central peak sits;
+    # measuring FWHM against zero captures the envelope width (often
+    # ~half the search range), not the resolution we actually have.
+    #
+    # Method: compute the noise floor as the median of the curve
+    # *excluding* a ±20 Hz window around the peak.  Then find the
+    # half-power level relative to that floor: half = floor + 0.5*(peak-floor).
+    # Walk outward from the peak until magnitude drops below this level
+    # — that's the local FWHM.  Robust against the slow envelope and
+    # multi-modal responses.
+    peak_mag = float(magnitudes[i_peak])
+    # Exclude ±20 Hz around peak for the noise-floor estimate
+    df_per_bin = freqs[1] - freqs[0]
+    exclude_bins = int(round(20.0 / df_per_bin))
+    mask_noise = np.ones(len(magnitudes), dtype=bool)
+    lo_excl = max(0, i_peak - exclude_bins)
+    hi_excl = min(len(magnitudes), i_peak + exclude_bins + 1)
+    mask_noise[lo_excl:hi_excl] = False
+    if mask_noise.any():
+        noise_floor = float(np.median(magnitudes[mask_noise]))
     else:
-        fwhm = float('nan')
+        noise_floor = float(np.median(magnitudes))
+    half_level = noise_floor + 0.5 * (peak_mag - noise_floor)
+    # Walk outward from the peak to find where magnitude drops below half_level
+    i_lo = i_peak
+    while i_lo > 0 and magnitudes[i_lo] >= half_level:
+        i_lo -= 1
+    i_hi = i_peak
+    while i_hi < len(magnitudes) - 1 and magnitudes[i_hi] >= half_level:
+        i_hi += 1
+    fwhm = float(freqs[i_hi] - freqs[i_lo])
+    # Peak-to-noise ratio: a confidence proxy.  >2 means peak is clearly
+    # above noise; <1.3 means peak is barely resolvable from the floor.
+    peak_to_noise = peak_mag / noise_floor if noise_floor > 0 else float('inf')
 
     return CoherentFreqEstimate(
         t_start_s=burst_start_n / sr,
@@ -256,6 +283,7 @@ def coherent_burst_freq_estimate(
         f0_hz=f0,
         peak_mag=float(magnitudes[i_peak]),
         peak_width_hz=fwhm,
+        peak_to_noise=peak_to_noise,
         freqs_hz=freqs.astype(np.float32),
         magnitudes=magnitudes.astype(np.float32),
     )
@@ -358,7 +386,8 @@ def plot_burst_response(path: Path,
                      label=f'burst {i+1}  ({e.duration_ms:.0f} ms, '
                            f'{e.n_syncs_used} syncs)   '
                            f'f₀ = {e.f0_hz:+.1f} Hz   '
-                           f'FWHM = {e.peak_width_hz:.1f} Hz')
+                           f'FWHM = {e.peak_width_hz:.1f} Hz   '
+                           f'pk/noise = {e.peak_to_noise:.1f}')
         # Mark the parabolic-interpolated peak
         ax_resp.axvline(e.f0_hz, color=color, ls=':', lw=0.8, alpha=0.6)
     ax_resp.axvline(0.0, color='k', ls=':', lw=0.5)
@@ -421,7 +450,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"dur={e.duration_ms:5.0f} ms  "
                   f"{e.n_frames_used} frames ({e.n_syncs_used} syncs)  "
                   f"f₀ = {e.f0_hz:+7.2f} Hz  FWHM = {e.peak_width_hz:5.2f} Hz  "
-                  f"peak_mag = {e.peak_mag:.0f}")
+                  f"peak_mag = {e.peak_mag:.0f}  pk/noise = {e.peak_to_noise:.2f}")
         print(f"\nPlot: {png}")
         return 0
 
@@ -470,14 +499,15 @@ def main(argv: list[str] | None = None) -> int:
             w = csv.writer(fh)
             w.writerow(['wav', 'wsjtx_msgs', 't_start_s', 't_end_s', 'dur_ms',
                         'n_frames', 'n_syncs', 'ish_best',
-                        'f0_hz', 'peak_mag', 'fwhm_hz'])
+                        'f0_hz', 'peak_mag', 'fwhm_hz', 'peak_to_noise'])
             for name, msgs, e in all_rows:
                 w.writerow([name, msgs,
                             f'{e.t_start_s:.3f}', f'{e.t_end_s:.3f}',
                             f'{e.duration_ms:.1f}',
                             e.n_frames_used, e.n_syncs_used, e.ish_best,
                             f'{e.f0_hz:+.2f}', f'{e.peak_mag:.0f}',
-                            f'{e.peak_width_hz:.2f}'])
+                            f'{e.peak_width_hz:.2f}',
+                            f'{e.peak_to_noise:.2f}'])
         print(f"\nCSV written: {args.csv}")
 
     # ── Summary distributions ────────────────────────────────────────────────
