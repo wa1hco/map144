@@ -70,7 +70,16 @@ def parse_wsjtx(path: Path):
                 ts_period = datetime.strptime("20" + ts_str, "%Y%m%d_%H%M%S").replace(tzinfo=timezone.utc)
             except ValueError:
                 continue
-            ts = period_start(ts_period + timedelta(seconds=float(dt_s)))
+            # MSK144 ALL.TXT timestamp = when jt9 ran (often mid-period,
+            # NOT a 15-s boundary).  ``dt`` is the offset from the START of
+            # the analysis window = floor(timestamp / 15s).  Computing
+            # ``period_start(ts_period + dt)`` directly mis-attributes
+            # decodes with non-boundary timestamps (e.g. 092914 dt=14.0)
+            # to the NEXT period (09:29:15 instead of 09:29:00).
+            # Diagnosed 2026-05-11 against WAV 260511_092900 via the
+            # corpus-regression tool (tools/wav_corpus_test.py).
+            window_start = period_start(ts_period)
+            ts = period_start(window_start + timedelta(seconds=float(dt_s)))
             results.append({
                 'ts':        ts,
                 'ts_period': ts_period,
