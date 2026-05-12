@@ -2449,8 +2449,8 @@ def _nb_mix_fir_sp(b_rev, raw, mix_phase, mix_step, zi, y, new_zi, new_mix_phase
         (1, "No information about how the frequency changes during the burst"),
         (0, "MAP144 tool:  tools/measure_ping_freq_vs_time.py"),
         (1, "For each WSJT-X-saved WAV in a session corpus:"),
-        (2, "Bandpass to MSK144 audio band (1300-1700 Hz)"),
-        (2, "Square the signal — modulation tones become CW lines at 2·f₀ ± 1000 Hz"),
+        (2, "Bandpass 600-2400 Hz — covers both MSK144 tones at 1000 and 2000 Hz"),
+        (2, "Square the signal — tone pair becomes CW lines at 2000 Hz and 4000 Hz"),
         (2, "Sliding short FFT, ±300 Hz peak search around each squared tone"),
         (2, "Carrier estimate = (low_tone + high_tone) / 4   at 10-ms resolution"),
         (1, "Suppresses MSK modulation contamination that breaks Hilbert-derivative methods"),
@@ -2485,28 +2485,29 @@ def _nb_mix_fir_sp(b_rev, raw, mix_phase, mix_step, zi, y, new_zi, new_mix_phase
               "the multipath signature.",
         png="doppler_burst_stats_distributions.png")
 
-    content_slide(prs, "Findings from 145 Bursts", [
-        (0, "σ(f) within burst"),
-        (1, "median 7.5 Hz, p75 13.1 Hz, max 128 Hz"),
-        (1, "Grows monotonically with burst duration"),
-        (2, "<100 ms bursts:  median 6.6 Hz"),
-        (2, "100-200 ms:        median 10.8 Hz"),
-        (2, "200-400 ms:        median 13.5 Hz"),
+    content_slide(prs, "Findings from 112 Bursts", [
+        (0, "σ(f) within burst is BIMODAL"),
+        (1, "median 20.7 Hz overall  —  but p25 = 0.7 Hz, p75 = 44.8 Hz"),
+        (1, "Two populations: frequency-stable vs fluttery"),
         (0, "Fraction satisfying the worst-case coherent-gain ceiling"),
-        (1, "N=1 frame  (σ<1.70 Hz):  4.8% of bursts"),
-        (1, "N=2 frames (σ<0.87 Hz):  1.4%"),
-        (1, "N=3 frames (σ<0.58 Hz):  0%   ← zero"),
-        (1, "N=5, N=7:                0%   ← zero"),
+        (1, "N=1 frame  (σ<1.70 Hz):  42% of bursts"),
+        (1, "N=2 frames (σ<0.87 Hz):  33%"),
+        (1, "N=3 frames (σ<0.58 Hz):  17%  ← matches empirical SPD navg=3 rate"),
+        (1, "N=5 frames (σ<0.35 Hz):  2.7%"),
+        (1, "N=7 frames (σ<0.25 Hz):  0.9%"),
         (0, "Amplitude-frequency correlation"),
         (1, "Strong (|r|>0.5):    26% of bursts"),
-        (1, "Moderate (|r|>0.3):  50%"),
+        (1, "Moderate (|r|>0.3):  58%"),
         (1, "Confirms the multipath mechanism — flutter is correlated"),
-        (0, "Ceiling formula is conservative (worst-case random walk)"),
-        (1, "Linear drift is easier — decoder partially tolerates it"),
-        (1, "But the trend is unambiguous: 5/7-frame integration is Doppler-limited"),
-    ], notes="The N=3 row at 0% is the striking result.  Conservative formula, yes, "
-             "but the message holds: -d 3 Deep mode's longer averages have very little "
-             "physics-allowed signal to integrate on real-world pings at this site.")
+        (0, "Two populations of pings visible in the data"),
+        (1, "Frequency-stable: ~42%  —  physics allows coherent integration"),
+        (1, "Fluttery: ~58%  —  coherent gain degrades silently"),
+        (0, "5/7-frame integration is Doppler-limited for real-world pings"),
+        (1, "Near-zero fractions explain why -d 3 Deep mode produces more phantoms than real catches"),
+    ], notes="The bimodal distribution is the key finding.  WSJT-X's 3-frame averaging "
+             "works because ~17% of pings genuinely satisfy the coherence criterion.  "
+             "But 5/7-frame averaging in Deep mode has almost no signal to integrate — "
+             "those longer averages mostly amplify noise-event coincidences into phantoms.")
 
     content_slide(prs, "Architectural Opportunities for MAP144", [
         (0, "WSJT-X averages with no in-burst frequency tracking"),

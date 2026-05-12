@@ -221,19 +221,30 @@ This is a genuine algorithmic step beyond WSJT-X — not a port but a measuremen
 
 These distributions do not appear to be published in measured form anywhere in the literature; building this dataset locally is a meaningful contribution.
 
-### Initial measurements (2026-05-11 corpus, 145 bursts)
+### Initial measurements (2026-05-11 corpus, 112 bursts)
 
 ![burst statistics](figures/doppler_burst_stats_distributions.png)
 
-*Top-left: σ(f) within burst, log-x.  Vertical red dashed lines mark the worst-case coherent-gain ceiling for N = 1, 2, 3, 5, 7 frames of coherent averaging — most bursts exceed even the 1-frame ceiling.  Top-right: σ(f) vs burst duration — drift accumulates over time.  Bottom-left: amplitude–frequency correlation distribution — 26% of bursts show |r| > 0.5, half show |r| > 0.3, confirming the multipath-flutter mechanism.  Bottom-right: |r| vs σ(f), peak-SNR coloured — bursts with larger σ(f) tend to have stronger amplitude–frequency correlation.*
+*Top-left: σ(f) within burst, log-x.  Vertical red dashed lines mark the worst-case coherent-gain ceiling for N = 1, 2, 3, 5, 7 frames of coherent averaging.  The distribution is bimodal — about half the bursts are frequency-stable (σ_f < a few Hz), the other half show significant drift (σ_f tens of Hz).  Top-right: σ(f) vs burst duration.  Bottom-left: amplitude–frequency correlation distribution — 26% of bursts show |r| > 0.5, 58% show |r| > 0.3, confirming the multipath-flutter mechanism.  Bottom-right: |r| vs σ(f), peak-SNR coloured.*
 
-Headline numbers from 145 bursts after outlier filter:
+Headline numbers from 112 bursts:
 
-- σ(f) within burst: median 7.5 Hz, p75 13.1 Hz (grows with burst duration: 6.6 Hz for <100 ms, 13.5 Hz for 200-400 ms).
-- Fraction satisfying the worst-case coherent-gain criterion at each N: N=1 4.8%, N=2 1.4%, N≥3 0%.
-- Amplitude–frequency correlation: 26% of bursts strong (|r|>0.5), 50% at least moderate (|r|>0.3).
+- σ(f) within burst is **bimodal**: median 20.7 Hz, but p25 = 0.7 Hz, p75 = 44.8 Hz.
+- Fraction satisfying the worst-case coherent-gain criterion at each N:
+  - N = 1 frame:  42% of bursts
+  - N = 2 frames: 33%
+  - N = 3 frames: **17%**
+  - N = 5 frames: 2.7%
+  - N = 7 frames: 0.9%
+- Amplitude–frequency correlation: 26% of bursts strong (|r| > 0.5), 58% at least moderate (|r| > 0.3).
 
-The strict-coherence ceiling is conservative — it assumes uniform random frequency walk, but real drift is mostly linear, which SPD's matched filter tolerates better.  However, the result is consistent with the empirical observation that WSJT-X's `-d 3` Deep mode (which adds 5- and 7-frame averages) produces phantom decodes during noise events more than it produces real catches on long sustained signals — the underlying physics doesn't supply enough coherent signal for the longer averages to converge.
+Two populations are visible in the data:
+- **Frequency-stable pings** (σ_f < 1.7 Hz, ~42% of bursts) — physics allows coherent integration, including the 17% that satisfy the 3-frame ceiling.
+- **Fluttery pings** (σ_f > 1.7 Hz, ~58%) — multipath signature; coherent integration degrades silently.
+
+The 17% figure for N=3 is consistent with empirical observations: WSJT-X's 3-frame coherent averaging *does* work — on roughly that fraction of pings.  The near-zero fractions at N=5 and N=7 explain why `-d 3` Deep mode is mostly phantom-producing rather than catching real long signals: the physics doesn't supply enough coherent signal at those integration lengths.
+
+The strict-coherence ceiling is still conservative — it assumes uniform random frequency walk, while real drift is often more linear and tolerable by the matched filter.  Even so, the order of magnitudes is clear: useful coherent integration tops out around N = 3 frames for typical 6 m MS conditions at this site.
 
 ---
 

@@ -48,7 +48,16 @@ from scipy.signal import butter, filtfilt, hilbert
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 SR_AUDIO        = 12000
-F_LO, F_HI      = 1300, 1700        # MSK144 audio band
+# MSK144 audio band — the two modulation tones live at 1000 Hz and 2000 Hz
+# (±500 Hz around the suppressed 1500 Hz carrier).  The bandpass must
+# preserve both tones for the squared-spectrum carrier estimator to work:
+# squaring tones at 1000 Hz and 2000 Hz produces the carrier-identifying
+# lines at 2·f₀ ± 1000 = 2000 Hz and 4000 Hz; if either input tone is
+# attenuated by the bandpass, the squared lines disappear.
+# 600-2400 Hz captures both tones with ~400 Hz margin (covers the main
+# spectral lobe of MSK144) and is similar in spirit to MAP144's own
+# 300-2700 Hz audio BPF in detection.py:_apply_audio_bpf.
+F_LO, F_HI      = 600, 2400         # MSK144 audio band — must straddle both tones
 INST_FREQ_BIN_S = 0.020             # 20 ms smoothing
 ENV_BIN_S       = 0.010             # 10 ms envelope resolution
 BURST_THRESH_DB = 4.0               # burst above (median + 4 dB)
