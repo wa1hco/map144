@@ -1523,13 +1523,54 @@ def _make_msk144_burst_real(msg: str, sample_rate: int, n_frames: int = 1) -> np
     return _modulate_msk144(chips, sample_rate)   # unit-amplitude complex
 
 
-def _run_ramp_mode(args) -> None:
-    """SNR-ramp emit path.
+def _make_gamma_enveloped_burst_complex(msg: str, sample_rate: int, width_ms: int
+                                        ) -> np.ndarray:
+    """Return a Gamma-enveloped MSK144 burst at 0 Hz baseband, complex.
 
-    Builds a 12 kHz mono real-audio buffer (the canonical, SNR-calibrated test
-    signal that WSJT-X / headless ``jt9 --msk144`` ingests directly) containing
-    N MSK144 pings at monotonically increasing SNRs in a 2500 Hz reference
-    bandwidth.
+    Envelope: e·(t/τ)·exp(−t/τ) with τ = width_ms/1000 s.  Peak value is
+    1.0 at t=τ (analytic peak of the Gamma profile is e·(τ/τ)·e⁻¹ = 1).
+    Peak-amplitude convention matches Mode 1 (generate_ping_msk144code)
+    and the existing ramp-snr ``--ramp-frames`` flat burst — so the same
+    SNR-scaling formula applies regardless of width, and ``snr_db_input``
+    is the *peak* SNR a perfectly-aligned receiver would see.
+
+    Energy varies with width: a longer trail genuinely carries more total
+    signal energy at the same peak SNR — matching real MS-trail physics
+    and matching what an operator would call "a stronger ping" on the
+    fast graph.
+
+    The burst contains enough phase-continuous MSK144 frames to cover the
+    Gamma envelope's significant duration (≈10τ).
+    """
+    width_s = max(width_ms, 10) / 1000.0
+    echo_dur_s = 10.0 * width_s
+    samples_per_frame = int(round(0.072 * sample_rate))
+    n_frames = max(1, int(np.ceil(echo_dur_s * sample_rate / samples_per_frame)))
+    burst_c = _make_msk144_burst_real(msg, sample_rate, n_frames=n_frames)
+    echo_n = min(int(np.ceil(echo_dur_s * sample_rate)), len(burst_c))
+    burst_c = burst_c[:echo_n]
+    t_norm = np.arange(echo_n, dtype=np.float64) / sample_rate / width_s
+    # Gamma profile peaks at 1.0 at t=τ → no further normalisation needed.
+    env = np.where(t_norm > 0, np.e * t_norm * np.exp(-t_norm), 0.0).astype(np.float32)
+    return (burst_c * env).astype(np.complex64)
+
+
+def _run_ramp_mode(args) -> None:
+    """Ramp emit path — sweeps SNR (default) or ping width (Gamma envelope τ).
+
+    Selected by ``--ramp-mode``:
+
+    * ``snr`` (default): emit N pings of fixed n_frames (flat envelope) with
+      monotonically increasing SNRs.  Used for sensitivity-curve testing.
+
+    * ``width``: emit N pings at fixed SNR with monotonically increasing
+      Gamma envelope τ.  Used to test SPD's frame-averaging behaviour — by
+      sweeping τ from "fits in one frame" (~30 ms → FWHM ~70 ms) to "spans
+      multiple frames" (~200 ms → FWHM ~490 ms), we can observe how SPD's
+      reported navg responds to physical ping length.  Energy-normalised
+      envelope (∫env² = 1) so each ping has the same total signal energy.
+      Suspected bug: SPD reports navg=1 even on long pings; this mode is
+      the controlled test.
 
     The 48 kHz complex-IQ output is the **signal** taken from a noise-free copy
     of the audio buffer (Hilbert → resample → optional frequency shift) PLUS a
@@ -1558,18 +1599,37 @@ def _run_ramp_mode(args) -> None:
     Each ping carries a self-describing ``A...`` message encoding its intended
     SNR; the truth JSON sidecar lists the full plan for the scoring step.
     """
-    if args.ramp_snr_max < args.ramp_snr_min:
-        raise SystemExit("--ramp-snr-max must be >= --ramp-snr-min")
-    n_steps = int(round((args.ramp_snr_max - args.ramp_snr_min) / args.ramp_snr_step)) + 1
-    if n_steps <= 0:
-        raise SystemExit("ramp produces zero pings — check --ramp-snr-min/-max/-step")
+    # Build the ramped-parameter sequence and fixed-parameter values per mode.
+    if args.ramp_mode == 'snr':
+        if args.ramp_snr_max < args.ramp_snr_min:
+            raise SystemExit("--ramp-snr-max must be >= --ramp-snr-min")
+        n_steps = int(round((args.ramp_snr_max - args.ramp_snr_min) / args.ramp_snr_step)) + 1
+        if n_steps <= 0:
+            raise SystemExit("ramp produces zero pings — check --ramp-snr-min/-max/-step")
+        snr_seq   = [args.ramp_snr_min + k * args.ramp_snr_step for k in range(n_steps)]
+        width_seq = [0] * n_steps                    # 0 → flat (existing behaviour)
+        ramped    = 'snr'
+    elif args.ramp_mode == 'width':
+        if args.ramp_width_max_ms < args.ramp_width_min_ms:
+            raise SystemExit("--ramp-width-max-ms must be >= --ramp-width-min-ms")
+        if args.ramp_width_step_ms <= 0:
+            raise SystemExit("--ramp-width-step-ms must be > 0")
+        n_steps = int(round((args.ramp_width_max_ms - args.ramp_width_min_ms)
+                            / args.ramp_width_step_ms)) + 1
+        if n_steps <= 0:
+            raise SystemExit("ramp produces zero pings — check --ramp-width-min-ms/-max/-step")
+        width_seq = [args.ramp_width_min_ms + k * args.ramp_width_step_ms
+                     for k in range(n_steps)]
+        snr_seq   = [args.ramp_fixed_snr_db] * n_steps
+        ramped    = 'width'
+    else:
+        raise SystemExit(f"unknown --ramp-mode {args.ramp_mode!r}; use 'snr' or 'width'")
 
-    snr_seq = [args.ramp_snr_min + k * args.ramp_snr_step for k in range(n_steps)]
     delays  = [args.ramp_t0 + k * args.ramp_spacing for k in range(n_steps)]
     if delays[-1] >= args.duration - 0.1:
         raise SystemExit(
             f"Ramp does not fit in {args.duration:.1f} s: last ping at {delays[-1]:.2f} s. "
-            f"Reduce --ramp-snr-step or --ramp-spacing, or extend --duration.")
+            f"Reduce --ramp-*-step or --ramp-spacing, or extend --duration.")
 
     rng = np.random.default_rng(args.seed)
     n_audio = int(args.duration * RAMP_AUDIO_RATE)
@@ -1590,21 +1650,32 @@ def _run_ramp_mode(args) -> None:
     fs = float(RAMP_AUDIO_RATE)
 
     truth = []
-    for k, (snr_db, delay_s) in enumerate(zip(snr_seq, delays)):
+    for k, (snr_db, delay_s, width_ms) in enumerate(zip(snr_seq, delays, width_seq)):
         # Self-describing message: freq-field always 0 in ramp mode (IQ offset
-        # is in the sidecar, not the message).  SNR + decisecond-time encoded.
+        # is in the sidecar, not the message).  SNR + decisecond-time encoded;
+        # width is tracked in the truth JSON only.
         time_ds = int(round(min(max(delay_s, 0.5), args.duration - 0.5) * 10))
         snr_int = int(round(snr_db))
         msg = encode_ping_message(freq_khz=0, time_ds=time_ds, snr_db=snr_int)
 
-        # Unit-amplitude complex MSK144 baseband, then up-shift to 1500 Hz
-        # and take Re{} to get a real audio burst at the WSJT-X centre.
-        burst_c = _make_msk144_burst_real(msg, RAMP_AUDIO_RATE, n_frames=args.ramp_frames)
+        if width_ms > 0:
+            # Width-ramp ping: Gamma envelope, peak-amplitude convention
+            # (matches Mode 1 generate_ping_msk144code).  Peak SNR is fixed
+            # by snr_db; total energy scales with width (longer trail ⇒
+            # more total signal energy at the same peak SNR — matches real
+            # MS physics).
+            burst_c = _make_gamma_enveloped_burst_complex(msg, RAMP_AUDIO_RATE, width_ms)
+        else:
+            # SNR-ramp ping: flat n_frames (existing behaviour).
+            burst_c = _make_msk144_burst_real(msg, RAMP_AUDIO_RATE, n_frames=args.ramp_frames)
+
         t = np.arange(len(burst_c), dtype=np.float64) / fs
         burst_real = np.real(burst_c * np.exp(1j * 2.0 * np.pi * RAMP_AUDIO_CENTER_HZ * t))
 
         # Real-signal amplitude for target SNR over the 2500 Hz reference,
         # given the real AWGN at sigma_audio per sample (see docstring).
+        # For energy-normalised Gamma bursts this scales total signal energy
+        # to match the flat-burst case at the same snr_db.
         snr_lin = 10.0 ** (snr_db / 10.0)
         amp = 2.0 * sigma_audio * np.sqrt(snr_lin * BW / fs)
         burst_real = (burst_real * amp).astype(np.float32)
@@ -1613,13 +1684,17 @@ def _run_ramp_mode(args) -> None:
         end_n   = min(delay_n + len(burst_real), n_audio)
         audio_signal[delay_n:end_n] += burst_real[:end_n - delay_n]
 
-        truth.append({
+        entry = {
             'message':       msg,
             't_offset_s':    round(delay_s, 4),
             'snr_db_input':  round(float(snr_db), 2),
             'audio_freq_hz': RAMP_AUDIO_CENTER_HZ,
             'iq_freq_hz':    RAMP_AUDIO_CENTER_HZ + args.iq_offset_hz,
-        })
+        }
+        if width_ms > 0:
+            entry['width_ms']   = int(width_ms)
+            entry['fwhm_ms']    = round(2.45 * width_ms, 1)   # ≈ Gamma FWHM
+        truth.append(entry)
 
     audio_buf = audio_noise + audio_signal
 
@@ -1644,7 +1719,13 @@ def _run_ramp_mode(args) -> None:
 
     # ── Output paths ─────────────────────────────────────────────────────────
     _ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
-    _stem = f"ramp_{_ts}_{n_steps}sig_{int(round(args.ramp_snr_min)):+d}to{int(round(args.ramp_snr_max)):+d}dB"
+    if ramped == 'snr':
+        _stem = (f"ramp_{_ts}_{n_steps}sig_"
+                 f"{int(round(args.ramp_snr_min)):+d}to{int(round(args.ramp_snr_max)):+d}dB")
+    else:  # width
+        _stem = (f"rampw_{_ts}_{n_steps}sig_"
+                 f"{int(args.ramp_width_min_ms)}to{int(args.ramp_width_max_ms)}ms"
+                 f"_{int(round(args.ramp_fixed_snr_db)):+d}dB")
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     audio_path = out_dir / f"{_stem}_audio.wav"
@@ -1700,8 +1781,14 @@ def _run_ramp_mode(args) -> None:
     }
     iq_manifest_path.write_text(json.dumps(iq_manifest, indent=2))
 
-    print(f"Ramp: {n_steps} pings, SNR {args.ramp_snr_min:+.1f} → {args.ramp_snr_max:+.1f} dB"
-          f"  step {args.ramp_snr_step:.1f} dB  spacing {args.ramp_spacing:.2f} s")
+    if ramped == 'snr':
+        print(f"Ramp ({ramped}): {n_steps} pings, "
+              f"SNR {args.ramp_snr_min:+.1f} → {args.ramp_snr_max:+.1f} dB"
+              f"  step {args.ramp_snr_step:.1f} dB  spacing {args.ramp_spacing:.2f} s")
+    else:
+        print(f"Ramp ({ramped}): {n_steps} pings @ SNR {args.ramp_fixed_snr_db:+.1f} dB, "
+              f"width τ {args.ramp_width_min_ms} → {args.ramp_width_max_ms} ms"
+              f"  step {args.ramp_width_step_ms} ms  spacing {args.ramp_spacing:.2f} s")
     print(f"  audio (WSJT-X / jt9): {audio_path}")
     print(f"  IQ    (MAP144):       {iq_path}  (offset {args.iq_offset_hz:+.0f} Hz)")
     print(f"  manifest (MAP144):    {iq_manifest_path}")
@@ -1799,6 +1886,23 @@ def main() -> None:
                              '5 frames (~360 ms) gives MDS ≈ −6 dB on jt9, close to the '
                              'published WSJT-X MSK144 sensitivity.  Single-frame (1) is too '
                              'short for the matched-filter decoder and shifts MDS by ~10 dB.')
+    parser.add_argument('--ramp-mode', choices=('snr', 'width'), default='snr',
+                        help='Which parameter to ramp.  snr (default): increasing SNR at fixed '
+                             'flat envelope.  width: fixed SNR, increasing Gamma envelope τ — '
+                             'used to test SPD frame-averaging behaviour against controlled '
+                             'ping lengths.')
+    parser.add_argument('--ramp-width-min-ms', type=int, default=30,
+                        help='Minimum Gamma envelope τ (ms) for --ramp-mode width.  Default 30 '
+                             '→ FWHM ≈ 70 ms (fits in one 72 ms frame).')
+    parser.add_argument('--ramp-width-max-ms', type=int, default=200,
+                        help='Maximum Gamma envelope τ (ms) for --ramp-mode width.  Default 200 '
+                             '→ FWHM ≈ 490 ms (spans 6-7 frames).')
+    parser.add_argument('--ramp-width-step-ms', type=int, default=20,
+                        help='Width step in ms; pings = (max-min)/step + 1.')
+    parser.add_argument('--ramp-fixed-snr-db', type=float, default=3.0,
+                        help='Fixed SNR (dB, WSJT-X 2500 Hz reference) used for every ping '
+                             'when --ramp-mode=width.  Default +3 dB keeps signals clearly '
+                             'above noise while still inside the decoder operating range.')
     parser.add_argument('--iq-offset-hz', type=float, default=0.0,
                         help='Frequency offset (Hz) added to the IQ render only.  The audio '
                              'render always places the signal at 1500 Hz (WSJT-X convention). '
