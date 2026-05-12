@@ -102,6 +102,8 @@ fortran_bp_test/bp_test
 fortran_bp_test/mf_test
 
 
-# Intentional documentation figures — override the global *.png
+# Intentional documentation figures — override the global *.png.
+# Glob the full tree so subdirectories under docs/figures/ (e.g.
+# freq_vs_time_corpus/) are tracked too.
 !docs/figures/
-!docs/figures/*.png
+!docs/figures/**/*.png
