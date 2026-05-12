@@ -240,34 +240,103 @@ def analyse_wav(path: Path) -> tuple[np.ndarray, np.ndarray, float, list[BurstFr
 # ── Plotting ─────────────────────────────────────────────────────────────────
 
 def plot_wav(path: Path, env_db: np.ndarray, freq_t: np.ndarray, env_bin_s: float,
-             bursts: list[BurstFreqStat], out_path: Path | None = None) -> Path:
+             bursts: list[BurstFreqStat], out_path: Path | None = None,
+             pre_post_buffer_s: float = 0.5) -> Path:
+    """Plot envelope + instantaneous freq, zoomed to the ping(s) with a
+    pre/post-burst buffer for noise-floor reference.
+
+    Zoom behaviour:
+        - If any bursts detected: x-axis spans from
+            (earliest burst start − pre_post_buffer_s)
+          to
+            (latest   burst end   + pre_post_buffer_s)
+          clamped to the WAV duration.  Covers all bursts in the WAV
+          including long extended pings.
+        - If no bursts: falls back to the full WAV (15 s).
+    """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
     t = np.arange(len(env_db)) * env_bin_s
     median_db = float(np.median(env_db))
+    wav_duration = float(len(env_db) * env_bin_s)
+
+    # Compute zoom window
+    if bursts:
+        t_start = max(0.0, min(b.t_start for b in bursts) - pre_post_buffer_s)
+        t_end   = min(wav_duration, max(b.t_end for b in bursts) + pre_post_buffer_s)
+        # Guarantee minimum 1-second window even if everything is squeezed
+        if t_end - t_start < 1.0:
+            mid = (t_end + t_start) / 2.0
+            t_start = max(0.0, mid - 0.5)
+            t_end   = min(wav_duration, mid + 0.5)
+        zoom_note = f"  [zoom {t_start:.2f}–{t_end:.2f} s, ±{pre_post_buffer_s:.1f} s noise reference]"
+    else:
+        t_start, t_end = 0.0, wav_duration
+        zoom_note = "  [no bursts — full WAV shown]"
 
     fig, (ax_a, ax_f) = plt.subplots(2, 1, figsize=(13, 6), sharex=True)
 
-    ax_a.plot(t, env_db - median_db, color='C0', lw=0.9)
+    ax_a.plot(t, env_db - median_db, color='C0', lw=1.0)
     ax_a.axhline(BURST_THRESH_DB, color='r', ls='--', lw=0.5,
                  label=f'{BURST_THRESH_DB} dB threshold')
     ax_a.set_ylabel('Envelope (dB above median)')
-    ax_a.set_title(f'{path.name} — envelope (top) and instantaneous freq (bottom)')
+    ax_a.set_title(f'{path.name} — envelope (top) and instantaneous freq (bottom){zoom_note}')
     ax_a.grid(alpha=0.3)
     ax_a.legend(loc='upper right', fontsize=8)
+    ax_a.set_xlim(t_start, t_end)
+    # Auto-scale envelope y-axis to the visible zoom window so WAV-boundary
+    # zeros (huge negative dB at file edges) don't squash the data range.
+    env_zoom_mask = (t >= t_start) & (t <= t_end)
+    if env_zoom_mask.any():
+        env_visible = env_db[env_zoom_mask] - median_db
+        env_lo = float(np.nanmin(env_visible)) - 2.0
+        env_hi = float(np.nanmax(env_visible)) + 2.0
+        # Ensure the burst-threshold line stays visible
+        env_hi = max(env_hi, BURST_THRESH_DB + 1.0)
+        # Sensible floor — don't zoom below -10 dB so noise spread shows
+        env_lo = max(env_lo, -10.0)
+        ax_a.set_ylim(env_lo, env_hi)
 
     # Plot freq vs time, but only where envelope is meaningfully above noise
     # (otherwise the freq estimate is noise-dominated and dominates the plot range)
     mask = env_db > (median_db + 1.0)
     f_plot = np.where(mask, freq_t, np.nan)
-    ax_f.plot(t, f_plot - 1500.0, color='C2', lw=0.9)
+    ax_f.plot(t, f_plot - 1500.0, 'o-', color='C2', markersize=3, lw=0.8)
     ax_f.axhline(0.0, color='k', ls=':', lw=0.5)
     ax_f.set_ylabel('Inst. freq − 1500 Hz')
     ax_f.set_xlabel('Time within WAV (s)')
     ax_f.grid(alpha=0.3)
-    ax_f.set_ylim(-150, 150)
+    ax_f.set_xlim(t_start, t_end)
+
+    # Auto-scale freq y-axis based on the data visible in the zoom window.
+    # Use 2nd–98th percentile to be robust against outliers from measurement
+    # glitches (e.g., the squared-FFT peak finder jumping between two signals
+    # in a multi-station period can produce one-bin spikes >1 kHz that would
+    # otherwise dominate the scale).
+    zoom_mask = (t >= t_start) & (t <= t_end) & mask
+    if zoom_mask.any():
+        f_visible = freq_t[zoom_mask] - 1500.0
+        f_visible = f_visible[np.isfinite(f_visible)]
+        if len(f_visible) >= 3:
+            p_lo = float(np.percentile(f_visible, 2))
+            p_hi = float(np.percentile(f_visible, 98))
+        else:
+            p_lo = float(np.nanmin(f_visible))
+            p_hi = float(np.nanmax(f_visible))
+        # Pad and ensure zero line is visible
+        f_lo = min(p_lo - 5.0, -10.0)
+        f_hi = max(p_hi + 5.0, +10.0)
+        # Minimum span 30 Hz; hard cap of ±200 Hz so outliers can't blow it up
+        if (f_hi - f_lo) < 30.0:
+            mid = (f_lo + f_hi) / 2.0
+            f_lo, f_hi = mid - 15.0, mid + 15.0
+        f_lo = max(f_lo, -200.0)
+        f_hi = min(f_hi, +200.0)
+        ax_f.set_ylim(f_lo, f_hi)
+    else:
+        ax_f.set_ylim(-150, 150)
 
     # Annotate each burst region with its stats
     for b in bursts:
