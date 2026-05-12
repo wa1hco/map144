@@ -385,6 +385,11 @@ def main(argv: list[str] | None = None) -> int:
                     help='Write per-burst stats to this CSV (batch mode)')
     ap.add_argument('--max-wavs', type=int, default=None,
                     help='Limit batch to first N WAVs')
+    ap.add_argument('--plot-each-burst', type=Path, default=None,
+                    metavar='DIR',
+                    help='In batch mode, generate a freq-vs-time plot for every '
+                         'WAV that has at least one burst, saving into DIR.  '
+                         'Filenames: freqtime_<wav-stem>.png')
     args = ap.parse_args(argv)
 
     save_dir = args.wsjtx_dir / 'save'
@@ -420,17 +425,30 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"Processing {len(wavs)} WAVs from {save_dir}", file=sys.stderr)
+    if args.plot_each_burst:
+        args.plot_each_burst.mkdir(parents=True, exist_ok=True)
+        print(f"Plots will be written to {args.plot_each_burst}/", file=sys.stderr)
     all_bursts: list[tuple[str, BurstFreqStat]] = []
+    n_plotted = 0
     for i, p in enumerate(wavs):
         try:
-            _, _, _, bursts = analyse_wav(p)
+            env_db, freq_t, bin_s, bursts = analyse_wav(p)
         except Exception as e:
             print(f"  {p.name}: ERROR {e}", file=sys.stderr)
             continue
         for b in bursts:
             all_bursts.append((p.name, b))
+        if args.plot_each_burst and bursts:
+            out_png = args.plot_each_burst / f"freqtime_{p.stem}.png"
+            try:
+                plot_wav(p, env_db, freq_t, bin_s, bursts, out_path=out_png)
+                n_plotted += 1
+            except Exception as e:
+                print(f"  {p.name}: PLOT ERROR {e}", file=sys.stderr)
         if (i+1) % 25 == 0 or i+1 == len(wavs):
-            print(f"  [{i+1}/{len(wavs)}]  {len(all_bursts)} bursts total", file=sys.stderr)
+            extra = f", {n_plotted} plotted" if args.plot_each_burst else ""
+            print(f"  [{i+1}/{len(wavs)}]  {len(all_bursts)} bursts total{extra}",
+                  file=sys.stderr)
 
     # CSV output
     if args.csv:
