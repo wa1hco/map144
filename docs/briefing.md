@@ -174,7 +174,9 @@ The FlexRadio VITA-49 stream delivers ~375 packets/second. A previous design pro
 
 ## Propagation Physics: Meteor-Scatter Doppler and Coherence
 
-MSK144 coherent integration is limited by the frequency stability of the signal over the integration window.  ![ping vs continuous](figures/doppler_ping_vs_continuous.png)
+MSK144 coherent integration is limited by the frequency stability of the signal over the integration window.
+
+![ping vs continuous](figures/doppler_ping_vs_continuous.png)
 
 *Left: meteor-scatter ping (KB8OTK), 90 ms burst with carrier σ = 7.7 Hz within the burst.  Right: strong-local continuous signal (N1KWF), full 15-s period with carrier wandering σ = 44.8 Hz across the period.  Same metric (instantaneous carrier from squared-spectrum sliding FFT), very different signal physics.*
 
