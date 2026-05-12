@@ -113,17 +113,27 @@ _JT9_FTOL          = 200   # Hz — search half-width around 1500 Hz audio centr
                             # ~30-50% more jt9 CPU per decode — covered by the
                             # 4-process semaphore.
 _JT9_FTOL_ANALYSIS = 400   # Hz — wider default for analysis window (human click accuracy)
-# jt9 decode depth.  Depth 3 (deep) widens the hypothesis search and adds
-# hash-based LDPC parity shortcuts using the master callsign/grid table.
-# That makes it prone to phantom decodes on noise — popular calls
-# (e.g. K1JT, WA2FZW) appear with arbitrary grids when LDPC parity
-# happens to pass on noise that hashes to a known call.  WSJT-X itself
-# defaults to depth 1 (normal) for live operation; matching here.
-# Observed 2026-05-11: -d 3 produced a 24-decode "CQ K1JT FN20" phantom
-# cluster over 3 hours from a persistent narrowband signal at 50265 kHz
-# (K1JT operates from FN42, FN20 grid is wrong — hash artifact).  Those
-# were going out over UDP/PSKReporter as spurious reports.
-_JT9_DEPTH   = 1
+# jt9 decode depth.  For MSK144 specifically (mskrtd.f90 in WSJT-X), the
+# depth flag gates ONLY the longer-frame-averaging patterns after the
+# 3-frame SPD path fails:
+#   -d 1 Fast   : SPD only (3-frame max), no 4/5/7-frame averaging fallback
+#   -d 2 Normal : SPD + two 4-frame averaging patterns
+#   -d 3 Deep   : SPD + 4-, 5-, and 7-frame averaging patterns
+# The 4-frame patterns catch long sustained signals (forward-scatter,
+# weak-terrestrial bursts) that are too long for the 3-frame SPD window.
+# The 5/7-frame patterns add a few more dB of sensitivity but are the
+# main source of phantom decodes on impulsive noise events — coherent
+# averaging across long noise transients produces more structured soft
+# bits that LDPC occasionally converges on by chance, especially when
+# the candidate decode matches a hashed callsign.
+# Operator's WSJT-X-flex instance runs Normal (-d 2) for the same
+# reason; matching here gives MAP144 the 4-frame sensitivity without
+# the 5/7-frame phantom risk.
+# Pre-2026-05-11 default was -d 3 (Deep).
+# 2026-05-11 (commit 3024bc3) overcorrected to -d 1 — that removed
+# the 4-frame patterns too, costing real sensitivity on sustained
+# weak signals.  2026-05-12 bumped to -d 2 to match WSJT-X.
+_JT9_DEPTH   = 2
 
 JT9_BASE_ARGS = [
     'jt9', "--msk144",
