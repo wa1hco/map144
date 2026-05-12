@@ -76,6 +76,68 @@ class BurstFreqStat:
     af_corr:    float    # Pearson r(|A|, f) within burst
 
 
+# ── WSJT-X ALL.TXT lookup for decoded messages per WAV ───────────────────────
+
+def _load_wsjtx_messages(all_txt_path: Path) -> dict[tuple[int, int, int], list[str]]:
+    """Return {(yyyymmdd, hhmm, ss-floored-to-15s): [message, ...]} index.
+
+    Lets us look up which MSK144 messages WSJT-X decoded for the 15-s
+    period a given WAV covers.  WAV filename ``YYMMDD_HHMMSS.wav`` →
+    period_start at HHMMSS (already 15-s-aligned by WSJT-X save logic).
+
+    Uses the same period-attribution math as the wav_corpus_test.py fix:
+    period = floor(timestamp/15s) + dt, then floor to 15s again.
+    """
+    import re
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    if not all_txt_path.exists():
+        return {}
+    pat = re.compile(
+        r'^(\d{6})_(\d{6})\s+[\d.]+\s+Rx\s+MSK144\s+'
+        r'[-+]?\d+\s+([-+]?[\d.]+)\s+\d+\s+(.+)$'
+    )
+    idx: dict[tuple[int, int, int], list[str]] = {}
+    with all_txt_path.open(errors='replace') as fh:
+        for ln in fh:
+            m = pat.match(ln.strip())
+            if not m:
+                continue
+            yymmdd, hhmmss, dt_s, msg = m.groups()
+            try:
+                ts = _dt.strptime(f"20{yymmdd}_{hhmmss}", "%Y%m%d_%H%M%S").replace(tzinfo=_tz.utc)
+                # floor ts to 15s, add dt, floor again — matches WAV period
+                window = _dt(ts.year, ts.month, ts.day, ts.hour, ts.minute,
+                             (ts.second // 15) * 15, tzinfo=_tz.utc)
+                signal_t = window + _td(seconds=float(dt_s))
+                period_start = _dt(
+                    signal_t.year, signal_t.month, signal_t.day,
+                    signal_t.hour, signal_t.minute,
+                    (signal_t.second // 15) * 15, tzinfo=_tz.utc)
+                key = (int(period_start.strftime('%Y%m%d')),
+                       period_start.hour * 100 + period_start.minute,
+                       period_start.second)
+                msg_clean = ' '.join(msg.strip().split())
+                if msg_clean not in idx.setdefault(key, []):
+                    idx[key].append(msg_clean)
+            except (ValueError, IndexError):
+                continue
+    return idx
+
+
+def _msgs_for_wav(wav_path: Path,
+                  msg_index: dict[tuple[int, int, int], list[str]]) -> list[str]:
+    """Look up decoded messages for the 15-s period covered by ``wav_path``."""
+    import re
+    m = re.match(r'(\d{6})_(\d{6})\.wav$', wav_path.name)
+    if not m:
+        return []
+    yymmdd, hhmmss = m.groups()
+    yyyymmdd = int(f"20{yymmdd}")
+    hh = int(hhmmss[:2]); mm = int(hhmmss[2:4]); ss = int(hhmmss[4:6])
+    key = (yyyymmdd, hh*100 + mm, (ss // 15) * 15)
+    return msg_index.get(key, [])
+
+
 # ── Signal processing ────────────────────────────────────────────────────────
 
 def _bandpass(audio: np.ndarray, sr: int = SR_AUDIO,
@@ -250,7 +312,8 @@ def analyse_wav(path: Path) -> tuple[np.ndarray, np.ndarray, float, list[BurstFr
 
 def plot_wav(path: Path, env_db: np.ndarray, freq_t: np.ndarray, env_bin_s: float,
              bursts: list[BurstFreqStat], out_path: Path | None = None,
-             pre_post_buffer_s: float = 0.5) -> Path:
+             pre_post_buffer_s: float = 0.5,
+             decoded_msgs: list[str] | None = None) -> Path:
     """Plot envelope + instantaneous freq, zoomed to the ping(s) with a
     pre/post-burst buffer for noise-floor reference.
 
@@ -262,6 +325,17 @@ def plot_wav(path: Path, env_db: np.ndarray, freq_t: np.ndarray, env_bin_s: floa
           clamped to the WAV duration.  Covers all bursts in the WAV
           including long extended pings.
         - If no bursts: falls back to the full WAV (15 s).
+
+    Frequency-display tiers:
+        Envelope > median + BURST_THRESH_DB (=4 dB) → dark solid points
+          (in-burst — these are the signal-dominated estimates).
+        median + 1 dB < envelope < BURST_THRESH_DB → light grey points
+          (transition / sub-threshold signal — visible but de-emphasised).
+        envelope < median + 1 dB → not plotted (noise-dominated; estimate
+          is meaningless).
+
+    Title includes ``decoded_msgs`` (decoded WSJT-X messages for this WAV's
+    15-s period) when provided.
     """
     import matplotlib
     matplotlib.use('Agg')
@@ -291,7 +365,15 @@ def plot_wav(path: Path, env_db: np.ndarray, freq_t: np.ndarray, env_bin_s: floa
     ax_a.axhline(BURST_THRESH_DB, color='r', ls='--', lw=0.5,
                  label=f'{BURST_THRESH_DB} dB threshold')
     ax_a.set_ylabel('Envelope (dB above median)')
-    ax_a.set_title(f'{path.name} — envelope (top) and instantaneous freq (bottom){zoom_note}')
+    # Title — include decoded messages if any
+    if decoded_msgs:
+        msg_str = "  /  ".join(decoded_msgs[:3])
+        if len(decoded_msgs) > 3:
+            msg_str += f"  /  +{len(decoded_msgs)-3} more"
+        title = f'{path.name} — {msg_str}{zoom_note}'
+    else:
+        title = f'{path.name} — envelope (top) and instantaneous freq (bottom){zoom_note}'
+    ax_a.set_title(title)
     ax_a.grid(alpha=0.3)
     ax_a.legend(loc='upper right', fontsize=8)
     ax_a.set_xlim(t_start, t_end)
@@ -308,16 +390,26 @@ def plot_wav(path: Path, env_db: np.ndarray, freq_t: np.ndarray, env_bin_s: floa
         env_lo = max(env_lo, -10.0)
         ax_a.set_ylim(env_lo, env_hi)
 
-    # Plot freq vs time, but only where envelope is meaningfully above noise
-    # (otherwise the freq estimate is noise-dominated and dominates the plot range)
-    mask = env_db > (median_db + 1.0)
-    f_plot = np.where(mask, freq_t, np.nan)
-    ax_f.plot(t, f_plot - 1500.0, 'o-', color='C2', markersize=3, lw=0.8)
+    # Two-tier frequency plot:
+    #   tier A (in-burst):   env > median + BURST_THRESH_DB → dark solid
+    #   tier B (sub-threshold): median+1 dB < env < BURST_THRESH_DB → light grey
+    #   below median+1 dB: skipped (pure noise, estimate meaningless)
+    tier_a_mask = env_db > (median_db + BURST_THRESH_DB)
+    tier_b_mask = (env_db > (median_db + 1.0)) & ~tier_a_mask
+    # Plot tier B first so tier A appears on top
+    fb = np.where(tier_b_mask, freq_t - 1500.0, np.nan)
+    fa = np.where(tier_a_mask, freq_t - 1500.0, np.nan)
+    ax_f.plot(t, fb, 'o', color='lightgrey', markersize=3, label='sub-threshold (1-4 dB)')
+    ax_f.plot(t, fa, 'o-', color='C2', markersize=3.5, lw=0.8,
+              label=f'in-burst (>{BURST_THRESH_DB:.0f} dB)')
     ax_f.axhline(0.0, color='k', ls=':', lw=0.5)
     ax_f.set_ylabel('Inst. freq − 1500 Hz')
     ax_f.set_xlabel('Time within WAV (s)')
     ax_f.grid(alpha=0.3)
     ax_f.set_xlim(t_start, t_end)
+    ax_f.legend(loc='upper right', fontsize=7)
+    # Combined mask for y-axis auto-scaling (use both tiers)
+    mask = tier_a_mask | tier_b_mask
 
     # Auto-scale freq y-axis based on the data visible in the zoom window.
     # Use 2nd–98th percentile to be robust against outliers from measurement
@@ -403,8 +495,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: WAV not found: {args.wav}", file=sys.stderr)
             return 1
         env_db, freq_t, bin_s, bursts = analyse_wav(wav_path)
-        png = plot_wav(wav_path, env_db, freq_t, bin_s, bursts)
-        print(f"{wav_path.name}  ({len(bursts)} bursts)")
+        # Look up decoded messages from WSJT-X ALL.TXT for the title
+        msg_index = _load_wsjtx_messages(args.wsjtx_dir / 'ALL.TXT')
+        decoded_msgs = _msgs_for_wav(wav_path, msg_index) if msg_index else []
+        png = plot_wav(wav_path, env_db, freq_t, bin_s, bursts,
+                       decoded_msgs=decoded_msgs)
+        msgs_str = '  /  '.join(decoded_msgs) if decoded_msgs else '(no decoded message)'
+        print(f"{wav_path.name}  ({len(bursts)} bursts)  WSJT-X: {msgs_str}")
         for b in bursts:
             print(f"  t={b.t_start:5.2f}-{b.t_end:5.2f}s  dur={b.duration_ms:5.0f} ms  "
                   f"peak +{b.peak_db:.1f} dB  f̄={b.f_mean_hz-1500:+6.1f}  "
@@ -428,6 +525,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.plot_each_burst:
         args.plot_each_burst.mkdir(parents=True, exist_ok=True)
         print(f"Plots will be written to {args.plot_each_burst}/", file=sys.stderr)
+    # Pre-load WSJT-X ALL.TXT messages so each plot can show the decoded calls
+    all_txt = args.wsjtx_dir / 'ALL.TXT'
+    msg_index = _load_wsjtx_messages(all_txt)
+    if msg_index:
+        print(f"Loaded {len(msg_index)} periods of WSJT-X decoded messages "
+              f"from {all_txt.name}", file=sys.stderr)
     all_bursts: list[tuple[str, BurstFreqStat]] = []
     n_plotted = 0
     for i, p in enumerate(wavs):
@@ -440,8 +543,10 @@ def main(argv: list[str] | None = None) -> int:
             all_bursts.append((p.name, b))
         if args.plot_each_burst and bursts:
             out_png = args.plot_each_burst / f"freqtime_{p.stem}.png"
+            decoded_msgs = _msgs_for_wav(p, msg_index)
             try:
-                plot_wav(p, env_db, freq_t, bin_s, bursts, out_path=out_png)
+                plot_wav(p, env_db, freq_t, bin_s, bursts, out_path=out_png,
+                         decoded_msgs=decoded_msgs)
                 n_plotted += 1
             except Exception as e:
                 print(f"  {p.name}: PLOT ERROR {e}", file=sys.stderr)
