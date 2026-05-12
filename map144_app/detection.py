@@ -103,15 +103,25 @@ from scipy.signal import decimate, firwin, filtfilt
 
 from .msk144_spd import msk144_spd_decode
 
-_JT9_FTOL          = 200   # Hz — search half-width around 1500 Hz audio centre.
-                            # Observed 2026-05-11: 85% of WSJT-X-decoded MSK144
-                            # signals on calling channel land at audio 1600-1640 Hz
-                            # (peak at 1603-1606 Hz), well above the prior 100 Hz
-                            # half-width.  Widening to 200 Hz brings MAP144 in line
-                            # with SPD's ntol=200 default and with the audio-freq
-                            # distribution we actually see in operation.  Costs
-                            # ~30-50% more jt9 CPU per decode — covered by the
-                            # 4-process semaphore.
+_JT9_FTOL          = 50    # Hz — search half-width around 1500 Hz audio centre.
+                            # MAP144 now pre-corrects the audio using the detection
+                            # stage's fine ``sync_freq_offset_hz`` estimate before
+                            # writing the jt9 WAV, so the signal lands within a
+                            # few Hz of 1500.  FTOL=50 covers:
+                            #   - sub-Hz sync-estimate residual
+                            #   - within-burst frequency drift (typically <10 Hz
+                            #     over 1.7 s for normal trail kinematics)
+                            #   - safety margin
+                            # Pre-correction was added 2026-05-12; previously the
+                            # mix-down used only the coarse fc_hz from squared-FFT
+                            # peaks (~23 Hz bin resolution) and FTOL had to absorb
+                            # the residual + 85% of stations transmitting at ~1605
+                            # Hz audio (a systematic 100 Hz operator-setup offset).
+                            # FTOL=200 needed before, FTOL=50 sufficient after.
+                            # Net effect: ~4x reduction in jt9 hypothesis count
+                            # per decode invocation, addresses CPU saturation
+                            # during noise events that produce many simultaneous
+                            # candidate launches.
 _JT9_FTOL_ANALYSIS = 400   # Hz — wider default for analysis window (human click accuracy)
 # jt9 decode depth.  For MSK144 specifically (mskrtd.f90 in WSJT-X), the
 # depth flag gates ONLY the longer-frame-averaging patterns after the
@@ -527,7 +537,28 @@ def extract_and_decode(
         return
 
     # Separate H and V, mix both to baseband (fc_hz → 1500 Hz audio centre).
-    shift_hz = fc_hz - _TARGET_FC_HZ
+    #
+    # Fine frequency pre-correction (2026-05-12):
+    # ``fc_hz`` is the coarse estimate from squared-FFT peak bins (~23 Hz
+    # bin resolution).  The detection-stage sync correlator computes a
+    # much finer estimate via phase rotation between sync sub-blocks
+    # (sub-Hz accuracy when sync metric is good) and stores it in
+    # ``launch_metrics['sync_freq_offset_hz_h']``.  Adding that to
+    # shift_hz here brings the signal to within a few Hz of 1500 Hz
+    # audio, allowing jt9 to run with FTOL=50 instead of FTOL=200 (~4×
+    # CPU reduction per decode).
+    #
+    # The fine offset is also added to fc_hz_fine below so the
+    # operator-facing radio_khz remains accurate after the pre-shift —
+    # the pre-shift contribution must be added back into the reported
+    # frequency, not silently absorbed.
+    fine_freq_offset = 0.0
+    if launch_metrics:
+        _foff = launch_metrics.get('sync_freq_offset_hz_h')
+        if _foff is not None:
+            fine_freq_offset = float(_foff)
+    fc_hz_fine = fc_hz + fine_freq_offset
+    shift_hz = fc_hz_fine - _TARGET_FC_HZ
     _seg_len  = iq_seg_raw.shape[0]
     _t_mix    = np.arange(_seg_len, dtype=np.float64)
     _mix      = np.exp(-2j * np.pi * shift_hz * _t_mix / sample_rate).astype(np.complex64)
@@ -604,7 +635,10 @@ def extract_and_decode(
     # number matches **USB dial / contest** convention (N1MM, GridTracker, …).
     # That only matches operator expectations if ``center_freq_mhz`` and ``fc_hz``
     # share the same IQ reference and the USB + 1500 Hz geometry matches reality.
-    radio_khz = center_freq_mhz * 1000.0 + (fc_hz - _TARGET_FC_HZ) / 1000.0
+    # Use fc_hz_fine (coarse fc_hz + sync-correlator fine offset) so the reported
+    # radio_khz reflects the actual signal frequency, not the FFT-bin-quantised
+    # estimate.  Pre-2026-05-12 used fc_hz directly with sub-bin resolution lost.
+    radio_khz = center_freq_mhz * 1000.0 + (fc_hz_fine - _TARGET_FC_HZ) / 1000.0
 
     out_dir   = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
