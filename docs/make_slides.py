@@ -738,7 +738,11 @@ def code_slide(prs, title, code_text, caption="", notes=""):
 
 _FOOTER_H    = Inches(0.28)
 _FOOTER_TOP  = H - _FOOTER_H
-_FOOTER_DATE = "April 2026"
+# Footer date: month + year at deck-generation time.  Re-running make_slides
+# refreshes this automatically so the footer always reflects when the PPTX
+# was built rather than a stale hand-edited string.
+from datetime import datetime as _datetime
+_FOOTER_DATE = _datetime.now().strftime("%B %Y")
 
 def _add_footer(slide, page_num):
     """Thin navy strip at slide bottom: date left, page-number right."""
