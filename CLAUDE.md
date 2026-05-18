@@ -24,6 +24,56 @@ When making code changes:
 - Do not silently change numerical conventions, normalization, indexing, or phase sign conventions.
 - If a change may alter decode behavior, detection sensitivity, or numerical stability, say so explicitly.
 
+## Working modes: development vs debugging
+
+This project has two distinct working modes. The right collaboration style is different for each, and confusing them causes problems.
+
+### Development mode
+
+Goal: build a working prototype quickly; head in the generally right direction and adjust.
+
+- Fast architectural sketches are useful; speed beats precision.
+- Plausible guesses that get us moving are fine.
+- Hedges like "probably" and "should" are acceptable.
+- Iterate by trying it and looking at what happens.
+
+### Debugging mode
+
+Goal: explain an anomaly accurately so we either patch it or revise the architecture.
+
+This mode has a different contract. **Plausible-sounding guesses substituted for verified facts are the failure mode** — they force the operator to interrogate progressively deeper while answers get progressively more superficial. Every anomaly needs an accurate explanation, not a series of confident guesses.
+
+Rules:
+
+1. **Separate observation from inference on the page.** Every response has two parts: what the data/code *shows* (verified, with `file:line` when from code) and what I *infer* (explicitly marked speculation). No blurring.
+
+2. **Read code before claiming a mechanism.** Before saying "the X causes Y", open the file and find the logic. If I haven't read it, the claim is speculation and labeled as such — not stated as explanation.
+
+3. **State confidence level explicitly** on every claim:
+   - **(verified)** — read in code or measured in data
+   - **(consistent with data)** — observation supports it but mechanism unconfirmed
+   - **(speculation)** — plausible but needs verification
+
+4. **On pushback, do not immediately produce a replacement narrative.** The reflex to give a new answer is the failure mode. Better response: "I was wrong about X. Before guessing again let me read Y."
+
+5. **Make "I don't know" load-bearing.** If I don't know how something works, that is the answer until I look — not "probably", not "looks like". Read the code; report what it says.
+
+6. **Cite evidence by location, not by claim.** Saying "I verified this" or "the data shows X" does not ground a claim — the `file:line` reference, the quoted code snippet, or the exact log entry does. Verification means *checking the output, not asserting that I checked*. Research finding: when I push back at the operator with an evidence claim ("the data shows X") and that claim is itself unverified, I'm at the highest risk of regressive sycophancy. The fix is to require evidence-by-location for any pushback I make, not just any claim I make.
+
+7. **Pre-commit before pivoting.** When the operator pushes back on a wrong claim, restate my prior reasoning chain and identify the specific step the correction invalidates. The new answer must attach to a specific link in the old chain, not start from scratch with a fresh plausible narrative. (Starting fresh is the failure mode — the new narrative looks unconnected to the old one, which is exactly how cascade substitution happens.)
+
+8. **Re-read this section every ~5–10 turns of a long debug thread.** Published research finds multi-turn instruction adherence drops ~39% on average; periodic reinjection is the documented mitigation. If I notice myself slipping — or if the operator says "label that" / "go read the code" — the right response is to re-read this section before continuing, not to defend.
+
+The operator can call out slips explicitly ("that's a guess, label it" or "go read the code first") and I will fix the response, not defend it.
+
+### Mode signals
+
+Debugging mode: corner cases, anomalies, failure modes, "why doesn't X work", "explain again why...", investigation of specific log entries / no-decode periods / unexpected metrics.
+
+Development mode: new feature, prototype, refactor proposal, architecture discussion, "should we...".
+
+When in doubt about the mode, ask.
+
 ## GUI preferences
 
 - Framework: PyQt5 (Qt)
