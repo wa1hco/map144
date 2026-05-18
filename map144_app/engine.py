@@ -31,25 +31,107 @@ from .processing import (
 log = logging.getLogger(__name__)
 
 
-# Phase 4 cut-over feature flag (option 1: shadow mode behind a flag).
+# Phase 4 cut-over feature flag.  Semantics changed 2026-05-17:
 #
-# Set this env var to 1 to enable a parallel Block-runtime that consumes
-# the same IQ stream the legacy code does and writes its decodes to a
-# separate JSONL (``MSK144/detections/decodes_blocks.jsonl``) for offline
-# A/B comparison against the legacy ``decodes.jsonl``.
+#   ``MAP144_USE_BLOCKS=1``  → **block-primary mode** (Option 2).
+#       Legacy ``_process_iq_data`` runs only its noise blanker +
+#       channelizer + waterfall sections; the detect+decode hop loop
+#       is bypassed (see processing.py around the
+#       ``while self._ch_buf_end >= CH_DETECT_SIZE`` gate).  The Block
+#       runtime is authoritative for detection + decode, writes
+#       WAVs / decodes.jsonl / launches.jsonl to the legacy location
+#       (``MSK144/detections/``), and pushes decode dicts into
+#       ``engine._decode_queue`` so the existing GUI decode panel +
+#       PSKReporter + WSJT-X UDP + DXcluster reporting keep working.
 #
-# When OFF (the default) the engine behaves exactly as before — no
-# Block runtime is started, no overhead.  Easy rollback: unset the flag.
+#   ``MAP144_USE_BLOCKS=0`` (default) → legacy detect+decode owns the
+#       run, no Block runtime is started.  Used as a kill-switch
+#       during the cut-over debug window: flip back to 0 if the Block
+#       path misbehaves and the engine reverts to the historical path
+#       with no code change required.
 #
-# This is the SHADOW mode, the lowest-risk first step toward the full
-# cut-over.  After bake-time confidence the next commit promotes the
-# Block path to primary (legacy detect/decode bypassed), and Phase 5
-# cleanup (#13–#16) deletes the legacy paths altogether.
+# This is the Option 2 cut-over — previously the flag enabled shadow
+# mode where both paths ran in parallel.  Shadow mode is gone; the
+# block-primary semantics replace it.  Phase 5 cleanup (#13–#16)
+# eventually removes the legacy detect/decode code and the flag
+# becomes a no-op.
 #
 # See:
 #   - docs/TODO.md §13.7 cut-over strategy options
-#   - project_phase3_progress memory for detailed rationale
+#   - project_map144_parity_roadmap memory for the parity goal
 _USE_BLOCKS_ENV = "MAP144_USE_BLOCKS"
+
+
+def _make_engine_bridge_sink_class():
+    """Factory for the engine-bridge sink Block — defined lazily so the
+    ``blocks/`` subpackage stays out of the import graph when the flag
+    is off.
+
+    The bridge consumes ``Event(kind="decode")`` records from the
+    DecoderBlock's output stream and pushes the decode payload into
+    ``engine._decode_queue`` in the legacy dict shape, so the existing
+    GUI decode panel + PSKReporter / WSJT-X UDP / DXcluster reporting
+    paths continue working unchanged after the cut-over.
+    """
+    from dataclasses import dataclass
+    from .blocks.block import Block
+    from .blocks.types import BlockConfig, Event
+
+    @dataclass
+    class _EngineBridgeSinkConfig(BlockConfig):
+        input_port_name: str = "events"
+        get_timeout_s: float = 0.250
+
+    class _EngineBridgeSink(Block):
+        """Forward DecoderBlock decode events to ``engine._decode_queue``.
+
+        The DecoderBlock's ``_DecodeQueueShim`` already preserves the
+        full legacy dict shape (every kwarg ``extract_and_decode``
+        passes to ``decode_queue.put`` is carried in
+        ``event.payload``).  We just unwrap it and push to the engine
+        queue that ``displays.py`` polls and forwards to the reporter.
+
+        Marker correlation: legacy decodes carry a ``marker_id`` that
+        the GUI uses to update the heatmap launch marker.  Block-path
+        decodes currently lack matching launches in ``_jt9_markers``
+        (the heatmap overlay does not emit launches yet), so the
+        marker lookup misses and the heatmap overlay stays dark.
+        That's acceptable for the initial Option 2 cut-over; the
+        decode list and reporter feeds work without it.
+        """
+
+        config_type = _EngineBridgeSinkConfig
+
+        def __init__(self, name: str, engine):
+            super().__init__(name)
+            self._engine = engine
+
+        def tick(self) -> None:
+            cfg: _EngineBridgeSinkConfig = self.config  # type: ignore[assignment]
+            port = cfg.input_port_name
+            if port not in self.inputs:
+                raise RuntimeError(
+                    f"{self.name}: input port {port!r} not connected"
+                )
+            try:
+                item = self.inputs[port].get(timeout=cfg.get_timeout_s)
+            except TimeoutError:
+                return
+            if not isinstance(item, Event):
+                return
+            # Reconstruct legacy decode dict — everything except the
+            # event-envelope fields lives in payload already.
+            payload = dict(item.payload or {})
+            payload.setdefault("outcome", "decoded")
+            try:
+                self._engine._decode_queue.put(payload)
+            except Exception:
+                log.exception(
+                    "%s: failed to push decode dict to engine queue",
+                    self.name,
+                )
+
+    return _EngineBridgeSink, _EngineBridgeSinkConfig
 
 
 def _env_use_blocks() -> bool:
@@ -323,8 +405,9 @@ class Engine:
         self._block_iq_anchor_wall: float = 0.0   # set on first push
         if self.use_blocks:
             log.info(
-                "Engine: shadow Block runtime ENABLED (env %s); "
-                "legacy DSP path remains authoritative",
+                "Engine: block-primary mode ENABLED (env %s); legacy "
+                "detect+decode hop loop is bypassed — Block runtime is "
+                "authoritative for detection + decode",
                 _USE_BLOCKS_ENV,
             )
 
@@ -397,22 +480,30 @@ class Engine:
     # ──────────────────────────────────────────────────────────────────
 
     def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
-        """IQ ingress dispatch — legacy ``_process_iq_data`` always runs;
-        when ``self.use_blocks`` is True a parallel Block runtime
-        consumes the same IQ for offline A/B validation.
+        """IQ ingress dispatch — Option 2 cut-over semantics.
 
         Behaviour:
 
         - **Flag off (default):** zero overhead, identical to the
           pre-feature-flag class-level binding ``process_iq_data =
-          _process_iq_data``.
-        - **Flag on:** legacy still authoritative for GUI / decode
-          reporting; Block runtime writes its own decodes JSONL to
-          ``MSK144/detections/blocks/decodes.jsonl`` for comparison.
-          A failure on the Block side is logged but never propagates
-          back into the legacy path.
+          _process_iq_data``.  Legacy detect+decode owns the run.
+        - **Flag on (block-primary):** ``_process_iq_data`` still runs
+          to do the noise blanker, IQ ring writes, magnitude display
+          buffers, channelizer state updates, and the post-loop
+          waterfall FFT — but the detect+decode hop loop is bypassed
+          inside processing.py (see the gate around
+          ``while self._ch_buf_end >= CH_DETECT_SIZE``).  The Block
+          runtime is authoritative for detection + decode; it writes
+          WAVs / decodes.jsonl / launches.jsonl to the legacy
+          ``MSK144/detections/`` location and pushes decode dicts
+          into ``self._decode_queue`` via ``_EngineBridgeSink`` so the
+          GUI decode panel + reporter feeds keep working.
 
-        See class docstring + ``project_phase3_progress`` memory.
+        On Block-side exception the flag is auto-cleared, which
+        re-engages legacy detect+decode on the next IQ chunk — the
+        env-var kill-switch.
+
+        See class docstring + ``project_map144_parity_roadmap`` memory.
         """
         # Snapshot ``_tx_settle_remaining`` BEFORE legacy runs (legacy
         # decrements it by len(iq_samples) per call).  We need both the
@@ -475,16 +566,25 @@ class Engine:
             self.use_blocks = False
 
     def _ensure_block_runtime(self) -> None:
-        """Lazy-init the shadow Block runtime on first IQ tick.
+        """Lazy-init the Block runtime on first IQ tick (block-primary mode).
 
         Wires Source-stand-in (a manually-fed IQ stream) ▶ Tee ▶
-        Channelizer ▶ Detector ▶ Decoder ▶ JsonlSink.  No Reporter — the
-        live PSKReporter / DXcluster uploads come from the LEGACY path
-        in shadow mode, so duplicate spots are not an issue.
+        Channelizer ▶ Detector ▶ Decoder ▶ {EngineBridgeSink, JsonlSink}.
 
-        Output dir: ``MSK144/detections/blocks/`` (its own directory so
-        the legacy ``decodes.jsonl`` and ``launches.jsonl`` are not
-        co-mingled with the Block-path output).
+        The Block runtime is now authoritative for detection + decode.
+        ``DecoderBlock.output_dir`` points at the legacy
+        ``MSK144/detections/`` location so WAVs / decodes.jsonl /
+        launches.jsonl land where downstream tooling
+        (compare_decoders.py, analyze_launches.py, etc.) expects them.
+
+        An ``_EngineBridgeSink`` forwards decode events to
+        ``engine._decode_queue`` so the existing GUI decode panel +
+        PSKReporter / WSJT-X UDP / DXcluster reporting paths continue
+        working unchanged.
+
+        A diagnostic ``JsonlSink`` still writes the event-structured
+        log to ``MSK144/detections/blocks/decode_events.jsonl`` for
+        offline analysis of the Block path's own structured output.
         """
         if self._block_runtime is not None:
             return
@@ -501,10 +601,17 @@ class Engine:
             make_event_stream, make_sample_stream,
         )
 
-        # Output directory for Block-path decodes (separate from legacy).
-        block_out_dir = (
-            Path(__file__).parent.parent / 'MSK144' / 'detections' / 'blocks'
+        # Output paths after Option 2 cut-over:
+        #   - WAVs / decodes.jsonl / launches.jsonl → legacy location
+        #     ``MSK144/detections/`` so downstream tooling reads them
+        #     unchanged.
+        #   - Diagnostic event-structured JSONL → blocks/ subdir for
+        #     offline analysis of the Block path's structured emit.
+        legacy_out_dir = (
+            Path(__file__).parent.parent / 'MSK144' / 'detections'
         )
+        legacy_out_dir.mkdir(parents=True, exist_ok=True)
+        block_out_dir = legacy_out_dir / 'blocks'
         block_out_dir.mkdir(parents=True, exist_ok=True)
         block_decode_jsonl = block_out_dir / 'decode_events.jsonl'
 
@@ -558,10 +665,28 @@ class Engine:
                 sample_rate_hz=self.sample_rate,
                 ring_seconds=15.0,
                 max_concurrent_decodes=4,
-                output_dir=str(block_out_dir),
+                output_dir=str(legacy_out_dir),
                 center_freq_mhz=self.center_freq_mhz,
                 get_timeout_s=0.05,
             ),
+        )
+
+        # Fan-out decode events: one branch → engine bridge (GUI +
+        # reporter), one branch → diagnostic JsonlSink (offline
+        # analysis of structured emit).
+        dec_tee = rt.add(
+            TeeBlock("dec_tee"),
+            TeeBlockConfig(
+                input_port_name="in",
+                output_port_names=["to_bridge", "to_sink"],
+                get_timeout_s=0.05,
+            ),
+        )
+
+        _BridgeCls, _BridgeCfg = _make_engine_bridge_sink_class()
+        bridge = rt.add(
+            _BridgeCls("engine_bridge", self),
+            _BridgeCfg(input_port_name="events", get_timeout_s=0.05),
         )
 
         sink = rt.add(
@@ -603,7 +728,12 @@ class Engine:
                    n_samples_per_record=1024)
         rt.connect(det, "detections", dec, "detections",
                    kind=Stream.KIND_EVENTS, capacity=64, durable=True)
-        rt.connect(dec, "decodes", sink, "events",
+        # Fan out decode events through dec_tee → bridge + sink.
+        rt.connect(dec, "decodes", dec_tee, "in",
+                   kind=Stream.KIND_EVENTS, capacity=64, durable=True)
+        rt.connect(dec_tee, "to_bridge", bridge, "events",
+                   kind=Stream.KIND_EVENTS, capacity=64, durable=True)
+        rt.connect(dec_tee, "to_sink", sink, "events",
                    kind=Stream.KIND_EVENTS, capacity=64, durable=True)
 
         rt.start()
@@ -614,8 +744,9 @@ class Engine:
         self._block_iq_anchor_wall = 0.0   # set lazily on first push
 
         log.info(
-            "Engine: shadow Block runtime started; decodes → %s",
-            block_decode_jsonl,
+            "Engine: Block runtime started (block-primary mode); "
+            "WAVs/decodes.jsonl → %s, structured event log → %s",
+            legacy_out_dir, block_decode_jsonl,
         )
 
     def _block_pump_iq(self, iq_samples: np.ndarray) -> None:

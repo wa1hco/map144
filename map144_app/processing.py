@@ -894,6 +894,27 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
             )
         self._ch_snr_hop_count += 1
 
+        # Block-primary cutover (Option 2): metrics + heatmap history
+        # writes above have already happened — that's what feeds the
+        # GUI sq_det / sync_det / detection-heatmap displays.  Skip
+        # the rest of the hop body (cooldown ticks, threshold gate,
+        # cluster gate, decode dispatch, launches.jsonl write) — the
+        # Block runtime's DetectorBlock + DecoderBlock now own those.
+        # Inline the per-hop _ch_buf drain that normally runs at the
+        # bottom of this loop body (lines ~1318-1325) so the loop
+        # advances; then ``continue`` to the next hop.
+        if getattr(self, 'use_blocks', False):
+            remaining = max(0, self._ch_buf_end - _CH_DETECT_HOP)
+            if remaining > 0:
+                self._ch_buf[:, :remaining] = self._ch_buf[:, _CH_DETECT_HOP:self._ch_buf_end]
+            self._ch_buf_end = remaining
+            if dual_pol:
+                remaining_v = max(0, self._ch_buf_v_end - _CH_DETECT_HOP)
+                if remaining_v > 0:
+                    self._ch_buf_v[:, :remaining_v] = self._ch_buf_v[:, _CH_DETECT_HOP:self._ch_buf_v_end]
+                self._ch_buf_v_end = remaining_v
+            continue
+
         # Tick down cooldowns
         self._detect_cooldowns = {
             k: v - 1 for k, v in self._detect_cooldowns.items() if v > 1
