@@ -2098,7 +2098,16 @@ class CompareGUI(QtWidgets.QMainWindow):
             none_action = menu.addAction(msg)
             none_action.setEnabled(False)
         else:
-            # Cap the menu — anything more than ~30 entries is unwieldy.
+            # Short lists go straight to a QMenu — fastest right-click→pick
+            # path.  When the list overflows ~30, a hard menu cap structurally
+            # hides older entries (newest-first sort + cap → 30 most recent
+            # transmissions only).  Add a "Browse all…" escape hatch that
+            # opens a scrollable, filterable dialog so no entry is unreachable.
+            if len(wavs) > 30:
+                browse = menu.addAction(
+                    f"Browse all {len(wavs)} captures…  (filter + scroll)")
+                browse.setData("__BROWSE__")
+                menu.addSeparator()
             for d, wav in wavs[:30]:
                 ts = d['ts'].strftime('%Y-%m-%d %H:%M:%S')
                 snr = d.get('snr')
@@ -2108,13 +2117,100 @@ class CompareGUI(QtWidgets.QMainWindow):
                 act = menu.addAction(label)
                 act.setData(str(wav))
             if len(wavs) > 30:
-                more = menu.addAction(f"… and {len(wavs) - 30} more (use the "
-                                       "filter or a tighter window)")
+                more = menu.addAction(f"… and {len(wavs) - 30} older — use "
+                                       "Browse all… above")
                 more.setEnabled(False)
 
         chosen = menu.exec_(self._callsign_table.viewport().mapToGlobal(pos))
         if chosen is not None and chosen.data():
-            self._launch_analyze_msk144(chosen.data())
+            if chosen.data() == "__BROWSE__":
+                self._open_captures_browser(callsign, wavs)
+            else:
+                self._launch_analyze_msk144(chosen.data())
+
+    def _open_captures_browser(self, callsign: str, wavs: list) -> None:
+        """Scrollable, filterable dialog for the full capture list.
+
+        Spawned from the right-click menu when entries exceed the menu
+        cap.  Activating an item (double-click or Enter, or the Launch
+        button) calls :meth:`_launch_analyze_msk144` without closing
+        the dialog, so multiple captures from the same QSO can be
+        inspected back-to-back without re-opening the menu.
+
+        Modeless on purpose — the operator can keep the browser open
+        while interacting with the rest of the GUI (changing the time
+        window, re-running, etc.).  A reference is stashed on ``self``
+        to keep Python from garbage-collecting the dialog as soon as
+        this method returns.
+        """
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"{callsign} — {len(wavs)} captures (SENDER)")
+        dlg.resize(820, 520)
+        lv = QtWidgets.QVBoxLayout(dlg)
+
+        filter_edit = QtWidgets.QLineEdit()
+        filter_edit.setPlaceholderText(
+            "Filter: substring match against time / SNR / addressee / message tail")
+        lv.addWidget(filter_edit)
+
+        match_count = QtWidgets.QLabel()
+        match_count.setStyleSheet("color: #555; padding: 0 2px;")
+        lv.addWidget(match_count)
+
+        listw = QtWidgets.QListWidget()
+        listw.setAlternatingRowColors(True)
+        # Monospace so columns align — same visual layout as the menu.
+        font = listw.font()
+        font.setFamily('monospace')
+        listw.setFont(font)
+        for d, wav in wavs:
+            ts = d['ts'].strftime('%Y-%m-%d %H:%M:%S')
+            snr = d.get('snr')
+            snr_str = f"{snr:+d} dB" if snr is not None else "    —"
+            addressee, tail = _format_decode_for_menu(d['message'], callsign)
+            label = f"{ts}  {snr_str}  → {addressee:<10}  {tail}"
+            it = QtWidgets.QListWidgetItem(label)
+            it.setData(QtCore.Qt.UserRole, str(wav))
+            listw.addItem(it)
+        lv.addWidget(listw, 1)
+
+        def _refresh_count() -> None:
+            visible = sum(1 for i in range(listw.count())
+                          if not listw.item(i).isHidden())
+            match_count.setText(f"{visible} of {len(wavs)} shown")
+        _refresh_count()
+
+        def _apply_filter(text: str) -> None:
+            needle = text.strip().lower()
+            for i in range(listw.count()):
+                it = listw.item(i)
+                it.setHidden(bool(needle) and needle not in it.text().lower())
+            _refresh_count()
+        filter_edit.textChanged.connect(_apply_filter)
+
+        def _launch_selected() -> None:
+            it = listw.currentItem()
+            if it is None or it.isHidden():
+                return
+            wav_path = it.data(QtCore.Qt.UserRole)
+            if wav_path:
+                self._launch_analyze_msk144(wav_path)
+        listw.itemActivated.connect(lambda _it: _launch_selected())
+
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch(1)
+        launch_btn = QtWidgets.QPushButton("Launch analyze")
+        launch_btn.clicked.connect(_launch_selected)
+        btns.addWidget(launch_btn)
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(dlg.close)
+        btns.addWidget(close_btn)
+        lv.addLayout(btns)
+
+        filter_edit.setFocus()
+        dlg.setModal(False)
+        dlg.show()
+        self._captures_browser = dlg
 
     def _launch_analyze_msk144(self, wav_path: str) -> None:
         """Spawn analyze_msk144.py in a subprocess so the GUI doesn't block.
