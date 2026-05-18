@@ -93,6 +93,14 @@ from ..processing import (
 from .block import Block
 from .types import BlockConfig, ChannelMetricRecord, Event, Record, StreamClosed
 
+# WSJT-X-faithful sq_det shadow logging (2026-05-16) — mirrors the same
+# additive observation layer in processing.py.  Computes the new sq_det
+# metric on the same channel window without affecting triggering.
+# Disable: MAP144_SHADOW_SQDET=0
+import os as _os
+from ..sq_det import sq_det as _sq_det_new, to_db as _sq_to_db
+_SHADOW_SQDET_ENABLED = _os.environ.get('MAP144_SHADOW_SQDET', '1') != '0'
+
 log = logging.getLogger(__name__)
 
 
@@ -431,6 +439,11 @@ class DetectorBlock(Block):
         """Squared-FFT tone-pair detector — mirrors the legacy
         ``processing.py:516-558`` math.  Returns dB above the rolling
         25th-percentile baseline.
+
+        Also (when ``_SHADOW_SQDET_ENABLED``) maintains a parallel rolling
+        history of MAX-combine ``new_raw_lin`` values per channel, for
+        use by ``_emit_detection_event``'s WSJT-X-shadow logging.  Same
+        shape as ``_metric_hist_buf``, same update rule.
         """
         cfg: DetectorBlockConfig = self.config  # type: ignore[assignment]
         sq = ch_block ** 2  # complex squaring → tones at ±2*offset Hz
@@ -440,6 +453,20 @@ class DetectorBlock(Block):
         lo_peak = power_lin[:, _LO_MASK].max(axis=1)
         hi_peak = power_lin[:, _HI_MASK].max(axis=1)
         raw_lin = (lo_peak + hi_peak) / 2.0
+
+        # Shadow: WSJT-X-style MAX combine + parallel rolling history.
+        # Stored on self so _emit_detection_event can compute detmet_norm
+        # and the three noise-reference variants at launch time.
+        if _SHADOW_SQDET_ENABLED:
+            self._new_raw_lin = np.maximum(lo_peak, hi_peak)  # (48,) latest hop
+            if not hasattr(self, '_metric_hist_buf_new'):
+                self._metric_hist_buf_new = np.zeros_like(self._metric_hist_buf)
+                self._metric_hist_idx_new = 0
+                self._metric_hist_cnt_new = 0
+            self._metric_hist_buf_new[self._metric_hist_idx_new] = self._new_raw_lin
+            self._metric_hist_idx_new = (self._metric_hist_idx_new + 1) % _METRIC_HIST_DEPTH
+            if self._metric_hist_cnt_new < _METRIC_HIST_DEPTH:
+                self._metric_hist_cnt_new += 1
 
         # Rolling baseline.
         self._metric_hist_buf[self._metric_hist_idx] = raw_lin
@@ -806,21 +833,76 @@ class DetectorBlock(Block):
         else:
             source = _SOURCE_SQ
 
+        payload = {
+            "channel_index": int(launch_ch),
+            "fc_hz": self._fc_hz_for_channel(launch_ch),
+            "pair_metric_db": float(pair_metric[launch_ch]),
+            "sync_metric_db": sync_db,
+            "sq_metric_db": sq_db,
+            "source": source,
+            "cluster_channels": [int(c) for c in cluster_chs],
+            "cluster_span_ch": int(cluster_chs[-1] - cluster_chs[0]),
+        }
+
+        # ── SHADOW: WSJT-X-faithful sq_det metrics on the same window ────
+        # Mirrors processing.py's per-launch shadow logging so both pipelines
+        # generate the same comparison data.  Disable: MAP144_SHADOW_SQDET=0.
+        # The sync window for the new sq_det() is the most recent NSPM samples
+        # of the channel buffer.  detector_block keeps its own _sync_buf via
+        # the parent class — same shape and update rule as legacy.
+        if _SHADOW_SQDET_ENABLED and hasattr(self, '_sync_buf'):
+            try:
+                _new_h = _sq_det_new(
+                    np.ascontiguousarray(self._sync_buf[launch_ch], dtype=np.complex128),
+                    fc=0.0,
+                )
+                _new_h_fc_off = (_new_h.ferr_hi if _new_h.ah >= _new_h.al
+                                 else _new_h.ferr_lo)
+                payload['sq_new_detmet_h']       = round(float(_new_h.detmet),  4)
+                payload['sq_new_detmet2_lin_h']  = round(float(_new_h.detmet2), 3)
+                payload['sq_new_detmet2_db_h']   = round(float(_sq_to_db(_new_h.detmet2)), 2)
+                payload['sq_new_ah_h']           = round(float(_new_h.ah),      4)
+                payload['sq_new_al_h']           = round(float(_new_h.al),      4)
+                payload['sq_new_fc_offset_hz_h'] = round(float(_new_h_fc_off),  2)
+
+                # Three noise references on the same hop (cf processing.py)
+                if hasattr(self, '_new_raw_lin'):
+                    _now = float(self._new_raw_lin[launch_ch])
+                    payload['sq_new_raw_lin_h'] = round(_now, 4)
+
+                    if getattr(self, '_metric_hist_cnt_new', 0) > 0:
+                        _hist = self._metric_hist_buf_new[:self._metric_hist_cnt_new, launch_ch]
+                        _hist_s = _hist[::_METRIC_HIST_STRIDE]
+                        _pct25_chan_rolling = float(np.percentile(_hist_s, 25)) if len(_hist_s) else 0.0
+                    else:
+                        _pct25_chan_rolling = 0.0
+                    payload['sq_new_pct25_chan_rolling_h'] = round(_pct25_chan_rolling, 6)
+
+                    payload['sq_new_pct25_cross_chan_h'] = round(
+                        float(np.percentile(self._new_raw_lin, 25)), 6
+                    )
+
+                    _denom = max(_pct25_chan_rolling, 1e-30)
+                    _detmet_norm = _now / _denom
+                    payload['sq_new_detmet_norm_h']    = round(_detmet_norm, 3)
+                    payload['sq_new_detmet_norm_db_h'] = round(float(_sq_to_db(_detmet_norm)), 2)
+
+                if self._pct25 is not None:
+                    payload['sq_new_pct25_chan_legacy_h'] = round(
+                        float(self._pct25[launch_ch]), 6
+                    )
+                # Wideband floor lives on the engine; block path doesn't have
+                # direct access.  Left absent — engine reference can be wired
+                # later when the engine/block bridge is formalised.
+            except Exception as _exc:    # noqa: BLE001
+                payload['sq_new_error_h'] = str(_exc)[:80]
+
         event = Event(
             kind="detection",
             occurred_at_sample=self._n_in_consumed,
             sample_rate_hz=cfg.sample_rate_hz,
             wall_clock_at_production=wall_clock_at_production,
-            payload={
-                "channel_index": int(launch_ch),
-                "fc_hz": self._fc_hz_for_channel(launch_ch),
-                "pair_metric_db": float(pair_metric[launch_ch]),
-                "sync_metric_db": sync_db,
-                "sq_metric_db": sq_db,
-                "source": source,
-                "cluster_channels": [int(c) for c in cluster_chs],
-                "cluster_span_ch": int(cluster_chs[-1] - cluster_chs[0]),
-            },
+            payload=payload,
         )
         try:
             self.outputs[port].put(event)

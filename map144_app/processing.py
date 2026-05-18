@@ -102,6 +102,14 @@ from .msk144_spd import (
     NSPM as _SYNC_NSPM,
 )
 
+# WSJT-X-faithful sq_det port (2026-05-15).  Used for SHADOW logging at launch
+# time only — does NOT affect triggering.  Per-launch enrichment so we can
+# compare the new metric against the legacy `sq_metric_db_h` field after a run.
+# Disable via env: MAP144_SHADOW_SQDET=0
+import os as _os
+from .sq_det import sq_det as _sq_det_new, to_db as _sq_to_db
+_SHADOW_SQDET_ENABLED = _os.environ.get('MAP144_SHADOW_SQDET', '1') != '0'
+
 # Step 1 of sensitivity-improvement plan — coherent MSK144 sync-word
 # correlator running in parallel with the squared-FFT detector.  Feature flag
 # so the change is bisectable (flip to False to recover the legacy path).
@@ -632,6 +640,25 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         hi_peak   = power_lin[:, _HI_MASK].max(axis=1)          # (48,) linear
         raw_lin   = (lo_peak + hi_peak) / 2.0                   # (48,) linear
 
+        # ── Shadow: WSJT-X-style MAX combine + parallel rolling history ──────
+        # Computed every hop (free — lo_peak/hi_peak already available).
+        # Maintained so launch-time shadow can compute detmet_norm (the WSJT-X
+        # primary metric).  Per-channel buffer, same shape and update rule as
+        # the legacy _metric_hist_buf.  Disable: env MAP144_SHADOW_SQDET=0.
+        new_raw_lin = np.maximum(lo_peak, hi_peak)              # (48,) WSJT-X max-combine
+        if _SHADOW_SQDET_ENABLED:
+            if not hasattr(self, '_metric_hist_buf_new'):
+                self._metric_hist_buf_new = np.zeros(
+                    (_METRIC_HIST_DEPTH, N_CHANNELS), dtype=np.float32
+                )
+                self._metric_hist_idx_new = 0
+                self._metric_hist_cnt_new = 0
+            if not getattr(self, '_skip_pct25_update_h', False):
+                self._metric_hist_buf_new[self._metric_hist_idx_new] = new_raw_lin
+                self._metric_hist_idx_new = (self._metric_hist_idx_new + 1) % _METRIC_HIST_DEPTH
+                if self._metric_hist_cnt_new < _METRIC_HIST_DEPTH:
+                    self._metric_hist_cnt_new += 1
+
         # ── H-channel rolling 25th-percentile baseline ───────────────────────
         # Skip the history append when this chunk had blanker activity
         # (TODO #41c — see _skip_pct25_update_h set after the blanker
@@ -1153,6 +1180,99 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                 launch_metrics['sync_phase_coherence_v'] = None
                 launch_metrics['sync_t_sample_v']         = None
                 launch_metrics['sync_freq_offset_hz_v']   = None
+
+            # ── SHADOW: WSJT-X-faithful sq_det metric on the same window ─────
+            # Compute the new sq_det algorithm at launch time only (per-launch
+            # cost, not per-hop) so we can compare against the legacy fields
+            # (`sq_metric_db_h`) without affecting triggering.  Rolls out the
+            # 2026-05-15 dB-scale-mismatch and fc-from-strong-band fixes for
+            # operator-side analysis.  Disable: env MAP144_SHADOW_SQDET=0.
+            if _SHADOW_SQDET_ENABLED:
+                try:
+                    _new_h = _sq_det_new(
+                        np.ascontiguousarray(self._sync_buf[ch_k], dtype=np.complex128),
+                        fc=0.0,        # _sync_buf is complex baseband (channelized at 0 Hz)
+                    )
+                    # Strong-band fc-offset (the regression-fix from 2026-05-15
+                    # — read the freq-error from whichever band fired stronger,
+                    # not the noise-driven argmax of the un-signaled band).
+                    _new_h_fc_off = (_new_h.ferr_hi if _new_h.ah >= _new_h.al
+                                     else _new_h.ferr_lo)
+                    launch_metrics['sq_new_detmet_h']      = round(float(_new_h.detmet),      4)
+                    launch_metrics['sq_new_detmet2_lin_h'] = round(float(_new_h.detmet2),     3)
+                    launch_metrics['sq_new_detmet2_db_h']  = round(float(_sq_to_db(_new_h.detmet2)), 2)
+                    launch_metrics['sq_new_ah_h']          = round(float(_new_h.ah),          4)
+                    launch_metrics['sq_new_al_h']          = round(float(_new_h.al),          4)
+                    launch_metrics['sq_new_fc_offset_hz_h']= round(float(_new_h_fc_off),      2)
+
+                    # ── Three noise references on the same hop ──────────────
+                    # detmet_norm (WSJT-X primary) = current MAX-combine raw_lin
+                    # divided by pct25 of recent values on this channel.  Log
+                    # three alternative noise references so offline analysis
+                    # can pick the best one for Step 6 threshold calibration:
+                    #   (1) rolling per-channel pct25 of NEW (max-combine) values
+                    #   (2) cross-channel pct25 at THIS hop (48 channels)
+                    #   (3) wideband median-floor estimator (decoupled from
+                    #       per-channel state entirely; see noise_blanker.py)
+                    # Plus the LEGACY per-channel rolling pct25 (avg-combine)
+                    # for direct comparison against the formula port.
+                    _new_raw_now = float(new_raw_lin[ch_k])
+                    launch_metrics['sq_new_raw_lin_h'] = round(_new_raw_now, 4)
+
+                    # (1) Rolling per-channel pct25 of new max-combine values
+                    if self._metric_hist_cnt_new > 0:
+                        _hist_new = self._metric_hist_buf_new[:self._metric_hist_cnt_new, ch_k]
+                        _hist_new_s = _hist_new[::_METRIC_HIST_STRIDE]
+                        _pct25_chan_rolling = float(np.percentile(_hist_new_s, 25)) if len(_hist_new_s) else 0.0
+                    else:
+                        _pct25_chan_rolling = 0.0
+                    launch_metrics['sq_new_pct25_chan_rolling_h'] = round(_pct25_chan_rolling, 6)
+
+                    # (2) Cross-channel pct25 of NEW values at this hop
+                    _pct25_cross_chan = float(np.percentile(new_raw_lin, 25))
+                    launch_metrics['sq_new_pct25_cross_chan_h'] = round(_pct25_cross_chan, 6)
+
+                    # (3) Wideband floor from the SELLIM-style estimator (in
+                    # noise_blanker.py).  None if estimator hasn't initialised
+                    # yet (early in run before lowlevel_frac threshold met).
+                    _wbf = getattr(self, '_nb_wideband_floor', None)
+                    launch_metrics['sq_new_wideband_floor_h'] = (
+                        round(float(_wbf), 6) if _wbf is not None else None
+                    )
+
+                    # Legacy per-channel rolling pct25 (AVG-combine) for direct
+                    # apples-to-apples comparison against (1).
+                    if hasattr(self, '_pct25'):
+                        launch_metrics['sq_new_pct25_chan_legacy_h'] = round(
+                            float(self._pct25[ch_k]), 6
+                        )
+
+                    # detmet_norm (WSJT-X primary metric) using reference (1)
+                    _denom = max(_pct25_chan_rolling, 1e-30)
+                    _detmet_norm = _new_raw_now / _denom
+                    launch_metrics['sq_new_detmet_norm_h']    = round(_detmet_norm, 3)
+                    launch_metrics['sq_new_detmet_norm_db_h'] = round(
+                        float(_sq_to_db(_detmet_norm)), 2
+                    )
+                except Exception as _exc:    # noqa: BLE001
+                    launch_metrics['sq_new_error_h'] = str(_exc)[:80]
+
+                if dual_pol and getattr(self, '_sync_buf_v', None) is not None:
+                    try:
+                        _new_v = _sq_det_new(
+                            np.ascontiguousarray(self._sync_buf_v[ch_k], dtype=np.complex128),
+                            fc=0.0,
+                        )
+                        _new_v_fc_off = (_new_v.ferr_hi if _new_v.ah >= _new_v.al
+                                         else _new_v.ferr_lo)
+                        launch_metrics['sq_new_detmet_v']      = round(float(_new_v.detmet),      4)
+                        launch_metrics['sq_new_detmet2_lin_v'] = round(float(_new_v.detmet2),     3)
+                        launch_metrics['sq_new_detmet2_db_v']  = round(float(_sq_to_db(_new_v.detmet2)), 2)
+                        launch_metrics['sq_new_ah_v']          = round(float(_new_v.ah),          4)
+                        launch_metrics['sq_new_al_v']          = round(float(_new_v.al),          4)
+                        launch_metrics['sq_new_fc_offset_hz_v']= round(float(_new_v_fc_off),      2)
+                    except Exception as _exc:    # noqa: BLE001
+                        launch_metrics['sq_new_error_v'] = str(_exc)[:80]
 
             if not getattr(self, '_analysis_no_decode', False):
                 t = threading.Thread(

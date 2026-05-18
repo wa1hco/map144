@@ -164,8 +164,8 @@ def _design_hp_filter(
 class ChannelizerState:
     """Mutable state that persists across apply_channelizer() calls.
 
-    zi_c       -- LP filter state, shape (n_channels, ntaps-1) complex64
-    abs_sample -- total input samples seen (for phase continuity)
+    zi_c               -- LP filter state, shape (n_channels, ntaps-1) complex64
+    abs_sample         -- total input samples seen (for phase continuity)
     _hp_taps, _hp_zi   -- per-channel HP FIR taps and state
     _b_lp_rev          -- pre-reversed LP taps (float32); stored once at init
     _mix_step          -- per-channel NCO step phasor (complex64)
