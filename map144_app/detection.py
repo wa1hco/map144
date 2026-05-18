@@ -91,6 +91,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -145,8 +146,69 @@ _JT9_FTOL_ANALYSIS = 400   # Hz — wider default for analysis window (human cli
 # weak signals.  2026-05-12 bumped to -d 2 to match WSJT-X.
 _JT9_DEPTH   = 2
 
+def find_jt9() -> str | None:
+    """Locate the WSJT-X ``jt9`` binary across platforms.
+
+    Many WSJT-X installs (especially on Windows) don't add the WSJT-X
+    ``bin/`` directory to PATH, so a bare ``shutil.which('jt9')`` fails
+    even though jt9 is installed.  This helper probes the standard
+    install locations per OS so MAP144 finds it without operator setup.
+
+    Search order:
+
+      1. ``MAP144_JT9`` env var — explicit override path (escape hatch
+         for non-standard installs); first hit wins
+      2. ``shutil.which('jt9')`` / ``shutil.which('jt9.exe')`` — PATH
+      3. Standard WSJT-X install locations per OS
+
+    Returns the absolute path string, or ``None`` if not found.
+    """
+    # 1. Explicit override.
+    override = os.environ.get('MAP144_JT9', '').strip()
+    if override and Path(override).is_file():
+        return override
+
+    # 2. PATH lookup.
+    for name in ('jt9', 'jt9.exe'):
+        p = shutil.which(name)
+        if p:
+            return p
+
+    # 3. Standard install locations per OS.
+    if sys.platform == 'win32':
+        candidates = [
+            r'C:\WSJT\wsjtx\bin\jt9.exe',        # operator-confirmed default
+            r'C:\WSJT-X\bin\jt9.exe',            # WSJT-X installer alt
+            r'C:\Program Files\WSJT-X\bin\jt9.exe',
+            r'C:\Program Files (x86)\WSJT-X\bin\jt9.exe',
+        ]
+    elif sys.platform == 'darwin':
+        candidates = [
+            '/Applications/wsjtx.app/Contents/MacOS/jt9',
+        ]
+    else:   # linux and other Unixes
+        candidates = [
+            '/usr/bin/jt9',                       # apt / standard package
+            '/usr/local/bin/jt9',                 # built-from-source default
+            str(Path.home() / '.local/bin/jt9'),  # per-user install
+            '/opt/wsjtx/bin/jt9',                 # third-party packages
+        ]
+    for c in candidates:
+        if Path(c).is_file():
+            return c
+
+    return None
+
+
+# Resolved at import time.  If discovery fails, fall back to the bare
+# name so the eventual subprocess.run() produces a clear FileNotFoundError
+# rather than a None-typed argument crash — though in practice map144.py's
+# startup check at the application entry point catches the missing-jt9
+# case earlier and exits with a friendly message.
+_JT9_PATH = find_jt9() or 'jt9'
+
 JT9_BASE_ARGS = [
-    'jt9', "--msk144",
+    _JT9_PATH, "--msk144",
     "-L", str(1500 - _JT9_FTOL), "-H", str(1500 + _JT9_FTOL),
     "-F", str(_JT9_FTOL), "-d", str(_JT9_DEPTH),
 ]

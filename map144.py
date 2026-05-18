@@ -188,9 +188,18 @@ def main():
 
     _configure_logging(args.log_level)
 
-    if shutil.which('jt9') is None:
-        print("error: jt9 not found on PATH", file=sys.stderr)
+    from map144_app.detection import find_jt9
+    jt9_path = find_jt9()
+    if jt9_path is None:
+        print(
+            "error: jt9 (WSJT-X) not found.\n"
+            "  Install WSJT-X from https://wsjt.sourceforge.io/,\n"
+            "  or set MAP144_JT9 to the full path of jt9 / jt9.exe\n"
+            "  (e.g. MAP144_JT9='C:\\\\WSJT\\\\wsjtx\\\\bin\\\\jt9.exe').",
+            file=sys.stderr,
+        )
         sys.exit(1)
+    logging.getLogger(__name__).info("Using jt9 binary: %s", jt9_path)
 
     from PyQt5 import QtCore, QtWidgets
 
