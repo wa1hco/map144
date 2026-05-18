@@ -1,8 +1,7 @@
 # map144 — MSK144 Meteor Scatter Decoder
 
 map144 is a real-time MSK144 meteor scatter decoder for amateur radio. It monitors
-the MSK144 calling frequency and ±20 kHz either side, detects bursts using a
-48-channel polyphase channelizer, and decodes them using the jt9 engine from
+the MSK144 calling frequency and ±20 kHz either side, detects signals and decodes them using the jt9 engine from
 [WSJT-X](https://wsjt.sourceforge.io/).
 
 Decoded contacts are reported to [PSKReporter](https://pskreporter.info),
@@ -35,6 +34,7 @@ the standard WSJT-X UDP protocol.
 - Python 3.10+
 - [WSJT-X](https://wsjt.sourceforge.io/) installed (provides the `jt9` and `msk144sim` binaries)
 - Linux (tested on Ubuntu 22.04 / 24.04)
+- Windows (but has less testing)
 
 Python dependencies:
 
