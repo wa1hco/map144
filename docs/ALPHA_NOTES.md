@@ -14,7 +14,7 @@ PSKReporter, WSJT-X UDP, and DXcluster.
 **Mission priority (please keep this in mind when reporting):**
 
 1. **PRIMARY** — decode MS pings (short bursts, random timing within the 15-s period)
-2. **SECONDARY** — decode weak tropo / weak fading distant signals
+2. **SECONDARY** — decode weak tropo / weak fading distant signals if using msk144
 3. **NOT THE GOAL** — strong locals, strong Es, regular tropo at workable SNR; those go to FT8 / SSB / CW
 
 A missed MS ping is a sensitivity bug worth reporting. A missed strong-local
@@ -35,7 +35,7 @@ to conserve CPU.
 Standard mode (legacy DSP path, the stable one):
 
 ```bash
-python3 main.py
+python3 map144.py
 ```
 
 That's the default. Don't set any env var.
