@@ -1,4 +1,4 @@
-#!/home/jeff/ham/map144/.venv/bin/python3
+#!/usr/bin/env python3
 """Analyze a single MSK144 WAV file.
 
 Standalone diagnostic and decode tool for MSK144 audio files.  Produces a

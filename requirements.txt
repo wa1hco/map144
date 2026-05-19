@@ -12,7 +12,8 @@ scipy
 # numba is used by the channelizer hot path for an @njit kernel.  Constrain
 # it to versions that support NumPy 1.26.x — older numba (<0.59) breaks on
 # NumPy 1.24+ ABI changes, and very-recent numba may require NumPy 2.x.
-# 0.59–0.65 is the working range against numpy 1.26 on Python 3.12.
+# 0.59–0.65 is the working range against numpy 1.26.  Verified against
+# Python 3.10–3.14 (cp314 wheels confirmed working 2026-05-18).
 numba>=0.59,<0.66
 
 # flexclient is the SmartSDR / Flex-6000 client library used by the Flex

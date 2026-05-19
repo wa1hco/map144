@@ -1,4 +1,4 @@
-#!/home/jeff/ham/map144/.venv/bin/python3
+#!/usr/bin/env python3
 # Copyright (C) 2026  Jeff Millar, WA1HCO <wa1hco@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify

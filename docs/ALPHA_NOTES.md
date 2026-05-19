@@ -30,15 +30,51 @@ to conserve CPU.
 - Block-pipeline architecture available behind a flag (see below — *not*
   enabled by default)
 
-## How to run
+## Prerequisites
 
-Standard mode (legacy DSP path, the stable one):
+- **Python 3.10 or newer** (3.14 verified working as of 2026-05-18).  Windows: install from [python.org](https://www.python.org/downloads/) — *not* the Microsoft Store version (that's a stub that opens the Store on first use).  Linux: your distro's `python3` package is fine on Ubuntu 22.04 / 24.04 and equivalent.
+- **WSJT-X** — provides the `jt9` decoder.  Install from [wsjt.sourceforge.io](https://wsjt.sourceforge.io/) on either OS.  MAP144 auto-discovers `jt9` in the standard install locations; you do **not** need to add it to PATH.
+- **Git** — to clone the repository.
+
+## Install
+
+### Linux / macOS
 
 ```bash
-python3 map144.py
+git clone https://github.com/wa1hco/map144.git
+cd map144
+./install.sh
 ```
 
-That's the default. Don't set any env var.
+### Windows (PowerShell)
+
+```powershell
+git clone https://github.com/wa1hco/map144.git C:\WSJT\map144
+cd C:\WSJT\map144
+.\install.ps1
+```
+
+(Recommended target directory `C:\WSJT\map144` — parallel to your existing `C:\WSJT\wsjtx`.  Don't install MAP144 under a OneDrive-synced location: it writes WAV captures and JSONL logs continuously, and OneDrive sync churn against that volume causes lag.)
+
+The install script creates a `.venv/`, installs dependencies, verifies that `jt9` was found, and prints how to launch.  Re-running the same script after `git pull` is the standard upgrade path.
+
+## How to run
+
+### Linux / macOS
+
+```bash
+./run.sh
+```
+
+### Windows
+
+```powershell
+.\run.bat
+```
+
+That's the default — uses the stable legacy DSP path.  Don't set any env var.
+
+The first launch may take ~10 s while numba JIT-compiles the channelizer hot paths.  Subsequent launches are fast (numba caches the compilation).
 
 ## Known limitations
 
