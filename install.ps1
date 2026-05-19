@@ -92,9 +92,13 @@ if (-not $jt9Path) {
     Write-Host "jt9: $jt9Path" -ForegroundColor Green
 }
 
-# ── 6. Done ─────────────────────────────────────────────────────────────
+# ── 6. Resolve installed version (single source of truth) ──────────────
+$Map144Version = & $VenvPython -c "from map144_app import __version__; print(__version__)" 2>$null
+if (-not $Map144Version) { $Map144Version = "???" }
+
+# ── 7. Done ─────────────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "MAP144 ready." -ForegroundColor Green
+Write-Host "MAP144 v$Map144Version ready." -ForegroundColor Green
 Write-Host "To run:"
 Write-Host "    cd $RepoDir"
 Write-Host "    .\run.bat"

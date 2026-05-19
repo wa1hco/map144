@@ -46,6 +46,7 @@ import numpy as np
 from PyQt5 import QtWidgets, QtCore
 import pyqtgraph as pg
 
+from . import __version__
 from .widgets import ClickableImageItem
 
 # MSK144 calling frequencies (US convention) and compatible source modes.
@@ -138,7 +139,7 @@ def setup_ui(self):
     from .reporting_window import setup_reporting_window
     from .screenshot_window import setup_screenshot_window
 
-    self.setWindowTitle(f'map144 - {self.center_freq_mhz:.3f} MHz')
+    self.setWindowTitle(f'map144 v{__version__}  —  {self.center_freq_mhz:.3f} MHz')
     self.setGeometry(50, 50, 420, 800)
 
     # ── Menu bar ──────────────────────────────────────────────────────────────

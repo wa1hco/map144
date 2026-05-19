@@ -62,9 +62,14 @@ else
     echo "jt9: $JT9_PATH"
 fi
 
+# Resolve the installed version from the package itself — single source
+# of truth, no risk of the install banner drifting from what the app
+# actually reports.
+MAP144_VERSION="$("$VENV_PY" -c 'from map144_app import __version__; print(__version__)' 2>/dev/null || echo '???')"
+
 cat <<EOF
 
-MAP144 ready.
+MAP144 v$MAP144_VERSION ready.
 
 To run:
     ./run.sh

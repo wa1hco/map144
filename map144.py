@@ -150,6 +150,10 @@ def _configure_logging(level_name: str):
     # Most diagnostic output in detection.py / processing.py uses print().
     sys.stdout = _TeeStream(sys.stdout, log_path)
 
+    # Version banner first so every log file carries the version that
+    # produced it — even when the user doesn't think to mention it.
+    from map144_app import __version__ as _map144_version
+    print(f"[map144] starting MAP144 v{_map144_version}", flush=True)
     print(f"[map144] log file: {log_path}", flush=True)
 
 

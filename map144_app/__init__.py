@@ -53,6 +53,14 @@ Only ``MAP144Visualizer`` is exported; everything else is an implementation
 detail internal to the package.
 """
 
+#: Package version.  Single source of truth — referenced by:
+#:   - the main-window title bar (map144_app.displays / map144_app.ui)
+#:   - the startup log line in map144.py
+#:   - the "ready" banner printed by install.sh / install.ps1
+#:   - bug reports (lands in MSK144/logs/map144_*.log automatically)
+#: Bumped together with a git tag at each release.  See CHANGELOG.md.
+__version__ = "0.1.1-alpha"
+
 from .visualizer import MAP144Visualizer
 
-__all__ = ["MAP144Visualizer"]
+__all__ = ["MAP144Visualizer", "__version__"]
