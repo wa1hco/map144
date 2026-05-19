@@ -6,6 +6,35 @@ All notable changes to MAP144 are recorded here.  Format roughly follows
 Versions are bumped at noticeable-to-tester intervals, not per commit.
 Each released version has a matching git tag (e.g. ``v0.1.1-alpha``).
 
+## v0.1.3-alpha — 2026-05-19
+
+### Fixed
+
+- **Test pollution into production decode log.**  Two test suites
+  (``test_engine_block_primary`` and ``test_parity_on_strong_multi_ping_sim``)
+  were writing synthetic-test decodes — including phantom-format LDPC
+  garbage from the parity_strong10 fixture and ``CQ K1JT FN20`` entries —
+  to the operator's real ``MSK144/detections/decodes.jsonl`` and capture
+  WAV directory.  An overnight bake on 2026-05-19 was confused by these
+  leftover test entries, masking the real bake's true (near-zero) decode
+  count.
+
+  Root cause: ``map144_app/processing.py`` (legacy hop loop) and
+  ``map144_app/engine.py`` (block-primary runtime) hardcoded the output
+  directory to ``<repo>/MSK144/detections/``.  Any test instantiating the
+  Engine or invoking the legacy pipeline wrote there.
+
+  Fix: new ``MAP144_OUTPUT_DIR`` env var override.  Default unchanged —
+  if unset, production writes go to ``MSK144/detections/``.  Tests set
+  the env var to a TempDir in setUp / restore in tearDown.
+
+### Added
+
+- **``MAP144_OUTPUT_DIR`` env var.**  Operators with non-standard layouts
+  (e.g., wanting decodes on a different drive) can now redirect WAV /
+  ``decodes.jsonl`` / ``launches.jsonl`` writes by setting this variable
+  before launching MAP144.
+
 ## v0.1.2-alpha — 2026-05-19
 
 ### Fixed
