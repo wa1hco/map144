@@ -6,10 +6,11 @@ first run.
 
 ## What MAP144 is
 
-A weak-signal DSP and decode pipeline for 144/50 MHz MSK144 meteor-scatter
-operation. It runs alongside (or in place of) WSJT-X, taking IQ from a Flex
-SmartSDR DAX-IQ stream and producing decodes to a GUI decode panel,
-PSKReporter, WSJT-X UDP, and DXcluster.
+Looks at 40 kHz of bandwidth around the meteor scatter calling frequency looking for signals, similar to map65 and QMAP from WSJTX family. It runs alongside WSJT-X, taking IQ from a FlexRadio or other DSP and producing decodes displayed on a GUI decode panel or sent to PSKReporter, N1MM, GridTracker, and DXcluster.
+
+I've done most of my testing with FlexRadio and USRP B210, the program has been tested with Airspy HF+, and nesdr smart
+
+The most significant feature, beside decoding over a wide bandwidth, is the ability to work with dual channel digital receivers and use dual polarization antennas.  Like map65, map144 finds the best combination of two antennas before decoding.  On 50 MHz, Faraday rotation makes the polarization of a received ping random.  map144 should have about 3 dB advantage over single polarity receivers.
 
 **Mission priority (please keep this in mind when reporting):**
 
@@ -22,13 +23,14 @@ re-decode is usually not a bug — MAP144 deliberately caps launches per channel
 to conserve CPU.
 
 ## What's in this alpha
-
-- Real-time MSK144 detect + decode pipeline (legacy DSP path is the default)
-- Side-by-side comparison vs WSJT-X via `compare_decoders.py`
-- Captures browser with substring filter + scrollable list (right-click a
-  callsign in the comparison GUI)
-- Block-pipeline architecture available behind a flag (see below — *not*
-  enabled by default)
+- Real-time MSK144 detect + decode pipeline
+- Display windows for 
+  - Radio interface status and settings
+  - Fast Graph like wsjtx
+  - Detection algorithms (two ways)
+  - Noise blanker status and settings
+  - Reporting options
+- Side-by-side comparison vs WSJT-X via `compare_decoders.py` tool
 
 ## Prerequisites
 
@@ -38,35 +40,62 @@ to conserve CPU.
 
 ## Install
 
-### Linux / macOS
+### Recommended location
+
+- **Linux / macOS:** `~/map144` (in your home directory)
+- **Windows:** `C:\map144` (top-level on the system drive)
+
+You can install elsewhere if you prefer — the install script doesn't care about location.  On Windows, **avoid OneDrive-synced paths** (e.g. `C:\Users\<you>\OneDrive\Documents\…`): MAP144 writes WAV captures and JSONL logs continuously, and OneDrive sync churn against that volume causes lag.
+
+### Fresh install
+
+#### Linux / macOS
 
 ```bash
-git clone https://github.com/wa1hco/map144.git
-cd map144
+git clone https://github.com/wa1hco/map144.git ~/map144
+cd ~/map144
 ./install.sh
 ```
 
-### Windows (PowerShell)
+#### Windows (PowerShell)
 
 ```powershell
-git clone https://github.com/wa1hco/map144.git C:\WSJT\map144
-cd C:\WSJT\map144
+git clone https://github.com/wa1hco/map144.git C:\map144
+cd C:\map144
 .\install.ps1
 ```
 
-(Recommended target directory `C:\WSJT\map144` — parallel to your existing `C:\WSJT\wsjtx`.  Don't install MAP144 under a OneDrive-synced location: it writes WAV captures and JSONL logs continuously, and OneDrive sync churn against that volume causes lag.)
+### Upgrade (existing install)
 
-The install script creates a `.venv/`, installs dependencies, verifies that `jt9` was found, and prints how to launch.  Re-running the same script after `git pull` is the standard upgrade path.
+Pull the latest source and re-run the install script.  It's idempotent — reuses any existing `.venv`, re-resolves dependencies, re-verifies `jt9`.
+
+#### Linux / macOS
+
+```bash
+cd ~/map144
+git pull
+./install.sh
+```
+
+#### Windows (PowerShell)
+
+```powershell
+cd C:\map144
+git pull
+.\install.ps1
+```
+
+The install script creates a `.venv/`, installs dependencies, verifies that `jt9` was found, and prints how to launch.
 
 ## How to run
 
-### Linux / macOS
+### Linux / macOS (from the map144 directory)
 
 ```bash
 ./run.sh
 ```
 
-### Windows
+### Windows (from the map144 directory)
 
 ```powershell
 .\run.bat
@@ -78,17 +107,7 @@ The first launch may take ~10 s while numba JIT-compiles the channelizer hot pat
 
 ## Known limitations
 
-- **Block-pipeline mode is opt-in only and not recommended yet.** Set
-  `MAP144_USE_BLOCKS=1` to enable it. It runs the new dataflow architecture
-  as primary detection + decode. Currently has a higher launch rate than
-  legacy with a different launch-to-decode profile; under investigation.
-  Default is off; flip back by unsetting the env var. No code change.
-- **Heatmap launch-marker overlay** is dark in block-primary mode. The decode
-  list and reporting work; only the heatmap circles are missing. Legacy mode
-  is unaffected.
-- **The flag's old "shadow mode" semantics are gone.** If you previously set
-  `MAP144_USE_BLOCKS=1` and got both pipelines running in parallel, that
-  configuration no longer exists.
+map144 is currently about 1 dB less sensitive than WSJT-X.  Most of the time both programs decode the ping, but sometimes only one program catches the weak ping and mostly wsjtx wins.  I'm working on parity and eventually using more CPU power to beat WSJTX.
 
 ## What to report
 
