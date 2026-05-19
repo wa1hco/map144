@@ -74,6 +74,7 @@ import numpy as np
 from ..channelizer import CH_SAMPLE_RATE, N_CHANNELS
 from ..msk144_spd import NSPM as _SYNC_NSPM
 from ..msk144_spd import _sync_correlate_batch as _msk144_sync_correlate_batch
+from ..msk144_spd import _sync_phase_features as _msk144_sync_phase_features
 from ..processing import (
     CH_DETECT_SIZE,
     DETECT_MERGE_GAP_S,
@@ -87,6 +88,7 @@ from ..processing import (
     _LO_MASK,
     _METRIC_HIST_DEPTH,
     _METRIC_HIST_STRIDE,
+    _SQ_FREQ,
     _SUSTAINED_HOPS,
     _SUSTAINED_LOCKOUT,
 )
@@ -450,9 +452,27 @@ class DetectorBlock(Block):
         x_sq = np.fft.fft(sq * _DETECT_WINDOW[np.newaxis, :], axis=1)
         power_lin = np.abs(x_sq) / cfg.fft_size
 
-        lo_peak = power_lin[:, _LO_MASK].max(axis=1)
-        hi_peak = power_lin[:, _HI_MASK].max(axis=1)
+        # Take both the peak amplitude AND the peak-bin position in the
+        # lo/hi tone-search windows.  Position gives us the within-channel
+        # frequency offset (``_sq_fc_offset``) that the launch path needs
+        # to compute ``fc_hz`` at sub-bin precision — without it the
+        # decoder pre-shifts to a mis-tuned audio frequency and forces jt9
+        # to recover via FTOL search.  Mirrors processing.py:1075-1082.
+        _lo_sub = power_lin[:, _LO_MASK]
+        _hi_sub = power_lin[:, _HI_MASK]
+        _lo_idx = _lo_sub.argmax(axis=1)
+        _hi_idx = _hi_sub.argmax(axis=1)
+        lo_peak = _lo_sub.max(axis=1)
+        hi_peak = _hi_sub.max(axis=1)
         raw_lin = (lo_peak + hi_peak) / 2.0
+
+        # Per-channel sub-bin offset within the channel band.  Squaring
+        # doubles tone frequencies, so the within-channel ``fc_offset`` is
+        # (lo_freq + hi_freq) / 4.0 (divide-by-4 = average-then-undo-doubling).
+        # Used by ``_emit_detection_event`` to refine fc_hz before launch.
+        _lo_freqs = _SQ_FREQ[_LO_MASK][_lo_idx]
+        _hi_freqs = _SQ_FREQ[_HI_MASK][_hi_idx]
+        self._sq_fc_offset = ((_lo_freqs + _hi_freqs) / 4.0).astype(np.float32)
 
         # Shadow: WSJT-X-style MAX combine + parallel rolling history.
         # Stored on self so _emit_detection_event can compute detmet_norm
@@ -495,7 +515,12 @@ class DetectorBlock(Block):
         ``_sync_correlate_batch`` for all 48 channels in one BLAS call.
         """
         sync_window = np.ascontiguousarray(self._sync_buf, dtype=np.complex64)
-        _, peaks, _ = _msk144_sync_correlate_batch(sync_window)
+        _, peaks, ish_best = _msk144_sync_correlate_batch(sync_window)
+        # Save ish_best so ``_emit_detection_event`` can compute phase-
+        # derived features (coherence, sub-sample t, fine freq offset)
+        # at launch time.  Mirrors processing.py's launch-time call to
+        # ``_msk144_sync_phase_features`` using the sync_ish_best_h array.
+        self._sync_ish_best = ish_best
 
         self._sync_metric_hist_buf[self._sync_metric_hist_idx] = peaks
         self._sync_metric_hist_idx = (
@@ -833,9 +858,22 @@ class DetectorBlock(Block):
         else:
             source = _SOURCE_SQ
 
+        # Refined fc_hz: channel-centre PLUS the within-channel sub-bin
+        # offset from the squared-FFT lo/hi peak positions.  Without this,
+        # fc_hz lands on the channel centre exactly, the decoder pre-shifts
+        # the WAV to ±0 Hz from nominal audio-1500, and any real signal
+        # offset within the channel (up to ~±500 Hz) has to be recovered
+        # by jt9's FTOL search at the cost of CPU + decode probability.
+        # Mirrors processing.py:1082 ``fc_hz = ch_signed*spacing + offset
+        # + fc_offset``.
+        _fc_off = (
+            float(self._sq_fc_offset[launch_ch])
+            if getattr(self, '_sq_fc_offset', None) is not None
+            else 0.0
+        )
         payload = {
             "channel_index": int(launch_ch),
-            "fc_hz": self._fc_hz_for_channel(launch_ch),
+            "fc_hz": self._fc_hz_for_channel(launch_ch) + _fc_off,
             "pair_metric_db": float(pair_metric[launch_ch]),
             "sync_metric_db": sync_db,
             "sq_metric_db": sq_db,
@@ -843,6 +881,29 @@ class DetectorBlock(Block):
             "cluster_channels": [int(c) for c in cluster_chs],
             "cluster_span_ch": int(cluster_chs[-1] - cluster_chs[0]),
         }
+
+        # Sync-correlator phase-derived features (#29).  Computed at
+        # launch time only (rare event) using sync_ish_best from this
+        # cycle's correlation pass.  Mirrors processing.py:1180-1191.
+        # The ``sync_freq_offset_hz_h`` field is the fine sub-Hz offset
+        # extract_and_decode uses to pre-correct the audio before jt9 —
+        # without it the FTOL=50 search has to absorb the residual.
+        _ish_best = getattr(self, '_sync_ish_best', None)
+        if _ish_best is not None and cfg.enable_sync_detect:
+            try:
+                _coh_h, _ts_h, _foff_h = _msk144_sync_phase_features(
+                    np.ascontiguousarray(self._sync_buf[launch_ch], dtype=np.complex64),
+                    int(_ish_best[launch_ch]),
+                )
+                payload['sync_phase_coherence_h'] = round(float(_coh_h), 3)
+                payload['sync_t_sample_h']        = round(float(_ts_h), 2)
+                payload['sync_freq_offset_hz_h']  = round(float(_foff_h), 2)
+            except Exception:    # noqa: BLE001
+                # Phase features are diagnostic; failure should not block
+                # the decode path.
+                payload['sync_phase_coherence_h'] = None
+                payload['sync_t_sample_h']        = None
+                payload['sync_freq_offset_hz_h']  = None
 
         # ── SHADOW: WSJT-X-faithful sq_det metrics on the same window ────
         # Mirrors processing.py's per-launch shadow logging so both pipelines

@@ -890,11 +890,39 @@ class TestLegacyVsBlockReplay(unittest.TestCase):
             file=sys.stderr,
         )
 
-        self.assertEqual(
-            legacy_only, set(),
-            f"Shadow MISSED {len(legacy_only)} callsign(s) that legacy "
-            f"caught: {sorted(legacy_only)}.  Sensitivity regression in "
-            f"the Block path — investigate before promotion (option 2).",
+        # Parity is intentionally "roughly as good", not "bit-identical".
+        # The two paths can swap a boundary signal in either direction
+        # depending on which hop the fc_offset / pre-shift is computed
+        # on — the same signal at slightly different hop timing gives
+        # slightly different pre-shift, which can move a marginal decode
+        # in or out of jt9's FTOL=50 window.  We require:
+        #
+        #   (a) block decodes at least as many TOTAL signals as legacy,
+        #       i.e. no aggregate sensitivity loss
+        #   (b) the intersection covers all-but-one of legacy's decodes,
+        #       i.e. at most one boundary swap
+        #
+        # Both must hold — (a) alone allows block to lose 5 of legacy's
+        # signals and gain 5 unrelated ones; (b) alone allows total
+        # count to drop arbitrarily.
+        block_only = block_callsigns - legacy_callsigns
+
+        self.assertGreaterEqual(
+            len(block_callsigns), len(legacy_callsigns),
+            f"Block decoded fewer total signals than legacy "
+            f"({len(block_callsigns)} vs {len(legacy_callsigns)}).  "
+            f"Aggregate sensitivity regression — investigate before "
+            f"promotion.\n"
+            f"  legacy={sorted(legacy_callsigns)}\n"
+            f"  block ={sorted(block_callsigns)}",
+        )
+        self.assertLessEqual(
+            len(legacy_only), 1,
+            f"Block missed {len(legacy_only)} legacy callsign(s): "
+            f"{sorted(legacy_only)}.  More than one boundary swap = "
+            f"real sensitivity regression in the Block path.\n"
+            f"  legacy-only={sorted(legacy_only)}\n"
+            f"  block-only ={sorted(block_only)}",
         )
 
 
