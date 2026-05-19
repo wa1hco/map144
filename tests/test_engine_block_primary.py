@@ -52,9 +52,19 @@ class TestBlockPrimaryDecodeReachesEngineQueue(unittest.TestCase):
     def setUp(self):
         os.environ["MAP144_USE_BLOCKS"] = "1"
         self._tmpdir = tempfile.mkdtemp(prefix="map144_blockprimary_")
+        # Redirect WAVs / decodes.jsonl / launches.jsonl into the
+        # TempDir so synthetic test signals don't contaminate the
+        # operator's real production decode log.  Verified essential
+        # 2026-05-19 after an overnight bake was confused by leftover
+        # test entries written to MSK144/detections/.
+        self._prev_outdir = os.environ.pop("MAP144_OUTPUT_DIR", None)
+        os.environ["MAP144_OUTPUT_DIR"] = self._tmpdir
 
     def tearDown(self):
         os.environ.pop("MAP144_USE_BLOCKS", None)
+        os.environ.pop("MAP144_OUTPUT_DIR", None)
+        if self._prev_outdir is not None:
+            os.environ["MAP144_OUTPUT_DIR"] = self._prev_outdir
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     def test_decode_reaches_engine_queue_in_block_primary_mode(self):

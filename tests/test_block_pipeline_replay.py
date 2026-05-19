@@ -808,11 +808,24 @@ class TestLegacyVsBlockReplay(unittest.TestCase):
         if not sim_wav.is_file() or not sim_json.is_file():
             self.skipTest(f"Sim fixture not present: {sim_wav}")
 
+        # Redirect both pipelines' production outputs into a TempDir so
+        # synthetic-sim decodes don't contaminate the operator's real
+        # ``MSK144/detections/decodes.jsonl``.  Verified essential
+        # 2026-05-19 after this test's legacy-side writes confused a
+        # real overnight bake's analysis.
+        sim_outdir = Path(tempfile.mkdtemp(prefix="map144_paritysim_"))
+        self.addCleanup(shutil.rmtree, str(sim_outdir), ignore_errors=True)
+        prev_outdir = os.environ.pop("MAP144_OUTPUT_DIR", None)
+        os.environ["MAP144_OUTPUT_DIR"] = str(sim_outdir)
+        def _restore_outdir():
+            os.environ.pop("MAP144_OUTPUT_DIR", None)
+            if prev_outdir is not None:
+                os.environ["MAP144_OUTPUT_DIR"] = prev_outdir
+        self.addCleanup(_restore_outdir)
+
         # ── Legacy ────────────────────────────────────────────────────
         from tests.headless_replay import replay_iq_wav  # noqa: PLC0415
-        legacy_decodes_path = (
-            _REPO_ROOT / "MSK144" / "detections" / "decodes.jsonl"
-        )
+        legacy_decodes_path = sim_outdir / "decodes.jsonl"
         legacy_run_start = replay_iq_wav(
             str(sim_wav),
             sample_rate=48_000,

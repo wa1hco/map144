@@ -146,6 +146,29 @@ _JT9_FTOL_ANALYSIS = 400   # Hz — wider default for analysis window (human cli
 # weak signals.  2026-05-12 bumped to -d 2 to match WSJT-X.
 _JT9_DEPTH   = 2
 
+def production_output_dir() -> Path:
+    """Directory where decode WAVs / ``decodes.jsonl`` / ``launches.jsonl``
+    are written.
+
+    Defaults to ``<repo>/MSK144/detections/``.  Tests **MUST** override
+    this via the ``MAP144_OUTPUT_DIR`` env var so synthetic-test decodes
+    don't pollute the operator's real decode log.  The legacy hop loop
+    in ``processing.py`` and the Block runtime's ``DecoderBlock`` both
+    consult this — single source of truth for the output location.
+
+    Pollution-protection rule (added 2026-05-19 after test runs
+    contaminated a real overnight bake):
+
+      - In production: env var unset → default to the real location.
+      - In tests:       env var set to a TempDir → writes go there.
+    """
+    override = os.environ.get('MAP144_OUTPUT_DIR', '').strip()
+    if override:
+        return Path(override)
+    # Project root is two levels up from this file (map144_app/detection.py).
+    return Path(__file__).resolve().parent.parent / 'MSK144' / 'detections'
+
+
 def find_jt9() -> str | None:
     """Locate the WSJT-X ``jt9`` binary across platforms.
 

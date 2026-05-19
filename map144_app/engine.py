@@ -602,14 +602,13 @@ class Engine:
         )
 
         # Output paths after Option 2 cut-over:
-        #   - WAVs / decodes.jsonl / launches.jsonl → legacy location
-        #     ``MSK144/detections/`` so downstream tooling reads them
-        #     unchanged.
+        #   - WAVs / decodes.jsonl / launches.jsonl → production location
+        #     (``<repo>/MSK144/detections/`` by default, overridable via
+        #     the ``MAP144_OUTPUT_DIR`` env var — tests use a TempDir).
         #   - Diagnostic event-structured JSONL → blocks/ subdir for
         #     offline analysis of the Block path's structured emit.
-        legacy_out_dir = (
-            Path(__file__).parent.parent / 'MSK144' / 'detections'
-        )
+        from .detection import production_output_dir
+        legacy_out_dir = production_output_dir()
         legacy_out_dir.mkdir(parents=True, exist_ok=True)
         block_out_dir = legacy_out_dir / 'blocks'
         block_out_dir.mkdir(parents=True, exist_ok=True)

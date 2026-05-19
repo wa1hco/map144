@@ -94,7 +94,7 @@ from .channelizer import (
     CH_SAMPLE_RATE,
 )
 from .channel_plan import NYQUIST_EDGE_CHANNEL_SKIP
-from .detection import extract_and_decode
+from .detection import extract_and_decode, production_output_dir
 from .msk144_spd import (
     _sync_correlate as _msk144_sync_correlate,
     _sync_correlate_batch as _msk144_sync_correlate_batch,
@@ -1089,7 +1089,10 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
 
             abs_snap      = self._iq_abs_sample
             ring_state_fn = lambda: (self._iq_ring_pos, self._iq_abs_sample)
-            output_dir    = str(Path(__file__).parent.parent / 'MSK144' / 'detections')
+            # Resolved via the env-var-aware helper so tests can redirect
+            # writes to a TempDir and not contaminate the operator's real
+            # decode log.  See detection.py:production_output_dir().
+            output_dir    = str(production_output_dir())
             detect_ts     = datetime.now(timezone.utc).strftime('%Y-%m-%d_%H:%M:%S.%f')[:21]
 
             decode_queue = getattr(self, '_decode_queue', None)
