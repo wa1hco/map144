@@ -174,6 +174,16 @@ class DAXIQSetup:
         self.stream_id = int(resp.strip(), 16) if resp.strip() else None
         if not self.stream_id:
             raise RuntimeError("Failed to create DAXIQ stream")
+        # Remember the stream WE created.  The status-watch handler
+        # below uses this to distinguish a radio-initiated reassignment
+        # of our slice (rare — ADC-overload recovery; update filter) from
+        # a foreign client creating its own DAX-IQ stream (common — other
+        # MAP144 / WSJT-X; do NOT update filter).  Without ownership
+        # awareness the filter silently follows the foreign stream and
+        # we stop receiving IQ; teardown then tries to ``stream remove``
+        # the foreign id, the radio rejects, and our own stream leaks.
+        # See ``project_flex_multi_client_stream_leak`` memory.
+        self._own_stream_id = self.stream_id
         log.debug(f"DAXIQ stream created: 0x{self.stream_id:08x}")
 
         # Wait briefly for stream status message with slice/pan assignment.
@@ -301,25 +311,68 @@ class DAXIQSetup:
                     tokens = parts[1].split()
                     if len(tokens) >= 2 and tokens[0] == "stream":
                         msg_stream_id = int(tokens[1], 16)
+                        # Parse slice once — used both for filter-update
+                        # ownership decisions and for slice/pan tracking.
+                        slice_id_str = _extract_key(parts[1], "slice")
+                        pan_id_str = _extract_key(parts[1], "pan")
+                        msg_slice_id = (
+                            int(slice_id_str, 16) if slice_id_str else None
+                        )
+                        _own_sid = getattr(self, '_own_stream_id', None)
 
-                        # Detect stream_id reassignment (e.g. after ADC overload).
-                        # Update filter_sid on the VITA receiver so packets aren't
-                        # silently discarded.
-                        if (self.stream_id is not None
-                                and msg_stream_id != self.stream_id
-                                and self._vita_ref is not None):
-                            log.warning(
-                                f"DAXIQ stream_id changed: "
-                                f"0x{self.stream_id:08x} → 0x{msg_stream_id:08x} — updating filter"
-                            )
-                            self.stream_id = msg_stream_id
-                            self._vita_ref.filter_sid = msg_stream_id
-                            self._vita_ref._last_seq = {}
-
-                        if self.stream_id is None or msg_stream_id == self.stream_id:
-                            slice_id_str = _extract_key(parts[1], "slice")
-                            pan_id_str = _extract_key(parts[1], "pan")
-
+                        # ── Foreign-vs-our-stream gate ─────────────────────
+                        # If the broadcast is for a stream id we didn't
+                        # create, decide whether it's a radio-initiated
+                        # reassignment of OUR slice (rare — update filter)
+                        # or another DAX client's stream (common — leave
+                        # our state alone).  The slice id distinguishes
+                        # them: our slice stays the same across radio
+                        # reassignment, while foreign clients run on a
+                        # different slice.
+                        is_our_stream = (
+                            _own_sid is None or msg_stream_id == _own_sid
+                        )
+                        if not is_our_stream:
+                            if (self.slice_id is not None
+                                    and msg_slice_id is not None
+                                    and msg_slice_id == self.slice_id
+                                    and self._vita_ref is not None):
+                                # Same slice → radio reassigned our stream.
+                                log.warning(
+                                    f"DAXIQ stream reassigned by radio: "
+                                    f"0x{_own_sid:08x} → 0x{msg_stream_id:08x} "
+                                    f"(same slice 0x{msg_slice_id:x}) — updating filter"
+                                )
+                                self._own_stream_id = msg_stream_id
+                                self.stream_id = msg_stream_id
+                                self._vita_ref.filter_sid = msg_stream_id
+                                self._vita_ref._last_seq = {}
+                            else:
+                                # Different slice (or no slice info yet) →
+                                # foreign DAX client.  Do NOT touch our
+                                # filter or stream_id — both are still
+                                # valid on the radio.  Operator workaround
+                                # if both clients must run: assign each
+                                # a different slice (radio supports it).
+                                _slice_str = (
+                                    f"0x{msg_slice_id:x}"
+                                    if msg_slice_id is not None else "?"
+                                )
+                                _own_slice_str = (
+                                    f"0x{self.slice_id:x}"
+                                    if self.slice_id is not None else "?"
+                                )
+                                log.info(
+                                    f"DAXIQ: another client owns stream "
+                                    f"0x{msg_stream_id:08x} (slice {_slice_str}); "
+                                    f"our stream 0x{_own_sid:08x} on "
+                                    f"slice {_own_slice_str} unaffected — "
+                                    f"ignoring broadcast"
+                                )
+                            # Foreign / reassigned: skip the slice/pan
+                            # absorption below — it'd capture foreign info.
+                        else:
+                            # ── Our stream → absorb slice/pan info ─────
                             if slice_id_str:
                                 self.slice_id = int(slice_id_str, 16)
                                 status = "ASSIGNED" if self.slice_id != 0 else "NOT ASSIGNED"
