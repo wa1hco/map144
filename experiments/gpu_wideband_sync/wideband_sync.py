@@ -232,6 +232,47 @@ def extract_candidates(surface_cp, cfg: WidebandSyncConfig,
     return out
 
 
+def extract_candidates_cpu(surface: np.ndarray, cfg: WidebandSyncConfig,
+                            template_length: int) -> list[Candidate]:
+    """CPU (numpy) implementation of candidate extraction.
+
+    Same algorithm as ``extract_candidates`` (the GPU version) but
+    operating on a numpy ambiguity surface — for use when CuPy isn't
+    installed (i.e. on hosts without a GPU).  Mostly useful for the
+    sensitivity-test driver in ``test_sensitivity.py``.
+
+    Per-freq-bin noise floor estimated as the median magnitude across
+    windows.  Detections are bins above ``cfg.threshold_db`` over their
+    per-bin noise floor.
+    """
+    if surface.shape[0] == 0:
+        return []
+    magnitude = np.abs(surface)
+    noise_floor = np.median(magnitude, axis=0)
+    noise_floor = np.maximum(noise_floor, 1e-30)
+    snr_lin = magnitude / noise_floor[None, :]
+    snr_db = 20.0 * np.log10(snr_lin)
+    above = snr_db > cfg.threshold_db
+    if not above.any():
+        return []
+
+    n_freq = surface.shape[1]
+    freq_axis = np.fft.fftfreq(n_freq, 1.0 / cfg.sample_rate_hz)
+
+    out: list[Candidate] = []
+    win_idxs, freq_idxs = np.where(above)
+    for t, f in zip(win_idxs.tolist(), freq_idxs.tolist()):
+        sample_idx = t * cfg.stride_samples + template_length // 2
+        out.append(Candidate(
+            time_sample=int(sample_idx),
+            time_s=float(sample_idx / cfg.sample_rate_hz),
+            freq_hz=float(freq_axis[f]),
+            snr_db=float(snr_db[t, f]),
+            raw_magnitude=float(magnitude[t, f]),
+        ))
+    return out
+
+
 # ── Convenience entry point ─────────────────────────────────────────────────
 
 
@@ -269,21 +310,14 @@ def detect(iq: np.ndarray, template: np.ndarray,
         )
         return extract_candidates(surface, cfg, template_length=tpl_cp.shape[0])
     else:
-        # CPU path: build surface in numpy, then ship to GPU (or skip
-        # extraction) — for now, basic numpy reference.
+        # CPU end-to-end path: surface in numpy, candidate extraction in
+        # numpy.  Used by the sensitivity-test driver on hosts without
+        # a GPU.
         surface_np = compute_ambiguity_surface_cpu(
             iq, template,
             stride_samples=cfg.stride_samples,
             fft_length=cfg.fft_length,
         )
-        # TODO: implement extract_candidates_cpu so CPU path is fully
-        # functional.  For now, ship surface to GPU just for extraction
-        # if cupy is present.
-        if _HAS_CUPY:
-            return extract_candidates(
-                cp.asarray(surface_np), cfg, template_length=template.shape[0]
-            )
-        raise NotImplementedError(
-            "CPU candidate extraction not implemented yet; install cupy to "
-            "use GPU end-to-end, or implement extract_candidates_cpu."
+        return extract_candidates_cpu(
+            surface_np, cfg, template_length=template.shape[0]
         )
