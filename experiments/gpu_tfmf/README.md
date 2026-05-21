@@ -48,6 +48,58 @@ For each ~3.5-ms sliding window of input IQ at 48 kHz:
 4. Detection candidates: bins above threshold (relative to per-bin noise
    floor estimated across recent windows).
 
+### Time and frequency stepping (default config, 48 kHz IQ)
+
+**Time axis:**
+
+| Parameter | Value | Where set |
+|---|---|---|
+| Window length (= template length) | 192 samples = **4 ms** | `sync_template.build_sync_template(48000)` |
+| Stride between windows | 24 samples = **0.5 ms** = 1 MSK144 symbol | `TFMFConfig.stride_samples` |
+| Window count for a 15-s input | (n_samples − 192) / 24 + 1 = **29,993** | derived |
+| **Time increment** | **0.5 ms** | `stride_samples / sample_rate` |
+| Time span | window-centre 2 ms → 14.998 s for 15-s input | derived |
+
+Sub-symbol stride buys nothing — correlation barely changes within a
+symbol — so 24 samples is the natural lower bound at 48 kHz.
+
+**Frequency axis:**
+
+| Parameter | Value | Where set |
+|---|---|---|
+| FFT length | 192 (= template length; no zero-pad by default) | `TFMFConfig.fft_length=None` |
+| Frequency span | **−24 kHz to +24 kHz** (full Nyquist, signed) | `np.fft.fftfreq(192, 1/48000)` |
+| Number of bins | 192 | = FFT length |
+| **Frequency increment** | **250 Hz/bin** | `fs / fft_length` |
+
+Bin layout follows `np.fft.fftfreq`: bins 0…96 cover 0…+12 kHz, bin 97
+wraps to −11.75 kHz, bins 97…191 cover −24 kHz…−250 Hz.  No `fftshift`
+in the hot path.
+
+**Resulting surface:**
+
+For a 15-s input at 48 kHz with default config: **29,993 × 192 ≈ 5.76 M
+cells**, each `complex64` (8 B) → **46 MB per 15-s surface**.  Trivial
+for the laptop's T2000 (4 GB GDDR6, ~128 GB/s bandwidth).
+
+**Both axes are tunable** via `TFMFConfig`:
+
+| Knob | Default | What it does |
+|---|---|---|
+| `stride_samples` | 24 | Smaller → finer time, more compute.  Larger → coarser, faster. |
+| `fft_length` | `None` (= 192) | Set to ``N_padded > 192`` to zero-pad and view the same correlation surface at finer bin resolution (does **not** improve underlying resolution — window length sets that).  At `fft_length=768` (4× pad): 62.5 Hz/bin. |
+
+**Practical caveats for MSK144 on 6 m:**
+
+- **Time resolution 0.5 ms** vs ping durations of 100 ms to several
+  seconds — much finer than needed; cheap headroom.
+- **Frequency resolution 250 Hz** vs typical 6 m signal stability of
+  ~10 Hz within a burst — **coarse**.  This is why the sensitivity-test
+  output shows bin-quantised freq errors at low SNR (multiples of
+  250 Hz).  Parabolic interpolation across the 3 bins around the peak
+  (TODO #1) is the recommended sub-bin refinement; zero-padding via
+  `fft_length` is the alternative.
+
 ### Why FFT-based search over freq?
 
 Mathematically, the matched filter at frequency offset `f` is:
