@@ -8,7 +8,7 @@ detection-rate curves.
 
 Usage:
     cd <repo>
-    .venv/bin/python -m experiments.gpu_wideband_sync.benchmark \\
+    .venv/bin/python -m experiments.gpu_tfmf.benchmark \\
         --out /tmp/sweep.csv --use-gpu
 
 Honest about what this measures:
@@ -36,7 +36,7 @@ import numpy as np
 _REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO))
 
-from experiments.gpu_wideband_sync import sync_template, synthetic, wideband_sync
+from experiments.gpu_tfmf import sync_template, synthetic, tfmf
 
 
 def matched_against_truth(candidate, ping,
@@ -54,7 +54,7 @@ def matched_against_truth(candidate, ping,
 
 
 def run_one_trial(snr_db: float, freq_hz: float, seed: int,
-                  cfg: wideband_sync.WidebandSyncConfig,
+                  cfg: tfmf.TFMFConfig,
                   use_gpu: bool):
     """Build a synthetic signal, run the detector, return result row."""
     s = synthetic.single_ping(
@@ -68,7 +68,7 @@ def run_one_trial(snr_db: float, freq_hz: float, seed: int,
     h = sync_template.build_sync_template(cfg.sample_rate_hz)
 
     t0 = time.perf_counter()
-    candidates = wideband_sync.detect(s.iq, h, cfg, use_gpu=use_gpu)
+    candidates = tfmf.detect(s.iq, h, cfg, use_gpu=use_gpu)
     elapsed_s = time.perf_counter() - t0
 
     truth = s.pings[0]
@@ -105,7 +105,7 @@ def main():
                     help="Use GPU (CuPy).  Required for non-trivial speed.")
     args = ap.parse_args()
 
-    cfg = wideband_sync.WidebandSyncConfig(
+    cfg = tfmf.TFMFConfig(
         sample_rate_hz=48_000,
         threshold_db=args.threshold_db,
     )

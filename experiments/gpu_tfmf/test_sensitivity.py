@@ -2,7 +2,7 @@
 # Licensed under GPL-3.0-or-later.
 """Measure sync-over-15s sensitivity + frequency-estimation accuracy.
 
-CPU-only test — no GPU required.  Designed to validate the wideband
+CPU-only test — no GPU required.  Designed to validate the full-bandwidth TFMF
 sync matched filter against a fair sq_det baseline before any GPU work.
 
 Inputs:
@@ -11,7 +11,7 @@ Inputs:
       * Truth JSON  (placements: msg, center_hz, delay_s, snr_db per ping)
 
 What it measures:
-    1. Detection rate per SNR bucket — wideband-sync vs sliding-window sq_det
+    1. Detection rate per SNR bucket — TFMF vs sliding-window sq_det
        on the same audio.  Same threshold-on-noise-floor convention for both
        so the comparison isn't rigged.
     2. Frequency-estimation error vs truth's ``center_hz`` for sync-detected
@@ -22,7 +22,7 @@ Output:
     Optional CSV via ``--out FILE`` for further plotting / aggregation.
 
 Usage:
-    python -m experiments.gpu_wideband_sync.test_sensitivity \\
+    python -m experiments.gpu_tfmf.test_sensitivity \\
         MSK144/simulations/ramp_<stamp>_iq.wav \\
         MSK144/simulations/ramp_<stamp>_iq.json \\
         --out /tmp/sensitivity.csv
@@ -43,7 +43,7 @@ import numpy as np
 _REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO))
 
-from experiments.gpu_wideband_sync import sync_template, wideband_sync
+from experiments.gpu_tfmf import sync_template, tfmf
 
 
 # ── Data loaders ────────────────────────────────────────────────────────────
@@ -231,13 +231,13 @@ def main():
     ap.add_argument('--out', type=Path, default=None,
                     help='Optional CSV output (one row per truth ping)')
     ap.add_argument('--sync-threshold-db', type=float, default=10.0,
-                    help='Wideband sync detection threshold (dB above '
+                    help='TFMF detection threshold (dB above '
                          'per-bin noise floor)  [default: 10]')
     ap.add_argument('--sqdet-threshold-db', type=float, default=9.5,
                     help='sq_det detection threshold (dB; WSJT-X primary '
                          'uses ~9.5 = detmet_norm >= 3.0)  [default: 9.5]')
     ap.add_argument('--sync-stride-samples', type=int, default=24,
-                    help='Wideband sync correlation stride (samples at '
+                    help='TFMF correlation stride (samples at '
                          '48 kHz; 24 = one MSK144 symbol)  [default: 24]')
     args = ap.parse_args()
 
@@ -258,15 +258,15 @@ def main():
     # matched filter operates without resampling.
     SR = wav_sample_rate
 
-    # ── Wideband sync detector (the "future" path) ─────────────────────
-    print("\n=== Wideband sync over 15-s window ===")
+    # ── TFMF detector (the "future" path) ─────────────────────
+    print("\n=== TFMF over 15-s window ===")
     h = sync_template.build_sync_template(SR)
-    cfg = wideband_sync.WidebandSyncConfig(
+    cfg = tfmf.TFMFConfig(
         sample_rate_hz=SR,
         stride_samples=args.sync_stride_samples,
         threshold_db=args.sync_threshold_db,
     )
-    sync_candidates = wideband_sync.detect(iq, h, cfg, use_gpu=False)
+    sync_candidates = tfmf.detect(iq, h, cfg, use_gpu=False)
     print(f"  template length: {len(h)} samples ({1000*len(h)/SR:.1f} ms)")
     print(f"  freq resolution: {SR/len(h):.1f} Hz/bin")
     print(f"  {len(sync_candidates)} candidates above {args.sync_threshold_db:.1f} dB")
@@ -332,16 +332,16 @@ def main():
     n_sync = sum(r['detected_by_sync'] for r in rows)
     n_sq   = sum(r['detected_by_sqdet'] for r in rows)
     print(f"\n=== Sensitivity summary ===")
-    print(f"  Wideband sync (15s): {n_sync}/{n_total} pings detected")
-    print(f"  sq_det baseline:     {n_sq}/{n_total} pings detected")
+    print(f"  TFMF (15s):      {n_sync}/{n_total} pings detected")
+    print(f"  sq_det baseline: {n_sq}/{n_total} pings detected")
     if n_sync > n_sq:
-        print(f"  → sync wins by {n_sync - n_sq} pings")
+        print(f"  → TFMF wins by {n_sync - n_sq} pings")
     elif n_sq > n_sync:
         print(f"  → sq_det wins by {n_sq - n_sync} pings")
     else:
         print(f"  → tied")
 
-    # Frequency-estimation accuracy on sync-detected pings (excluding misses).
+    # Frequency-estimation accuracy on TFMF-detected pings (excluding misses).
     sync_freq_errs = [r['sync_freq_err_hz'] for r in rows
                       if r['sync_freq_err_hz'] is not None]
     if sync_freq_errs:

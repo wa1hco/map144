@@ -1,6 +1,6 @@
 # Copyright (C) 2026  Jeff Millar, WA1HCO <wa1hco@gmail.com>
 # Licensed under GPL-3.0-or-later.
-"""Synthetic-IQ test signal generator for the wideband sync detector.
+"""Synthetic-IQ test signal generator for the TFMF detector.
 
 Wraps the repo's ``generate_msk144.py`` so we can produce controlled
 test signals with known ground truth:

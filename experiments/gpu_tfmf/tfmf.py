@@ -1,6 +1,6 @@
 # Copyright (C) 2026  Jeff Millar, WA1HCO <wa1hco@gmail.com>
 # Licensed under GPL-3.0-or-later.
-"""GPU wideband sync matched filter for MSK144.
+"""GPU Time-Frequency Matched Filter (TFMF) for MSK144.
 
 Algorithm (single window, all-frequencies-at-once via FFT):
 
@@ -11,9 +11,9 @@ Algorithm (single window, all-frequencies-at-once via FFT):
            frequency offset k * fs/N from the centre.
 
 Repeated across sliding windows with stride S, this builds a (time, freq)
-ambiguity surface.  Peak-find above threshold → detection candidates.
+time-frequency correlation surface.  Peak-find above threshold → detection candidates.
 
-The two-FFT trick is the standard ambiguity-function-via-FFT identity:
+The two-FFT trick is the standard "FFT-of-product-equals-correlation-at-all-freqs" identity:
 the matched filter at frequency offset f and time offset t is
 
     y(t, f) = ∫ x(τ) · h*(τ - t) · exp(-j 2π f τ) dτ
@@ -21,7 +21,7 @@ the matched filter at frequency offset f and time offset t is
 For a fixed t (one window), varying f is one FFT.  See README math.
 
 Implementation lives entirely in CuPy — pure GPU.  numpy fallback exists
-only for CPU testing of the math (see `compute_ambiguity_surface_cpu`).
+only for CPU testing of the math (see `compute_tf_surface_cpu`).
 """
 
 from __future__ import annotations
@@ -42,8 +42,8 @@ except ImportError:
 
 
 @dataclass
-class WidebandSyncConfig:
-    """Configuration for the wideband sync matched-filter detector."""
+class TFMFConfig:
+    """Configuration for the TFMF matched-filter detector."""
 
     sample_rate_hz: int = 48_000
     #: Stride (samples) between consecutive correlation windows.
@@ -64,7 +64,7 @@ class WidebandSyncConfig:
 # ── CPU reference ────────────────────────────────────────────────────────────
 
 
-def compute_ambiguity_surface_cpu(iq: np.ndarray,
+def compute_tf_surface_cpu(iq: np.ndarray,
                                   template: np.ndarray,
                                   stride_samples: int,
                                   fft_length: int | None = None
@@ -102,11 +102,11 @@ def compute_ambiguity_surface_cpu(iq: np.ndarray,
 # ── GPU implementation ──────────────────────────────────────────────────────
 
 
-def compute_ambiguity_surface_gpu(iq_cp, template_cp, stride_samples: int,
+def compute_tf_surface_gpu(iq_cp, template_cp, stride_samples: int,
                                    fft_length: int | None = None):
-    """GPU implementation of the ambiguity-surface computation.
+    """GPU implementation of the TF-correlation-surface computation.
 
-    Same math as ``compute_ambiguity_surface_cpu`` but vectorised:
+    Same math as ``compute_tf_surface_cpu`` but vectorised:
         - Build (n_windows, N) matrix of windowed views in one shot
         - Single batched elementwise multiply by conj(template)
         - Single batched FFT along axis=1
@@ -164,7 +164,7 @@ def compute_ambiguity_surface_gpu(iq_cp, template_cp, stride_samples: int,
 
 @dataclass
 class Candidate:
-    """One detection candidate from the ambiguity surface."""
+    """One detection candidate from the time-frequency correlation surface."""
     time_sample: int          # input-IQ sample index of the window centre
     time_s: float             # seconds from start of input
     freq_hz: float            # frequency offset from IQ DC
@@ -172,9 +172,9 @@ class Candidate:
     raw_magnitude: float      # |matched_filter_output|
 
 
-def extract_candidates(surface_cp, cfg: WidebandSyncConfig,
+def extract_candidates(surface_cp, cfg: TFMFConfig,
                        template_length: int) -> list[Candidate]:
-    """Scan the ambiguity surface for detections above threshold.
+    """Scan the time-frequency correlation surface for detections above threshold.
 
     Per-bin noise floor estimated as the median magnitude across the
     last ``cfg.noise_window`` time-windows in each freq bin.  Detections
@@ -232,12 +232,12 @@ def extract_candidates(surface_cp, cfg: WidebandSyncConfig,
     return out
 
 
-def extract_candidates_cpu(surface: np.ndarray, cfg: WidebandSyncConfig,
+def extract_candidates_cpu(surface: np.ndarray, cfg: TFMFConfig,
                             template_length: int) -> list[Candidate]:
     """CPU (numpy) implementation of candidate extraction.
 
     Same algorithm as ``extract_candidates`` (the GPU version) but
-    operating on a numpy ambiguity surface — for use when CuPy isn't
+    operating on a numpy time-frequency correlation surface — for use when CuPy isn't
     installed (i.e. on hosts without a GPU).  Mostly useful for the
     sensitivity-test driver in ``test_sensitivity.py``.
 
@@ -277,7 +277,7 @@ def extract_candidates_cpu(surface: np.ndarray, cfg: WidebandSyncConfig,
 
 
 def detect(iq: np.ndarray, template: np.ndarray,
-           cfg: WidebandSyncConfig | None = None,
+           cfg: TFMFConfig | None = None,
            use_gpu: bool = True
            ) -> list[Candidate]:
     """One-shot detection: feed IQ, get back candidate list.
@@ -288,7 +288,7 @@ def detect(iq: np.ndarray, template: np.ndarray,
         Input IQ at ``cfg.sample_rate_hz``.
     template : complex64 ndarray, shape (N,)
         Sync template at the same sample rate (see ``sync_template.py``).
-    cfg : WidebandSyncConfig
+    cfg : TFMFConfig
         Detector config.  Default config = 48 kHz, stride=24, threshold=10 dB.
     use_gpu : bool
         If False, run the numpy reference path (slow; for tests).
@@ -298,12 +298,12 @@ def detect(iq: np.ndarray, template: np.ndarray,
     candidates : list of Candidate
     """
     if cfg is None:
-        cfg = WidebandSyncConfig()
+        cfg = TFMFConfig()
 
     if use_gpu and _HAS_CUPY:
         iq_cp = cp.asarray(iq, dtype=cp.complex64)
         tpl_cp = cp.asarray(template, dtype=cp.complex64)
-        surface = compute_ambiguity_surface_gpu(
+        surface = compute_tf_surface_gpu(
             iq_cp, tpl_cp,
             stride_samples=cfg.stride_samples,
             fft_length=cfg.fft_length,
@@ -313,7 +313,7 @@ def detect(iq: np.ndarray, template: np.ndarray,
         # CPU end-to-end path: surface in numpy, candidate extraction in
         # numpy.  Used by the sensitivity-test driver on hosts without
         # a GPU.
-        surface_np = compute_ambiguity_surface_cpu(
+        surface_np = compute_tf_surface_cpu(
             iq, template,
             stride_samples=cfg.stride_samples,
             fft_length=cfg.fft_length,

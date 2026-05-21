@@ -9,7 +9,7 @@ shape.
 
 The legacy detector at ``map144_app/msk144_spd.py`` builds this template
 at 12 kHz (the channelized-audio rate) as a 42-sample complex array.
-For wideband detection we want it at the full IQ rate (48 kHz default)
+For full-bandwidth detection we want it at the full IQ rate (48 kHz default)
 without going through the channelizer first; this module produces the
 template at any sample rate.
 
@@ -119,7 +119,7 @@ def build_sync_template(sample_rate_hz: int = 48_000,
         # For scaffold, return the natural-length template; edge-trim
         # tuning is a refinement once everything else works.
         # TODO: validate against the 12-kHz reference template (project
-        # already has a working 42-sample template; the wideband one
+        # already has a working 42-sample template; the full-bandwidth TFMF (48 kHz) one
         # should differ from it only by sample-rate upsampling).
         return template[:n]
 

@@ -1,11 +1,11 @@
-# GPU wideband sync matched-filter detector
+# GPU TFMF matched-filter detector
 
 **Status:** scaffold — first concrete CuPy implementation is the TODO.
 
 ## Goal
 
 Replace the legacy `ChannelizerBlock + DetectorBlock(sq_det + per-channel sync)`
-pipeline with a single **wideband sync matched filter on GPU** that produces
+pipeline with a single **Time-Frequency Matched Filter (TFMF) on GPU** that produces
 detection candidates directly from full-bandwidth IQ.
 
 **Why this works:** the sync correlator is a *linear* operator, unlike the
@@ -18,7 +18,7 @@ neighbours.  So we can:
 
 - drop the channelizer entirely
 - drop sq_det entirely
-- search the full (time × frequency) ambiguity surface in one pass
+- search the full (time × frequency) time-frequency correlation surface in one pass
 
 ## Acceptance criteria
 
@@ -109,11 +109,11 @@ Ported from `map144_app/msk144_spd.py::_build_sync_template`, retimed from
 | File | Purpose |
 |---|---|
 | `sync_template.py` | Build the MSK144 sync template at any sample rate |
-| `wideband_sync.py` | Core GPU matched filter + candidate extraction |
+| `tfmf.py` | Core GPU matched filter + candidate extraction |
 | `synthetic.py` | Synthetic-IQ test signal generator (uses repo's `generate_msk144.py`) |
 | `benchmark.py` | Sweep harness: SNR × freq-offset × position → detection-rate table |
 | `compare_to_legacy.py` | Same signals through legacy `sq_det + sync`, ROC compare |
-| `test_wideband_sync.py` | Unit tests — template correctness, single-ping detection at high SNR, noise-only false-positive rate |
+| `test_tfmf.py` | Unit tests — template correctness, single-ping detection at high SNR, noise-only false-positive rate |
 
 ## Dev setup (laptop side)
 
@@ -128,7 +128,7 @@ nvidia-smi   # confirm driver + CUDA version
 .venv/bin/python -c "import cupy as cp; print(cp.cuda.runtime.getDeviceCount(), 'GPU(s) visible')"
 
 # Run the (currently stub) sanity test:
-.venv/bin/pytest experiments/gpu_wideband_sync/test_wideband_sync.py -v
+.venv/bin/pytest experiments/gpu_tfmf/test_tfmf.py -v
 ```
 
 ## Suggested work sequence on the road
@@ -154,7 +154,7 @@ nvidia-smi   # confirm driver + CUDA version
 - **Frequency-interpolation method**: parabolic vs gaussian peak fit?
   Probably parabolic (cheaper, similar accuracy in noise-dominated regime).
 - **Output schema**: emit `Event` records compatible with existing
-  `DetectorBlock`, or define a new `WidebandCandidate` record and bridge?
+  `DetectorBlock`, or define a new `TFMFCandidate` record and bridge?
   Defer until the math is proven — start with a simple list of `(time_s,
   freq_hz, snr_db)` tuples.
 - **Compute budget per candidate** in GPU mode: at GPU speeds we can

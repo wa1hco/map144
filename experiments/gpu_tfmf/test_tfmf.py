@@ -1,6 +1,6 @@
 # Copyright (C) 2026  Jeff Millar, WA1HCO <wa1hco@gmail.com>
 # Licensed under GPL-3.0-or-later.
-"""Unit / sanity tests for the wideband sync detector scaffold.
+"""Unit / sanity tests for the TFMF detector scaffold.
 
 These are the minimum-viable correctness checks.  Expand on the road
 as the algorithm matures.
@@ -22,7 +22,7 @@ import numpy as np
 _REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO))
 
-from experiments.gpu_wideband_sync import sync_template, wideband_sync
+from experiments.gpu_tfmf import sync_template, tfmf
 
 
 def _msk144code_available() -> bool:
@@ -82,13 +82,13 @@ class TestCPUReference(unittest.TestCase):
                          f"Correlation peak at sample {peak}, "
                          f"template was inserted at {offset}")
 
-    def test_ambiguity_surface_cpu_smoke(self):
+    def test_tf_surface_cpu_smoke(self):
         """Surface computation produces (n_windows, fft_len) output of
         the right shape for a small input."""
         fs = 48_000
         h = sync_template.build_sync_template(fs)
         iq = np.zeros(fs, dtype=np.complex64)               # 1 s of zeros
-        surface = wideband_sync.compute_ambiguity_surface_cpu(
+        surface = tfmf.compute_tf_surface_cpu(
             iq, h,
             stride_samples=24,
             fft_length=len(h),
@@ -106,7 +106,7 @@ class TestSyntheticPingDetection(unittest.TestCase):
         """At 15 dB SNR, freq offset 0, the detector must find SOMETHING
         near the right (time, freq).  Loose tolerance — this is a
         first-light test, not a precision claim."""
-        from experiments.gpu_wideband_sync import synthetic   # noqa: PLC0415
+        from experiments.gpu_tfmf import synthetic   # noqa: PLC0415
 
         s = synthetic.single_ping(
             snr_db=15.0,
@@ -117,14 +117,14 @@ class TestSyntheticPingDetection(unittest.TestCase):
             seed=42,
         )
         h = sync_template.build_sync_template(48_000)
-        cfg = wideband_sync.WidebandSyncConfig(
+        cfg = tfmf.TFMFConfig(
             sample_rate_hz=48_000,
             threshold_db=8.0,
         )
         # Try GPU first, fall back to CPU surface + GPU extraction
         # if GPU end-to-end fails.
         try:
-            cands = wideband_sync.detect(s.iq, h, cfg, use_gpu=True)
+            cands = tfmf.detect(s.iq, h, cfg, use_gpu=True)
         except (RuntimeError, NotImplementedError) as exc:
             self.skipTest(f"GPU path unavailable: {exc}")
 
