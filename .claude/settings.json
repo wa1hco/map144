@@ -1,0 +1,83 @@
+{
+  "_comment": "Bash allow rules use prefix matching: 'Bash(cmd:*)' allows any command starting with 'cmd'. State-changing commands (commit, push, rm, mv, checkout, reset --hard, write to MSK144/detections) deliberately omitted so they still prompt.",
+
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(file:*)",
+      "Bash(stat:*)",
+      "Bash(du:*)",
+      "Bash(df:*)",
+      "Bash(date:*)",
+      "Bash(echo:*)",
+      "Bash(printf:*)",
+      "Bash(pwd)",
+      "Bash(which:*)",
+      "Bash(type:*)",
+      "Bash(env)",
+      "Bash(ps:*)",
+      "Bash(uname:*)",
+
+      "Bash(grep:*)",
+      "Bash(rg:*)",
+      "Bash(find:*)",
+      "Bash(awk:*)",
+      "Bash(sort:*)",
+      "Bash(uniq:*)",
+      "Bash(cut:*)",
+      "Bash(tr:*)",
+      "Bash(xargs:*)",
+      "Bash(tee:*)",
+
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git stash list:*)",
+      "Bash(git stash show:*)",
+      "Bash(git ls-files:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git blame:*)",
+      "Bash(git config --get:*)",
+
+      "Bash(python -c:*)",
+      "Bash(python3 -c:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(python3 -m pytest:*)",
+      "Bash(pytest:*)",
+      "Bash(python tests/headless_replay.py:*)",
+      "Bash(python tools/:*)",
+      "Bash(python3 tools/:*)",
+      "Bash(python tests/:*)",
+      "Bash(python3 tests/:*)",
+      "Bash(python experiments/:*)",
+      "Bash(python3 experiments/:*)",
+
+      "Bash(.venv/bin/python:*)",
+      "Bash(.venv/bin/python3:*)",
+      "Bash(.venv/bin/pytest:*)",
+      "Bash(.venv/bin/pip list:*)",
+      "Bash(.venv/bin/pip show:*)",
+
+      "Bash(mkdir:*)",
+      "Bash(touch:*)",
+      "Bash(cp:*)",
+      "Bash(ln -s:*)",
+
+      "Bash(MAP144_USE_BLOCKS=:*)",
+
+      "Bash(jt9 --msk144:*)",
+      "Bash(msk144code:*)",
+
+      "Bash(unzip -l:*)"
+    ],
+    "additionalDirectories": [
+      "/home/jeff/.local/share/WSJT-X - flex/save"
+    ]
+  }
+}

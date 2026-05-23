@@ -107,3 +107,9 @@ fortran_bp_test/mf_test
 # freq_vs_time_corpus/) are tracked too.
 !docs/figures/
 !docs/figures/**/*.png
+
+# Throwaway artifacts from forensic investigations and one-off analysis
+# runs.  Per the global rule "never create files outside the project tree"
+# (~/.claude/CLAUDE.md), tools default to writing here; nothing in scratch/
+# should be relied on by other tools.  See scratch/README.md.
+scratch/

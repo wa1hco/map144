@@ -239,6 +239,13 @@ def main():
     ap.add_argument('--sync-stride-samples', type=int, default=24,
                     help='TFMF correlation stride (samples at '
                          '48 kHz; 24 = one MSK144 symbol)  [default: 24]')
+    ap.add_argument('--no-two-subblock', action='store_true',
+                    help='Disable two-sub-block coherent sum (single 8-sym sync only)')
+    ap.add_argument('--no-parabolic', action='store_true',
+                    help='Disable parabolic freq interpolation (bin-centred only)')
+    ap.add_argument('--fft-length', type=int, default=None,
+                    help='FFT length (zero-pad if > template length 192).  '
+                         'Default: use template length (no padding).')
     args = ap.parse_args()
 
     # Load — auto-detect IQ vs audio, native sample rate
@@ -265,7 +272,12 @@ def main():
         sample_rate_hz=SR,
         stride_samples=args.sync_stride_samples,
         threshold_db=args.sync_threshold_db,
+        two_subblock_sum=not args.no_two_subblock,
+        parabolic_freq_interp=not args.no_parabolic,
+        fft_length=args.fft_length,
     )
+    print(f"  two_subblock_sum: {cfg.two_subblock_sum}, "
+          f"parabolic_freq_interp: {cfg.parabolic_freq_interp}")
     sync_candidates = tfmf.detect(iq, h, cfg, use_gpu=False)
     print(f"  template length: {len(h)} samples ({1000*len(h)/SR:.1f} ms)")
     print(f"  freq resolution: {SR/len(h):.1f} Hz/bin")

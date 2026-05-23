@@ -100,6 +100,59 @@ for the laptop's T2000 (4 GB GDDR6, ~128 GB/s bandwidth).
   (TODO #1) is the recommended sub-bin refinement; zero-padding via
   `fft_length` is the alternative.
 
+### False alarm rate vs threshold
+
+The detector threshold is **per-bin SNR in dB above the rolling-median
+noise floor** for that frequency bin (see `extract_candidates` in
+`tfmf.py`).  Per cell:
+
+    snr_lin = |surface[t, f]| / median_t(|surface[·, f]|)
+    snr_db  = 20 · log10(snr_lin)
+    fire    = snr_db > cfg.threshold_db
+
+On AWGN, each matched-filter magnitude `|surface[t, f]|` is Rayleigh
+distributed.  Normalised by its median (= σ·√(2·ln 2) ≈ 1.177σ), the
+per-cell tail probability above threshold `T_dB` is:
+
+    P_FA(cell) = exp( −ln(2) · 10^(T_dB / 10) )
+
+(Derivation: P(X > T) = exp(−T²/2σ²); set R = X/median_R, then
+P(R > r) = exp(−r²·ln 2); with r = 10^(T_dB/20), r² = 10^(T_dB/10).)
+
+For the default surface (29,993 windows × 192 bins = 5.76 M cells per
+15 s), expected false alarms per 15-s period:
+
+| threshold_db | P_FA per cell | FA / 15 s | Use case |
+|---|---|---|---|
+| 5.0  | 1.1 × 10⁻¹ | 6.4 × 10⁵ | (research only — surface is noise-saturated) |
+| 10.0 | 9.8 × 10⁻⁴ | 5 600   | Old default — too loose for production |
+| 12.0 | 1.7 × 10⁻⁵ | 97      | Tuning / characterisation |
+| **13.5** | **1.8 × 10⁻⁷** | **≈ 1** | **Default — one FA per 15 s** |
+| 14.0 | 2.7 × 10⁻⁸ | 0.16    | Mildly conservative |
+| 15.0 | 3.1 × 10⁻¹⁰ | 1.8 × 10⁻³ | Clean detection logs |
+| 17.0 | 8.3 × 10⁻¹⁶ | 4.8 × 10⁻⁹ | Very confident detections only |
+| 20.0 | ≪ 10⁻³⁰ | ≈ 0 | Hard ceiling (effectively zero FAs) |
+
+Empirical verification on 15 s of synthetic complex-Gaussian noise at
+48 kHz (template autocorrelation magnitudes normalised by per-bin
+median) closely matched the table above — Rayleigh statistics hold.
+
+**Why 13.5 dB as the default**: at one expected FA per 15-s period
+the detector reports ≈ 1 FP per WSJT-period, which is the natural cap
+before downstream stages (decoder gate, sync sub-block sum, etc.)
+discount false candidates.  For sensitivity sweeps or ROC plots, lower
+`threshold_db` and rely on downstream stages to reject; for clean
+detection logs, raise it.
+
+**Caveats:**
+- These numbers assume *independent* cells.  Adjacent (t, f) cells are
+  weakly correlated (overlapping windows, sinc-shaped per-bin response),
+  so the realised FA count is slightly less than the i.i.d. prediction.
+  In practice the table is accurate to ~10–20 %.
+- A 2D local-max filter (TODO in `extract_candidates`) would deduplicate
+  the multi-cell ring around each real or false detection, dropping the
+  effective FA rate by another ~10×.
+
 ### Why FFT-based search over freq?
 
 Mathematically, the matched filter at frequency offset `f` is:
@@ -123,33 +176,92 @@ Time resolution is set by the stride between windows.  At stride=24 samples
 (one symbol at 48 kHz, 500 µs), we get 2000 windows per second.  Total
 (time, freq) cells per second: 2000 × 168 = 336k — light for a GPU.
 
-### Frequency resolution refinement (TODO #1)
+### Frequency resolution refinement (implemented)
 
-286 Hz/bin is coarse compared to MSK144's expected freq stability (~10 Hz
-within a burst).  Two refinement strategies:
+250 Hz/bin is coarse compared to MSK144's expected freq stability (~10 Hz
+within a burst).  Implemented refinement (`cfg.parabolic_freq_interp`,
+default True): **parabolic interpolation across the 3 bins centred on
+the peak**.  Standard 3-point fit:
 
-1. **Zero-pad the window** to N_padded samples before FFT.  Increases freq
-   resolution by N_padded/N (but doesn't improve the underlying matched-
-   filter resolution — just gets us a finer view of the same correlation
-   surface).
-2. **Frequency-interpolation around the peak** using parabolic
-   interpolation across the 3 bins centred on the strongest detection.
-   Same trick the legacy sync correlator uses for sub-sample time
-   refinement.
+    δ = 0.5 · (left − right) / (left − 2·peak + right)
 
-Start with #2.  Cheap, no extra FFT cost.
+Returns a sub-bin offset in (−0.5, +0.5) × bin_width that is added to
+the bin-centre frequency.  Cheap (no extra FFT), no math change to the
+matched filter.
 
-### Two sync sub-blocks per MSK144 message (TODO #2)
+Empirical accuracy on synthetic pings at bin-centre (1500 Hz = bin 6 at
+250 Hz/bin):
 
-WSJT-X's MSK144 message has **two** 8-symbol sync sub-blocks per 144-symbol
-message frame — at positions 0–7 and 56–63 (336 samples apart at 12 kHz =
-1344 samples apart at 48 kHz).  The legacy sync correlator at
-`map144_app/msk144_spd.py::_sync_correlate` correlates both sub-blocks
-and sums them coherently.
+- At SNR ≥ 0 dB: typically < 50 Hz error (signal dominates the peak).
+- At SNR < −5 dB: 50–250 Hz error (noise pushes peak to neighbouring bin).
 
-Scaffold uses **single-sub-block** correlation initially.  Two-sub-block
-coherent sum adds ~3 dB on real MSK144 signals; tackle once single-block
-detection is proven.
+Alternative: **zero-pad the window** (`cfg.fft_length`) to N_padded.
+Increases bin resolution by N_padded/N but doesn't change the underlying
+matched-filter accuracy — strictly a finer view of the same surface.
+At fft_length=768 (4× pad): 62.5 Hz/bin.  More expensive; use only if
+parabolic interp proves insufficient.
+
+### Two sync sub-blocks per MSK144 message (implemented)
+
+WSJT-X's MSK144 message has **two** 8-symbol sync sub-blocks per
+144-symbol message frame — at positions 0–7 and 56–63 (336 samples
+apart at 12 kHz = **1344 samples = 7 × FFT length at 48 kHz**).  The
+legacy sync correlator at `map144_app/msk144_spd.py::_sync_correlate`
+correlates both sub-blocks and sums them coherently.
+
+Implemented (`cfg.two_subblock_sum`, default True): after building the
+time-frequency surface, sum each row with the row 56 samples later
+(`SYNC_SPACING_SAMPLES / stride_samples = 1344 / 24`).  At FFT-bin
+frequencies the phase between sub-blocks is `2π · k · 7` mod 2π = 0
+for all integer `k`, so the coherent sum is a plain elementwise complex
+add — no phase correction needed.  This was the design intent of the
+1344-sample spacing.
+
+**Theoretical gain:** +3 dB SNR at the same threshold and FA rate.
+Both signal amplitude doubles (+6 dB power) and independent-noise
+variance doubles (+3 dB power), so the detector statistic
+`|MF|/median(|MF|)` is scale-invariant on pure noise (threshold and
+FA distribution unchanged) but signals get +3 dB lift.
+
+**Empirical on a 16-ping ramp (−10 to +5 dB SNR, 1 dB steps):**
+
+| Config | Detections | Candidates | Per-ping snr_db shift |
+|---|---|---|---|
+| Single sub-block (off) | 5/16 (+1..+5 dB) | 73 | baseline |
+| Two-sub-block (on)     | 5/16 (+1..+5 dB) | 134 | +1 to +3 dB (noisy) |
+
+Detection count on this small ramp didn't improve — the +3 dB lift on
+already-detected pings is real but doesn't pull the next-dB-down ping
+above threshold reliably because per-realization snr_db variance is
+~1–2 dB at low SNR (5 pings is too few to average that out).  Candidate
+count nearly doubled because each strong ping produces phantom peaks at
+row offsets ±56 in the combined surface (sync-1 alone or sync-2 alone
+adding to noise still exceeds threshold near a strong source).
+
+**Side-lobe caveat:** for any detected ping at row `i₀`, the combined
+surface also lights up at `i₀ ± 56` (a single sub-block matching plus
+noise from the other window).  These side-lobes are ~3 dB weaker than
+the main peak but can still trip the threshold for strong signals.  A
+2D local-max suppressor in `extract_candidates` (TODO) would collapse
+them.
+
+### Sensitivity floor caveat
+
+The sync template covers only 16 of 144 symbols = **11.1% of frame
+energy** = −9.5 dB vs the full-frame energy that `sq_det` sees.  Per
+`memory/project_msk144_sync_fraction_floor.md`, even with K=7 coherent
+frame averaging (+4.2 dB) and two-sub-block (+3 dB), the sync matched
+filter sits ~2.3 dB below sq_det in per-frame sensitivity on AWGN.
+
+TFMF's value over sq_det is therefore *not* per-frame sensitivity — it
+is:
+
+1. **Wide-bandwidth coverage** with no channelizer/intermod limits.
+2. **Precise (t, f) handoff to the decoder** — narrowing jt9's FTOL
+   search reduces redundant work (jt9 re-does its own sync search;
+   high-precision input lets it skip much of that).
+3. **GPU throughput** — variable compute per candidate (multi-Doppler
+   testing, etc.) becomes affordable.
 
 ### Sync template construction
 

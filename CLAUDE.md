@@ -138,6 +138,49 @@ Do not change mathematical conventions casually. If a convention is inferred rat
 - Be explicit about whether a quantity is magnitude, magnitude-squared, power, phase, or a complex phasor.
 - Do not replace complex-domain logic with magnitude-only shortcuts unless explicitly approved.
 
+### dB convention
+
+**dB is always power.**  There is no such thing as "amplitude-dB" in
+this project.  The two valid forms are:
+
+- `10 · log10(power_ratio)` — for quantities that already scale as power
+  (e.g. `|X|²`, energy, variance).
+- `20 · log10(amplitude_ratio)` — equivalent, for quantities that scale
+  as voltage/amplitude (e.g. `|X|`, signal magnitude, matched-filter
+  output).  This is just `10 · log10(amplitude_ratio²)`; same dB number.
+
+Applying `10 · log10` to an amplitude-scaled quantity is a **unit bug**,
+not an alternative convention.  Same for `20 · log10` on a power-scaled
+quantity.  When in doubt about a quantity's scaling, work out what power
+of the underlying audio voltage it scales as (e.g. `|FFT(s²)|²` scales
+as `A⁴`) and pick the conversion factor that makes the final dB number
+mean "audio power dB".
+
+### SNR convention
+
+All SNR values in this project are in the WSJT-X standard reference
+bandwidth of **2.5 kHz**.  This applies to:
+
+- ground-truth labels (simulator outputs, `truth.snr_db`, etc.)
+- decoder-reported SNR (jt9 `snr_db`)
+- any "SNR" used in analysis, plots, or discussion
+
+The 12 kHz audio stream from the SSB receiver is already bandlimited
+to approximately 300–2700 Hz by the radio's audio filter (and may be
+narrowed further by MAP144 DSP).  The audio noise bandwidth is therefore
+already ≈ 2.5 kHz — **no sample-rate-to-2.5-kHz BW correction is
+needed**.  Treating the 12 kHz sample rate as the noise bandwidth is a
+common mistake; it would over-state SNR by ~6.8 dB.
+
+When proposing or reviewing an SNR-related calculation:
+
+- State what reference bandwidth is in use; if unstated, assume 2.5 kHz.
+- Do not convert SNR between bandwidths without explicit justification
+  tied to the actual noise spectrum at that point in the pipeline.
+- If a calculation appears to need a "12 kHz to 2.5 kHz" correction,
+  stop and check whether you're looking at audio (already at 2.5 kHz)
+  or at some earlier-stage IQ where the noise is genuinely wideband.
+
 ### FFT and indexing
 
 Be explicit about:
