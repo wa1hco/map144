@@ -97,6 +97,91 @@ after FFT(squared); the |·|² operation is what produces A⁴.  WSJT-X's
 `tonespec = |FFT(s²)|²` is the A⁴ quantity.  Verified in
 sq_det.py:206.)
 
+## 3.5 Receiver chain phase / amplitude — calibration baseline
+
+**Design point:** MAP144's own audio filter chain introduces negligible
+phase or amplitude distortion within the signal band (300–2700 Hz).
+By design, **all internal filters are linear-phase FIR or zero-phase
+filtfilt** with one exception (the scipy IIR decimate), and that
+exception operates with its non-flat region above the signal band.
+**Therefore MAP144 does not require receiver-chain calibration** —
+upstream radio behaviour aside.
+
+### Filter inventory (verified in code)
+
+| Stage | File | Filter | Phase behaviour |
+|---|---|---|---|
+| Source decimation (SDR → 48 kHz) | `airspy_source.py:121` | 15-tap `firwin` LP via `lfilter` | **Linear phase** |
+| Channelizer LP (anti-alias before 48→12 kHz) | `channelizer.py:142` | 23-tap `firwin` LP at 2700 Hz | **Linear phase** |
+| Channelizer HP (per-channel 300 Hz DC reject) | `channelizer.py:152` | 15-tap `firwin` HP at 300 Hz | **Linear phase** |
+| `scipy.signal.decimate` (48→12 kHz for jt9 input) | `detection.py:661` | IIR (Chebyshev I, 8th-order), `zero_phase=False` | **Nonlinear phase** — but cutoff is ~4800 Hz, *above* the 300–2700 Hz signal band |
+| SPD audio BPF (300–2700 Hz on complex baseband) | `detection.py:269` | 129-tap `firwin` LP via `filtfilt` | **Zero phase** |
+
+Definitions:
+- **Linear phase** — constant group delay across the band; introduces a
+  fixed time offset but no in-band distortion.
+- **Zero phase** — no delay AND no distortion (filtfilt forward+reverse
+  pass cancels phase).
+- **Nonlinear phase** — group delay varies with frequency; introduces
+  real distortion within the affected band.
+
+### Why this matters operationally
+
+The "audio filter chain is flat" property has three consequences:
+
+1. **No phase-equalization step is needed inside MAP144.** WSJT-X has
+   a `Tools → Phase Equalization` feature designed to compensate for
+   nonlinear-phase passband filters on analog SSB receivers; MAP144's
+   chain doesn't introduce equivalent distortion to compensate.
+2. **Calibration would target upstream**, not internal. The only
+   plausible source of in-band amplitude/phase distortion is the
+   receiver itself (SDR firmware, audio filter on an analog SSB
+   receiver, etc.).  For Flex DAX audio at the recommended 4–5 kHz
+   DIGU filter, AK4AO's setup doc (Vienna Wireless, 2016) confirms
+   the audio is "already flat"; MAP144 inherits that.
+3. **The SPD audio BPF is for noise-bandwidth matching, not distortion
+   correction.** The 300–2700 Hz BPF on the SPD path exists because
+   the IIR decimation upstream passes noise across ~4800 Hz while the
+   signal occupies only ~2400 Hz; without the BPF, noise power is 2×
+   the signal bandwidth and SNR estimates are pessimistic.  Bandlimiting
+   noise to match the signal recovers ~+1.5 dB sensitivity.  This is
+   noise-bandwidth control, not phase/amplitude calibration.
+
+### Caveats
+
+- The IIR `scipy.signal.decimate` step is the only nonlinear-phase
+  filter in the chain.  If a future change tightens its cutoff toward
+  the signal band, or if a narrower receiver filter is used upstream,
+  the group-delay nonlinearity could move into the signal band and
+  start to matter.  At the current configuration it doesn't.
+- The 300 Hz per-channel HP filter rejects energy at exactly DC in
+  each channel — see `project_channelizer_hp_dc_reject` memory.  This
+  shapes the channel response near 300 Hz audio (= channel-centre)
+  but is symmetric and well-understood; not a distortion needing
+  correction.
+- This baseline assumes the operator's radio chain feeds clean IQ
+  (or clean DAX audio in 4–5 kHz filter).  Analog SSB receivers with
+  narrow 2.4 kHz contest filters have nonlinear phase at the band
+  edges (see QEX 2017 Figure 7); MAP144 does not currently compensate
+  for those.
+
+### Verification approach (if ever needed)
+
+To empirically verify the "flat" assumption on a specific receiver
+chain:
+
+1. Capture a strong continuous reference signal (e.g., W1NB MSK144
+   recording, or an injected CW tone sweep)
+2. Compute the cross-spectrum vs a clean reference (locally generated
+   MSK144 waveform with known phase)
+3. Plot magnitude and phase difference across 300–2700 Hz
+4. If magnitude ripple > ~0.5 dB or phase departure > 0.2 rad within
+   the band, calibration would buy real performance.
+
+The W1NB recording at `/home/jeff/.local/share/WSJT-X - flex/save/
+260507_114000.wav` is a suitable reference signal for this measurement
+on the operator's current Flex setup.
+
 ## 4. Per-detector reference pages
 
 One short subsection per detector.  Each says: what's the input, what
