@@ -62,7 +62,11 @@ class TFMFConfig:
     #: explicit template is passed to detect().
     use_dual_sync: bool = True
     #: Detection threshold in dB above the per-bin noise-floor estimate.
-    threshold_db: float = 10.0
+    #: Default 13.5 dB → ~1 false alarm per 15-s period on pure AWGN at
+    #: default stride/FFT settings (5.76 M cells).  See README "False alarm
+    #: rate vs threshold" for the table.  Lower for high-sensitivity sweeps,
+    #: raise for clean detection logs.
+    threshold_db: float = 13.5
     #: Per-bin noise-floor estimator: rolling-median window length, in
     #: number of correlation windows.
     noise_window: int = 300
@@ -73,6 +77,35 @@ class TFMFConfig:
     #: Converted to bins at runtime; rounded up to the nearest odd integer.
     #: 500 Hz ≈ ±2 bins at 250 Hz/bin (single) or ±16 bins at 31 Hz/bin (dual).
     peak_picking_freq_hz: float = 500.0
+    #: If True, coherently sum the matched-filter outputs of MSK144's two
+    #: 8-symbol sync sub-blocks (positions 0-7 and 56-63 within one
+    #: 144-symbol frame).  Gives +3 dB sensitivity at the same threshold
+    #: and FA rate — both signal and noise scale by √2, so the detector
+    #: statistic |MF|/median(|MF|) is unchanged on pure noise.  Requires
+    #: ``stride_samples`` to divide ``SYNC_SPACING_SAMPLES`` (= 1344 at
+    #: 48 kHz).
+    two_subblock_sum: bool = True
+    #: If True, refine each detection's freq estimate to sub-bin precision
+    #: by parabolic interpolation across the 3 bins centred on the peak.
+    #: Cheap (no extra FFT).  Lowers the freq error handed to the decoder.
+    parabolic_freq_interp: bool = True
+    #: K-frame coherent integration.  K=1 disables; K>1 sums the matched-
+    #: filter outputs of K consecutive MSK144 frames at the same (t, f).
+    #: At FFT-bin frequencies, the per-frame phase rotation is an integer
+    #: multiple of 2π (since 3456 = 18 × FFT length), so the coherent sum
+    #: is plain elementwise complex addition.  Gain on coherent signal:
+    #: +10·log10(K) dB; noise lifts by +5·log10(K) dB → SNR ratio
+    #: improvement +5·log10(K) dB.  Strongest benefit is suppression of
+    #: single-frame impulsive noise (which doesn't repeat across frames).
+    #: Requires the input IQ to contain ≥ K consecutive MSK144 frames at
+    #: a stable freq; for short meteor pings (< 144 ms) K-frame > 2 may
+    #: not have enough frames to integrate.
+    k_frame_integration: int = 1
+
+
+# Hard-coded MSK144 geometry constants
+SYNC_SPACING_SAMPLES_48K: int = 56 * 24   # = 1344, between sub-blocks in a frame
+FRAME_SPACING_SAMPLES_48K: int = 144 * 24 # = 3456, MSK144 message frame length
 
 
 # ── CPU reference ────────────────────────────────────────────────────────────
@@ -173,6 +206,101 @@ def compute_tf_surface_gpu(iq_cp, template_cp, stride_samples: int,
     return surface.astype(cp.complex64)
 
 
+# ── Two-sub-block coherent sum ──────────────────────────────────────────────
+
+
+def _apply_two_subblock_sum(surface, stride_samples: int,
+                             sync_spacing_samples: int = SYNC_SPACING_SAMPLES_48K):
+    """Sum each row of ``surface`` with the row that is exactly one sync-
+    sub-block-spacing later in time.
+
+    For an MSK144 message frame placed so its sync-1 lands at row ``i``,
+    sync-2 lands at row ``i + shift`` where ``shift = sync_spacing_samples
+    / stride_samples``.  Summing surface[i] + surface[i + shift] gives the
+    coherent two-sub-block matched-filter output: signal amplitudes add
+    (+6 dB power) while independent-noise variances add (+3 dB power), a
+    net +3 dB SNR gain.
+
+    At FFT bin centres the phase between the two MF outputs is
+    ``2π · k · 7`` (since 1344 = 7 × 192) — integer multiple of 2π for all
+    integer ``k``, so coherent sum is a plain complex add with no phase
+    correction.
+
+    Works on either numpy or cupy arrays — uses generic slicing.
+
+    Parameters
+    ----------
+    surface : ndarray, shape (n_rows, n_freq), complex64
+        Matched-filter time-frequency correlation surface.
+    stride_samples : int
+        Same stride used to build the surface.  Must divide
+        ``sync_spacing_samples`` evenly.
+    sync_spacing_samples : int
+        Sample-distance between sub-blocks at the surface's native rate.
+
+    Returns
+    -------
+    combined : ndarray, shape (n_rows - shift, n_freq), complex64
+        Truncated by ``shift`` rows at the tail — bursts whose sync-1
+        falls in those trailing rows lose their sync-2 partner.
+    """
+    if sync_spacing_samples % stride_samples != 0:
+        raise ValueError(
+            f"stride_samples ({stride_samples}) must divide "
+            f"sync_spacing_samples ({sync_spacing_samples}); "
+            f"got remainder {sync_spacing_samples % stride_samples}"
+        )
+    shift = sync_spacing_samples // stride_samples
+    n_rows = surface.shape[0]
+    if n_rows <= shift:
+        # Input too short to contain a full frame — return empty surface
+        # of compatible shape.
+        return surface[:0]
+    return surface[:n_rows - shift] + surface[shift:]
+
+
+def _apply_k_frame_sum(surface, stride_samples: int, k: int,
+                        frame_spacing_samples: int = FRAME_SPACING_SAMPLES_48K):
+    """Coherently sum K consecutive MSK144 frames into a single surface.
+
+    Each cell ``out[i, f]`` becomes::
+
+        out[i, f] = sum_{n=0}^{K-1} surface[i + n*shift, f]
+
+    where ``shift = frame_spacing_samples / stride_samples`` (= 144 at the
+    default stride=24).  At FFT bin centres the per-frame phase rotation
+    is ``2π · k_bin · (3456 / 192) = 2π · k_bin · 18`` ≡ 0 mod 2π, so the
+    coherent sum is a plain elementwise complex addition — no phase
+    correction needed.
+
+    For coherent multi-frame signal: SNR voltage ratio improves by √K
+    (= +10·log10(K) dB power).  For single-window impulsive noise that
+    fires only one row: the impulse is diluted by 1/K in voltage, so the
+    detector statistic effectively rejects single-frame impulses while
+    preserving signals coherent across all K frames.
+
+    Returns an array shorter by ``(K-1) * shift`` rows.  Works on either
+    numpy or cupy arrays via generic slicing.
+    """
+    if k <= 1:
+        return surface
+    if frame_spacing_samples % stride_samples != 0:
+        raise ValueError(
+            f"stride_samples ({stride_samples}) must divide "
+            f"frame_spacing_samples ({frame_spacing_samples}); "
+            f"got remainder {frame_spacing_samples % stride_samples}"
+        )
+    shift = frame_spacing_samples // stride_samples
+    n_rows = surface.shape[0]
+    needed = n_rows - (k - 1) * shift
+    if needed <= 0:
+        return surface[:0]
+    out = surface[:needed].copy()
+    for n in range(1, k):
+        out = out + surface[n * shift : n * shift + needed]
+    return out
+
+
 # ── Candidate extraction ────────────────────────────────────────────────────
 
 
@@ -222,6 +350,26 @@ def _parabolic_subpixel(row: np.ndarray, idx: int) -> float:
     if denom >= -1e-10:   # flat or convex — not a valid peak
         return 0.0
     return float(np.clip(0.5 * (a - c) / denom, -1.0, 1.0))
+
+
+def _parabolic_freq_offset(left: float, peak: float, right: float) -> float:
+    """Parabolic-interpolation sub-bin offset, range (-0.5, +0.5) bins.
+
+    Given the magnitudes at the peak bin and its two neighbours, return
+    the fractional bin shift of the true peak relative to the centre bin.
+    Standard 3-point parabolic fit: δ = 0.5·(left - right) / (left - 2·peak + right).
+
+    Returns 0.0 (no refinement) when the denominator is non-positive
+    (degenerate — peak not a strict local max).
+    """
+    denom = left - 2.0 * peak + right
+    if denom >= 0.0:
+        return 0.0
+    delta = 0.5 * (left - right) / denom
+    # Clamp to (-0.5, +0.5) — anything outside is a bad fit.
+    if delta > 0.5: delta = 0.5
+    if delta < -0.5: delta = -0.5
+    return float(delta)
 
 
 def extract_candidates(surface_cp, cfg: TFMFConfig,
@@ -278,15 +426,23 @@ def extract_candidates(surface_cp, cfg: TFMFConfig,
     # are positive freqs; n/2..n-1 wrap to negative.
     freq_axis = np.fft.fftfreq(n_freq, 1.0 / cfg.sample_rate_hz)
 
+    bin_width_hz = cfg.sample_rate_hz / n_freq
     out: list[Candidate] = []
     win_idxs, freq_idxs = np.where(is_peak_np)
     for t, f in zip(win_idxs.tolist(), freq_idxs.tolist()):
         sample_idx = t * cfg.stride_samples + template_length // 2
-        delta_t    = _parabolic_subpixel(magnitude_np[:, f], t)
+        delta_t = _parabolic_subpixel(magnitude_np[:, f], t)
+        freq_hz = float(freq_axis[f])
+        if cfg.parabolic_freq_interp:
+            left  = float(magnitude_np[t, (f - 1) % n_freq])
+            peak  = float(magnitude_np[t, f])
+            right = float(magnitude_np[t, (f + 1) % n_freq])
+            delta = _parabolic_freq_offset(left, peak, right)
+            freq_hz = freq_hz + delta * bin_width_hz
         out.append(Candidate(
             time_sample=int(sample_idx),
             time_s=float(sample_idx / cfg.sample_rate_hz),
-            freq_hz=float(freq_axis[f]),
+            freq_hz=freq_hz,
             snr_db=float(snr_db_np[t, f]),
             raw_magnitude=float(magnitude_np[t, f]),
             sample_epoch_offset_samples=delta_t * cfg.stride_samples,
@@ -333,16 +489,30 @@ def extract_candidates_cpu(surface: np.ndarray, cfg: TFMFConfig,
         return []
 
     freq_axis = np.fft.fftfreq(n_freq, 1.0 / cfg.sample_rate_hz)
+    bin_width_hz = cfg.sample_rate_hz / n_freq
 
     out: list[Candidate] = []
     win_idxs, freq_idxs = np.where(is_peak)
     for t, f in zip(win_idxs.tolist(), freq_idxs.tolist()):
         sample_idx = t * cfg.stride_samples + template_length // 2
-        delta_t    = _parabolic_subpixel(magnitude[:, f], t)
+        delta_t = _parabolic_subpixel(magnitude[:, f], t)
+        freq_hz = float(freq_axis[f])
+        if cfg.parabolic_freq_interp:
+            # 3-point parabolic refinement.  Use circular wrap so bin 0
+            # and bin n_freq-1 work without special-casing.
+            left  = float(magnitude[t, (f - 1) % n_freq])
+            peak  = float(magnitude[t, f])
+            right = float(magnitude[t, (f + 1) % n_freq])
+            delta = _parabolic_freq_offset(left, peak, right)
+            # Centre-bin frequency + delta·bin_width, signed (fftfreq
+            # already handles wrap to negative half).  Note we add to the
+            # *signed* centre freq, not to the raw bin index, so this
+            # composes correctly with the fftfreq wrap.
+            freq_hz = freq_hz + delta * bin_width_hz
         out.append(Candidate(
             time_sample=int(sample_idx),
             time_s=float(sample_idx / cfg.sample_rate_hz),
-            freq_hz=float(freq_axis[f]),
+            freq_hz=freq_hz,
             snr_db=float(snr_db[t, f]),
             raw_magnitude=float(magnitude[t, f]),
             sample_epoch_offset_samples=delta_t * cfg.stride_samples,
@@ -369,7 +539,7 @@ def detect(iq: np.ndarray, template: np.ndarray | None = None,
         +3 dB gain) when ``cfg.use_dual_sync`` is True (the default), or
         single-sync (192 samples) otherwise.
     cfg : TFMFConfig
-        Detector config.  Default config = 48 kHz, stride=24, threshold=10 dB.
+        Detector config.  Default config = 48 kHz, stride=24, threshold=13.5 dB.
     use_gpu : bool
         If False, run the numpy reference path (slow; for tests).
 
@@ -394,6 +564,11 @@ def detect(iq: np.ndarray, template: np.ndarray | None = None,
             stride_samples=cfg.stride_samples,
             fft_length=cfg.fft_length,
         )
+        if cfg.two_subblock_sum:
+            surface = _apply_two_subblock_sum(surface, cfg.stride_samples)
+        if cfg.k_frame_integration > 1:
+            surface = _apply_k_frame_sum(surface, cfg.stride_samples,
+                                          cfg.k_frame_integration)
         return extract_candidates(surface, cfg, template_length=tpl_cp.shape[0])
     else:
         # CPU end-to-end path: surface in numpy, candidate extraction in
@@ -404,6 +579,11 @@ def detect(iq: np.ndarray, template: np.ndarray | None = None,
             stride_samples=cfg.stride_samples,
             fft_length=cfg.fft_length,
         )
+        if cfg.two_subblock_sum:
+            surface_np = _apply_two_subblock_sum(surface_np, cfg.stride_samples)
+        if cfg.k_frame_integration > 1:
+            surface_np = _apply_k_frame_sum(surface_np, cfg.stride_samples,
+                                             cfg.k_frame_integration)
         return extract_candidates_cpu(
             surface_np, cfg, template_length=template.shape[0]
         )

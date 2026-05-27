@@ -1,0 +1,91 @@
+{
+  "comment": "Real-WAV smoke set for detection-stage changes.  Each entry's `expected_messages` is the BASELINE — what the current MAP144 pipeline decodes on this WAV.  Treat it as a regression-catch reference, not an absolute truth.  When intentionally changing detection-stage behaviour, re-run, compare, and update this file with the new baseline.  Per project lesson 2026-05-15: synthetic balanced-MSK does NOT cover combine-rule failure modes; this set must include real signals with CW interferer / asymmetric multipath / noise-only.",
+  "schema_version": 1,
+  "cases": [
+    {
+      "case_id": "period_260507_091015",
+      "category": "must_decode",
+      "tags": [],
+      "description": "Strong meteor pings, N1KWF CQs — MAP144 currently decodes (4 events, 1 valid decode).",
+      "wav": "/home/jeff/.local/share/WSJT-X - flex/save/260507_091015.wav",
+      "expected_messages": ["CQ N1KWF FN32"],
+      "expected_radio_khz": [50260]
+    },
+    {
+      "case_id": "period_260507_091215",
+      "category": "must_decode",
+      "tags": [],
+      "description": "Strong meteor pings, N1KWF CQs — MAP144 currently decodes (10 events, 3 valid decodes).",
+      "wav": "/home/jeff/.local/share/WSJT-X - flex/save/260507_091215.wav",
+      "expected_messages": ["CQ N1KWF FN32"],
+      "expected_radio_khz": [50260]
+    },
+    {
+      "case_id": "period_260514_112645",
+      "category": "must_decode",
+      "tags": [],
+      "description": "Strong N1KWF CQ — smoke-tested 2026-05-15 in this session (decoded via SPD t=4.59s).",
+      "wav": "/home/jeff/.local/share/WSJT-X - flex/save/260514_112645.wav",
+      "expected_messages": ["CQ N1KWF FN32"],
+      "expected_radio_khz": [50272]
+    },
+    {
+      "case_id": "period_260514_092730",
+      "category": "operator_observed",
+      "tags": ["meteor_ping"],
+      "description": "Operator-tagged meteor_ping.  Baseline 2026-05-15: MAP144 decodes CQ N4EMM EM82 at 50260.  Sometimes also misses (historical manual_tags note 'MAP144 currently misses').",
+      "wav": "/home/jeff/.local/share/WSJT-X - flex/save/260514_092730.wav",
+      "current_baseline_messages": ["CQ N4EMM EM82"],
+      "expected_messages": [],
+      "expected_radio_khz": []
+    },
+    {
+      "case_id": "period_260514_085815",
+      "category": "operator_observed",
+      "tags": ["meteor_ping"],
+      "description": "Operator-tagged meteor_ping — WSJT-X decodes, MAP144 currently misses.  Baseline 2026-05-15: 0 decodes.",
+      "wav": "/home/jeff/.local/share/WSJT-X - flex/save/260514_085815.wav",
+      "current_baseline_messages": [],
+      "expected_messages": [],
+      "expected_radio_khz": []
+    },
+    {
+      "case_id": "period_260514_084845",
+      "category": "asymmetric_multipath",
+      "tags": ["fluttery", "groundwave"],
+      "description": "Fluttery + groundwave — exercises one-tone-faded case that broke max-combine 2026-05-15.  Baseline 2026-05-15: MAP144 decodes CQ N1KWF FN32 via det=sync (this is the case that proves sync-only fires catch real signals).",
+      "wav": "/home/jeff/.local/share/WSJT-X - flex/save/260514_084845.wav",
+      "current_baseline_messages": ["CQ N1KWF FN32"],
+      "expected_messages": [],
+      "expected_radio_khz": []
+    },
+    {
+      "case_id": "period_260514_100545",
+      "category": "continuous_local",
+      "tags": ["continuous", "fluttery", "groundwave"],
+      "description": "Continuous groundwave with flutter — possible TX carrier leak / WD1V-like signal.  Baseline 2026-05-15: MAP144 decodes K0TPP WA2FZW R+19 at 50260.",
+      "wav": "/home/jeff/.local/share/WSJT-X - flex/save/260514_100545.wav",
+      "current_baseline_messages": ["K0TPP WA2FZW R+19"],
+      "expected_messages": [],
+      "expected_radio_khz": []
+    },
+    {
+      "case_id": "period_260507_174030",
+      "category": "noise_only_active",
+      "tags": [],
+      "description": "Noise-only period with 25 trigger events — no real signal but plenty of noise excursions.  Tests false-positive rate of detection threshold.",
+      "wav": "/home/jeff/.local/share/WSJT-X - flex/save/260507_174030.wav",
+      "expected_messages": [],
+      "expected_radio_khz": []
+    },
+    {
+      "case_id": "period_260507_174445",
+      "category": "noise_only_quiet",
+      "tags": [],
+      "description": "Noise-only period with 1 trigger event — quiet conditions, baseline FP behaviour.",
+      "wav": "/home/jeff/.local/share/WSJT-X - flex/save/260507_174445.wav",
+      "expected_messages": [],
+      "expected_radio_khz": []
+    }
+  ]
+}

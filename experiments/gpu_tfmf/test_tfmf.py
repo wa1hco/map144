@@ -147,5 +147,44 @@ class TestSyntheticPingDetection(unittest.TestCase):
         )
 
 
+class TestKFrameIntegration(unittest.TestCase):
+    """K-frame coherent integration helper — no msk144code needed."""
+
+    def test_k1_is_identity(self):
+        """k=1 should return the surface unchanged."""
+        surface = (np.random.default_rng(42).standard_normal((1000, 192)) +
+                   1j * np.random.default_rng(43).standard_normal((1000, 192))
+                   ).astype(np.complex64)
+        result = tfmf._apply_k_frame_sum(surface, stride_samples=24, k=1)
+        # Reference equality (slice into the same array is fine; just shape match)
+        self.assertEqual(result.shape, surface.shape)
+        np.testing.assert_array_equal(result, surface)
+
+    def test_k_frame_shape_truncates_correctly(self):
+        """k=K reduces row count by (K-1) * frame_spacing/stride."""
+        surface = np.zeros((1000, 192), dtype=np.complex64)
+        for k in (2, 3, 4, 7):
+            r = tfmf._apply_k_frame_sum(surface, stride_samples=24, k=k)
+            expected = 1000 - (k - 1) * (3456 // 24)
+            self.assertEqual(r.shape, (max(expected, 0), 192),
+                             f"K={k} shape wrong")
+
+    def test_k_frame_coherent_sum_doubles_at_k2(self):
+        """Constant-valued surface: K=2 sum gives exactly 2× the value."""
+        surface = np.full((1000, 192), 1.0 + 2.0j, dtype=np.complex64)
+        r = tfmf._apply_k_frame_sum(surface, stride_samples=24, k=2)
+        # All summed rows should be exactly 2*(1+2j)
+        expected = np.full_like(r, 2.0 + 4.0j)
+        np.testing.assert_allclose(r, expected, atol=1e-6)
+
+    def test_k_frame_rejects_short_input(self):
+        """Surface too short for K frames returns an empty array of compatible shape."""
+        # Need (K-1)*144 + 1 rows minimum; give less.
+        surface = np.zeros((50, 192), dtype=np.complex64)
+        r = tfmf._apply_k_frame_sum(surface, stride_samples=24, k=7)
+        self.assertEqual(r.shape[0], 0)
+        self.assertEqual(r.shape[1], 192)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

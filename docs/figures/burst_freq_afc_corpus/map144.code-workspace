@@ -1,0 +1,23 @@
+{
+	"folders": [
+		{
+			"path": "../../.."
+		},
+		{
+			"path": "../../../../FlexQMAP"
+		},
+		{
+			"path": "../../../../linrad"
+		},
+		{
+			"path": "../../../../wsjtx-3.1.0_improved_PLUS_260228"
+		}
+	],
+	"settings": {
+		"workbench.editor.enablePreview": false,
+		"workbench.editor.enablePreviewFromQuickOpen": false,
+		"chat.tools.terminal.autoApprove": {
+			"/home/jeff/ham/map144/.venv/bin/python": true
+		}
+	}
+}
