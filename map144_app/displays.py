@@ -414,42 +414,73 @@ def update_displays(self):
             self.ch_detect_img_v.setRect(_hm_rect)
             _detect_plot_v.setXRange(0, float(self.history_secs) + 0.5, padding=0)
 
-    # ── Sync-detector heatmap (parallel panel; same axes / scale) ────────────
+    # ── TFMF time-frequency surface (period-boundary update) ─────────────────
+    # _tfmf_surface_h is (n_windows, n_bins) float32 SNR-dB computed once per
+    # 15-s period.  Image col=time, row=audio-freq (fftshifted, DC centred).
+    # Candidate scatter uses fftfreq-ordered freq_hz converted to kHz.
+    _TFMF_FREQ_MIN_KHZ  = -6.0    # after fftshift, bin 0 → −6 kHz
+    _TFMF_FREQ_SPAN_KHZ = 12.0    # ±6 kHz audio range
+    _TFMF_DISP_STRIDE   = 24      # samples/window at 12 kHz = 2 ms/window
+    _TFMF_FS            = 12000   # channel sample rate
+
     _sync_win = getattr(self, '_sync_detect_win', None)
     if _sync_win is None or _sync_win.isVisible():
         _sync_plot = getattr(self, 'sync_detect_plot', None)
         if _sync_plot is not None:
-            _hm_rect = QtCore.QRectF(
-                0.0, self._detect_freq_min_khz,
-                float(self.history_secs), self._detect_freq_span_khz,
-            )
-            sync_h = np.fft.fftshift(self._sync_snr_history_h, axes=1)
-            _dw  = max(_sync_plot.width(), 1)
-            _rep = max(1, -(-_dw // sync_h.shape[0]))
             _sync_levels = [getattr(self, 'sync_detect_min_level', self.detect_min_level),
                             getattr(self, 'sync_detect_max_level', self.detect_max_level)]
-            self.sync_detect_img.setImage(
-                np.repeat(sync_h, _rep, axis=0),
-                autoLevels=False,
-                levels=_sync_levels,
-            )
-            self.sync_detect_img.setRect(_hm_rect)
-            _sync_plot.setXRange(0, float(self.history_secs) + 0.5, padding=0)
+            _surf_h = getattr(self, '_tfmf_surface_h', None)
+            if _surf_h is not None:
+                _n_win_h = _surf_h.shape[0]
+                _time_span_h = _n_win_h * _TFMF_DISP_STRIDE / _TFMF_FS
+                _tfmf_rect_h = QtCore.QRectF(
+                    0.0, _TFMF_FREQ_MIN_KHZ, _time_span_h, _TFMF_FREQ_SPAN_KHZ
+                )
+                self.sync_detect_img.setImage(
+                    _surf_h, autoLevels=False, levels=_sync_levels,
+                )
+                self.sync_detect_img.setRect(_tfmf_rect_h)
+                _sync_plot.setXRange(0, _time_span_h + 0.5, padding=0)
+
+                _scatter = getattr(self, 'sync_detect_scatter', None)
+                if _scatter is not None:
+                    _cands = getattr(self, '_tfmf_candidates_h', [])
+                    if _cands:
+                        _scatter.setData(
+                            x=[c.time_s for c in _cands],
+                            y=[c.freq_hz / 1000.0 for c in _cands],
+                        )
+                    else:
+                        _scatter.setData(x=[], y=[])
 
             _sync_plot_v = getattr(self, 'sync_detect_plot_v', None)
             if _dual and _sync_plot_v is not None:
-                sync_v = np.fft.fftshift(self._sync_snr_history_v, axes=1)
-                _dw_v  = max(_sync_plot_v.width(), 1)
-                _rep_v = max(1, -(-_dw_v // sync_v.shape[0]))
-                self.sync_detect_img_v.setImage(
-                    np.repeat(sync_v, _rep_v, axis=0),
-                    autoLevels=False,
-                    levels=_sync_levels,
-                )
-                self.sync_detect_img_v.setRect(_hm_rect)
-                _sync_plot_v.setXRange(0, float(self.history_secs) + 0.5, padding=0)
-                if not _sync_plot_v.isVisible():
-                    _sync_plot_v.show()
+                _surf_v = getattr(self, '_tfmf_surface_v', None)
+                if _surf_v is not None:
+                    _n_win_v = _surf_v.shape[0]
+                    _time_span_v = _n_win_v * _TFMF_DISP_STRIDE / _TFMF_FS
+                    _tfmf_rect_v = QtCore.QRectF(
+                        0.0, _TFMF_FREQ_MIN_KHZ, _time_span_v, _TFMF_FREQ_SPAN_KHZ
+                    )
+                    self.sync_detect_img_v.setImage(
+                        _surf_v, autoLevels=False, levels=_sync_levels,
+                    )
+                    self.sync_detect_img_v.setRect(_tfmf_rect_v)
+                    _sync_plot_v.setXRange(0, _time_span_v + 0.5, padding=0)
+
+                    _scatter_v = getattr(self, 'sync_detect_scatter_v', None)
+                    if _scatter_v is not None:
+                        _cands_v = getattr(self, '_tfmf_candidates_v', [])
+                        if _cands_v:
+                            _scatter_v.setData(
+                                x=[c.time_s for c in _cands_v],
+                                y=[c.freq_hz / 1000.0 for c in _cands_v],
+                            )
+                        else:
+                            _scatter_v.setData(x=[], y=[])
+                if _surf_v is not None:
+                    if not _sync_plot_v.isVisible():
+                        _sync_plot_v.show()
             elif _sync_plot_v is not None and _sync_plot_v.isVisible():
                 _sync_plot_v.hide()
 

@@ -558,7 +558,12 @@ def _connect_radio_client(self):
         t_import = _time.monotonic()
         print(f"[radio] import done ({t_import - t0:.2f}s); calling FlexDAXIQ(...)", flush=True)
         flex_client_class = flex_client_module.FlexDAXIQ
+        _radio_ip_edit = getattr(self, '_flex_radio_ip_edit', None)
+        _radio_ip = _radio_ip_edit.text().strip() if _radio_ip_edit is not None else ''
+        _radio_ip = _radio_ip or None
+        print(f"[radio] calling FlexDAXIQ(radio_ip={_radio_ip!r})", flush=True)
         self.radio_client = flex_client_class(
+            radio_ip=_radio_ip,
             center_freq_mhz=self.center_freq_mhz,
             sample_rate=self.sample_rate,
             dax_channel=1,

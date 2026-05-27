@@ -125,6 +125,109 @@ def load_truth(path: Path) -> tuple[list[TruthPing], dict]:
     return pings, meta
 
 
+# ── Threshold calibration ─────────────────────────────────────────────────────
+
+
+def _noise_iq(n_samples: int, seed: int = 0) -> np.ndarray:
+    """Pure unit-variance AWGN complex IQ for threshold calibration."""
+    rng = np.random.default_rng(seed)
+    return (
+        rng.standard_normal(n_samples).astype(np.float32)
+        + 1j * rng.standard_normal(n_samples).astype(np.float32)
+    ).astype(np.complex64)
+
+
+def calibrate_tfmf_threshold(
+        noise_iq: np.ndarray,
+        h: np.ndarray,
+        stride_samples: int,
+        sample_rate_hz: int,
+        target_far_per_s: float,
+        lo: float = 3.0,
+        hi: float = 60.0,
+        n_iter: int = 24,
+) -> tuple[float, float]:
+    """Find TFMF threshold_db that yields ≈ target_far_per_s false candidates/s.
+
+    Computes the full SNR surface on noise-only IQ once, then sweeps threshold
+    analytically via binary search — no repeated surface computation.
+
+    A 'candidate' here is one above-threshold (time-window, freq-bin) cell,
+    matching extract_candidates_cpu's counting.  Recalibrate once 2-D
+    peak-picking is added (it will collapse cell clusters into single events).
+
+    Returns (calibrated_threshold_db, achieved_far_per_s).
+    """
+    duration_s = float(noise_iq.shape[0]) / sample_rate_hz
+    surface = tfmf.compute_tf_surface_cpu(noise_iq, h, stride_samples)
+    magnitude = np.abs(surface)
+    noise_floor = np.median(magnitude, axis=0)
+    noise_floor = np.maximum(noise_floor, 1e-30)
+    snr_db_arr = 20.0 * np.log10(magnitude / noise_floor[None, :])
+
+    for _ in range(n_iter):
+        mid = (lo + hi) / 2.0
+        far = float(np.sum(snr_db_arr > mid)) / duration_s
+        if far > target_far_per_s:
+            lo = mid
+        else:
+            hi = mid
+    cal_thr = (lo + hi) / 2.0
+    achieved = float(np.sum(snr_db_arr > cal_thr)) / duration_s
+    return cal_thr, achieved
+
+
+def calibrate_sqdet_threshold(
+        noise_iq: np.ndarray,
+        sample_rate_hz: int,
+        assumed_fc_hz: float,
+        target_far_per_s: float,
+        lo: float = 0.0,
+        hi: float = 40.0,
+        n_iter: int = 24,
+) -> tuple[float, float]:
+    """Find sq_det threshold_db that yields ≈ target_far_per_s false candidates/s.
+
+    Runs sq_det on noise-only IQ (decimated to 12 kHz), normalises by the
+    noise 25th-percentile (same method run_sq_det_baseline uses), then
+    binary-searches the threshold analytically.
+
+    A 'candidate' is one above-threshold NSPM-sample time window.
+
+    Returns (calibrated_threshold_db, achieved_far_per_s).
+    """
+    from map144_app.sq_det import sq_det as _sq_det, NSPM    # noqa: PLC0415
+    from scipy.signal import decimate                         # noqa: PLC0415
+
+    duration_s = float(noise_iq.shape[0]) / sample_rate_hz
+    factor = sample_rate_hz // 12_000
+    audio_12k = decimate(noise_iq, factor, ftype='fir',
+                         zero_phase=True).astype(np.complex128)
+
+    hop = NSPM // 4
+    raw_detmets: list[float] = []
+    for start in range(0, audio_12k.size - NSPM + 1, hop):
+        result = _sq_det(audio_12k[start:start + NSPM], fc=assumed_fc_hz)
+        raw_detmets.append(float(result.detmet))
+    raw_arr = np.array(raw_detmets, dtype=np.float32)
+
+    xmed = float(np.percentile(raw_arr, 25))
+    if xmed <= 0:
+        xmed = 1e-30
+    detmet_norm = raw_arr / xmed
+
+    for _ in range(n_iter):
+        mid = (lo + hi) / 2.0
+        far = float(np.sum(detmet_norm > 10.0 ** (mid / 20.0))) / duration_s
+        if far > target_far_per_s:
+            lo = mid
+        else:
+            hi = mid
+    cal_thr = (lo + hi) / 2.0
+    achieved = float(np.sum(detmet_norm > 10.0 ** (cal_thr / 20.0))) / duration_s
+    return cal_thr, achieved
+
+
 # ── sq_det baseline (sliding-window WSJT-X-faithful) ────────────────────────
 
 
@@ -239,6 +342,11 @@ def main():
     ap.add_argument('--sync-stride-samples', type=int, default=24,
                     help='TFMF correlation stride (samples at '
                          '48 kHz; 24 = one MSK144 symbol)  [default: 24]')
+    ap.add_argument('--target-far', type=float, default=1.0,
+                    help='Target false-alarm rate in candidates/s; calibrates '
+                         'both detectors to this FAR before comparing '
+                         '(0 = skip calibration, use fixed thresholds)  '
+                         '[default: 1.0]')
     args = ap.parse_args()
 
     # Load — auto-detect IQ vs audio, native sample rate
@@ -258,18 +366,46 @@ def main():
     # matched filter operates without resampling.
     SR = wav_sample_rate
 
+    # ── CFAR threshold calibration ───────────────────────────────────────
+    sync_thr = args.sync_threshold_db
+    sq_thr   = args.sqdet_threshold_db
+
+    if args.target_far > 0.0:
+        print(f"\n=== Calibrating to {args.target_far:.2f} false candidates/s "
+              f"(noise-only IQ, same duration) ===")
+        noise = _noise_iq(iq.shape[0], seed=0)
+        h_cal = sync_template.build_sync_template(SR)
+
+        print("  TFMF ...", flush=True)
+        sync_thr, sync_achieved = calibrate_tfmf_threshold(
+            noise, h_cal, args.sync_stride_samples, SR, args.target_far,
+        )
+        print(f"    threshold: {sync_thr:.2f} dB  "
+              f"(achieved FAR: {sync_achieved:.3f} false/s)")
+
+        print("  sq_det ...", flush=True)
+        sq_thr, sq_achieved = calibrate_sqdet_threshold(
+            noise, SR, assumed_fc_hz=1500.0, target_far_per_s=args.target_far,
+        )
+        print(f"    threshold: {sq_thr:.2f} dB  "
+              f"(achieved FAR: {sq_achieved:.3f} false/s)")
+        print(f"  NOTE: TFMF candidates are (time,freq) cells; sq_det candidates "
+              f"are time windows.\n"
+              f"        FAR units are comparable but not identical until "
+              f"2-D peak-picking is added.")
+
     # ── TFMF detector (the "future" path) ─────────────────────
     print("\n=== TFMF over 15-s window ===")
     h = sync_template.build_sync_template(SR)
     cfg = tfmf.TFMFConfig(
         sample_rate_hz=SR,
         stride_samples=args.sync_stride_samples,
-        threshold_db=args.sync_threshold_db,
+        threshold_db=sync_thr,
     )
     sync_candidates = tfmf.detect(iq, h, cfg, use_gpu=False)
     print(f"  template length: {len(h)} samples ({1000*len(h)/SR:.1f} ms)")
     print(f"  freq resolution: {SR/len(h):.1f} Hz/bin")
-    print(f"  {len(sync_candidates)} candidates above {args.sync_threshold_db:.1f} dB")
+    print(f"  {len(sync_candidates)} candidates above {sync_thr:.2f} dB")
     sync_matches = match_candidates(
         sync_candidates, truth,
         key_time='time_s', key_freq='freq_hz',
@@ -278,9 +414,9 @@ def main():
     # ── sq_det baseline (the "current" path) ────────────────────────────
     print("\n=== sq_det baseline (sliding-window, WSJT-X-faithful) ===")
     sq_candidates = run_sq_det_baseline(
-        iq, SR, threshold_db=args.sqdet_threshold_db,
+        iq, SR, threshold_db=sq_thr,
     )
-    print(f"  {len(sq_candidates)} candidates above {args.sqdet_threshold_db:.1f} dB")
+    print(f"  {len(sq_candidates)} candidates above {sq_thr:.2f} dB")
     sq_matches = match_candidates(
         sq_candidates, truth,
         key_time='time_s', key_freq='freq_hz',

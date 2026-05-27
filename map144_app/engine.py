@@ -22,7 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .channelizer import design_channelizer_filter, make_channelizer_state, N_CHANNELS
+from .channelizer import design_channelizer_filter, make_channelizer_state, N_CHANNELS, CH_SAMPLE_RATE
 from .processing import (
     process_iq_data as _process_iq_data,
     N_SNR_HIST, CH_DETECT_SIZE, _METRIC_HIST_DEPTH,
@@ -361,6 +361,25 @@ class Engine:
         self._sync_snr_history_h = np.full((N_SNR_HIST, N_CHANNELS), -999.0, dtype=np.float32)
         self._sync_snr_history_v = np.full((N_SNR_HIST, N_CHANNELS), -999.0, dtype=np.float32)
         self._ch_snr_hop_count = 0
+
+        # TFMF display state — per-period single-channel IQ accumulation.
+        # At each 15-s boundary the buffer is processed into a (n_windows,
+        # n_freq_bins) SNR surface stored in _tfmf_surface_h/v.  The display
+        # thread renders it as a time×frequency heatmap with candidate scatter.
+        _TFMF_PERIOD_SAMPLES = 15 * CH_SAMPLE_RATE   # 180 000 samples
+        self._tfmf_active_ch_h    = 0
+        self._tfmf_period_buf_h   = np.zeros(_TFMF_PERIOD_SAMPLES, dtype=np.complex64)
+        self._tfmf_period_fill_h  = 0
+        self._tfmf_surface_h      = None   # float32 (n_win, n_bins) SNR dB, freq-axis fftshifted
+        self._tfmf_candidates_h   = []
+        self._tfmf_surface_dirty_h = False
+        # V-pol counterparts (dual_pol path only)
+        self._tfmf_active_ch_v    = 0
+        self._tfmf_period_buf_v   = np.zeros(_TFMF_PERIOD_SAMPLES, dtype=np.complex64)
+        self._tfmf_period_fill_v  = 0
+        self._tfmf_surface_v      = None
+        self._tfmf_candidates_v   = []
+        self._tfmf_surface_dirty_v = False
 
         # Pre-computed FFT window
         self._fft_window = np.hanning(self.fft_size).astype(np.float32)

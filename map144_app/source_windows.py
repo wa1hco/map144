@@ -592,8 +592,24 @@ def setup_flex_window(self, view_action):
     self._flex_win = win
 
     # ── Radio ──
+    from .visualizer import _SETTINGS
     radio_grp, radio_form = _form_group("Radio", compact=True)
     radio_grp.setStyleSheet(_GRP_SS)
+
+    try:
+        _saved_radio_ip = str(_SETTINGS.value('flex_radio_ip', ''))
+    except Exception:
+        _saved_radio_ip = ''
+    self._flex_radio_ip_edit = QtWidgets.QLineEdit(_saved_radio_ip)
+    self._flex_radio_ip_edit.setPlaceholderText("auto-discover")
+    self._flex_radio_ip_edit.setStyleSheet(
+        f"QLineEdit {{ font-family: {_FONT}; font-size: {_FSZ}; }}"
+    )
+    self._flex_radio_ip_edit.textChanged.connect(
+        lambda text: _SETTINGS.setValue('flex_radio_ip', text.strip())
+    )
+    radio_form.addRow("Radio IP:", self._flex_radio_ip_edit)
+
     radio_form.addRow("Status:",   _sl("_flex_status_val", "Idle", "#c76000"))
     radio_form.addRow("Model:",    _sl("_flex_model_val"))
     radio_form.addRow("Serial:",   _sl("_flex_serial_val"))

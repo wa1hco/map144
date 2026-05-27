@@ -77,6 +77,7 @@ N_SNR_HIST          : computed — spans ~one 15 s window at the channeliser hop
 """
 
 import logging
+import sys as _sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -228,6 +229,79 @@ _NB_TAPER_KERNEL /= _NB_TAPER_KERNEL.max()   # normalise peak to 1.0
 
 # Pre-computed constants for the detection hot loop (computed once at import time)
 _DETECT_WINDOW = np.hanning(CH_DETECT_SIZE).astype(np.float32)
+
+# ── TFMF display surface constants ────────────────────────────────────────────
+# One surface is computed per 15-s period (at the boundary) from the accumulated
+# channelised IQ of the active (highest-metric) channel.  stride=24 → 2 ms/window,
+# giving ~7500 time bins over 15 s — sufficient resolution for a display widget.
+_TFMF_DISP_STRIDE  = 24            # samples between TFMF windows (2 ms at 12 kHz)
+_TFMF_DISP_TMPL_N  = 384           # dual-sync template length at 12 kHz
+_TFMF_FREQ_MIN_KHZ = -CH_SAMPLE_RATE / 2 / 1000.0   # −6.0 kHz (after fftshift)
+_TFMF_FREQ_SPAN_KHZ = CH_SAMPLE_RATE / 1000.0         # 12.0 kHz
+# Lazy-initialised dual-sync template (built once on first period boundary)
+_TFMF_TEMPLATE_12K: 'np.ndarray | None' = None
+
+
+def _build_tfmf_display_surface(iq_samples: np.ndarray):
+    """Compute the TFMF SNR surface and peak-picked candidates for the sync-det display.
+
+    Runs once per 15-s period at the boundary — not in the per-hop hot path.
+    Uses a vectorised batched FFT (one np.fft.fft call for all windows) to keep
+    latency below ~100 ms for a full 15-s buffer at stride=24.
+
+    Returns
+    -------
+    snr_db : float32 ndarray shape (n_windows, _TFMF_DISP_TMPL_N), freq axis fftshifted
+             (DC in centre column), SNR in dB above per-bin median noise floor.
+             None when the input is too short.
+    candidates : list[Candidate]  peak-picked detections; freq_hz in fftfreq ordering.
+    """
+    global _TFMF_TEMPLATE_12K
+    if _TFMF_TEMPLATE_12K is None:
+        _repo = Path(__file__).resolve().parent.parent
+        if str(_repo) not in _sys.path:
+            _sys.path.insert(0, str(_repo))
+        from experiments.gpu_tfmf.sync_template import build_dual_sync_template
+        _TFMF_TEMPLATE_12K = build_dual_sync_template(CH_SAMPLE_RATE)
+
+    h = _TFMF_TEMPLATE_12K
+    N = len(h)                           # 384
+    stride = _TFMF_DISP_STRIDE           # 24
+    iq = np.ascontiguousarray(iq_samples, dtype=np.complex64)
+    n_samp = len(iq)
+    n_windows = max(0, (n_samp - N) // stride + 1)
+    if n_windows == 0:
+        return None, []
+
+    # Build (n_windows, N) matrix via advanced indexing — one copy, fully contiguous.
+    row_idx = np.arange(n_windows, dtype=np.int32)[:, np.newaxis] * stride
+    col_idx = np.arange(N, dtype=np.int32)[np.newaxis, :]
+    windows = iq[row_idx + col_idx]                                 # (n_windows, N)
+    h_conj  = np.conj(h).astype(np.complex64)
+    products = windows * h_conj[np.newaxis, :]                      # (n_windows, N)
+    surface  = np.fft.fft(products, axis=1).astype(np.complex64)   # (n_windows, N)
+
+    # SNR surface: fftshift freq axis so DC is centred, then dB above median noise
+    surface_s = np.fft.fftshift(surface, axes=1)
+    magnitude  = np.abs(surface_s)
+    noise_floor = np.median(magnitude, axis=0)
+    noise_floor = np.maximum(noise_floor, 1e-30)
+    snr_db = (20.0 * np.log10(magnitude / noise_floor[np.newaxis, :])).astype(np.float32)
+
+    # Peak-pick candidates from the UN-shifted surface (fftfreq ordering expected by
+    # extract_candidates_cpu) with a permissive threshold for display completeness.
+    try:
+        from experiments.gpu_tfmf.tfmf import extract_candidates_cpu, TFMFConfig
+        _cfg = TFMFConfig(
+            sample_rate_hz=CH_SAMPLE_RATE,
+            stride_samples=stride,
+            threshold_db=12.0,
+        )
+        candidates = extract_candidates_cpu(surface, _cfg, N)
+    except Exception:
+        candidates = []
+
+    return snr_db, candidates
 
 
 def reset_detection_baseline(engine):
@@ -807,6 +881,31 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
             # the display window boundary so a signal that starts just before
             # the boundary still triggers a jt9 launch after it.
 
+            # Compute TFMF display surface from the completed period buffer.
+            # Runs once per 15 s; batched FFT keeps latency below ~100 ms.
+            for _tfmf_buf_a, _tfmf_fill_a, _tfmf_surf_a, _tfmf_cand_a, _tfmf_dirty_a in (
+                ('_tfmf_period_buf_h', '_tfmf_period_fill_h',
+                 '_tfmf_surface_h',    '_tfmf_candidates_h', '_tfmf_surface_dirty_h'),
+                ('_tfmf_period_buf_v', '_tfmf_period_fill_v',
+                 '_tfmf_surface_v',    '_tfmf_candidates_v', '_tfmf_surface_dirty_v'),
+            ):
+                _fill = getattr(self, _tfmf_fill_a, 0)
+                if _fill >= _TFMF_DISP_TMPL_N:
+                    try:
+                        _buf = getattr(self, _tfmf_buf_a)
+                        _surf, _cands = _build_tfmf_display_surface(_buf[:_fill])
+                        if _surf is not None:
+                            setattr(self, _tfmf_surf_a,  _surf)
+                            setattr(self, _tfmf_cand_a,  _cands)
+                            setattr(self, _tfmf_dirty_a, True)
+                    except Exception as _tfmf_err:
+                        logger.warning("TFMF display surface error: %s", _tfmf_err)
+                # Reset accumulation for next period
+                getattr(self, _tfmf_buf_a)[:] = 0.0
+                setattr(self, _tfmf_fill_a, 0)
+            self._tfmf_active_ch_h = 0
+            self._tfmf_active_ch_v = 0
+
         # Hop-counter row index — guaranteed contiguous across hops.
         self._ch_snr_write_idx = self._ch_snr_hop_count % N_SNR_HIST
         # ── Diagnostic toggle: raw power vs pct25-normalised metric ────────
@@ -893,6 +992,28 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                 int(self._ch_snr_boundary),
             )
         self._ch_snr_hop_count += 1
+
+        # Accumulate non-overlapping samples for the TFMF display buffer.
+        # ch_block[:, :_CH_DETECT_HOP] are the samples that will be drained
+        # at the bottom of this loop iteration — these are the NEW (unique)
+        # samples for this hop.  Append them to the per-period accumulation
+        # buffer so the period-boundary surface computation has continuous IQ.
+        _tfmf_fill_h = self._tfmf_period_fill_h
+        _tfmf_cap    = len(self._tfmf_period_buf_h)
+        _n_acc_h     = min(_CH_DETECT_HOP, _tfmf_cap - _tfmf_fill_h)
+        if _n_acc_h > 0:
+            _ach = self._tfmf_active_ch_h
+            self._tfmf_period_buf_h[_tfmf_fill_h:_tfmf_fill_h + _n_acc_h] = \
+                ch_block[_ach, :_n_acc_h]
+            self._tfmf_period_fill_h += _n_acc_h
+        if dual_pol and ch_block_v is not None:
+            _tfmf_fill_v = self._tfmf_period_fill_v
+            _n_acc_v     = min(_CH_DETECT_HOP, _tfmf_cap - _tfmf_fill_v)
+            if _n_acc_v > 0:
+                _acv = self._tfmf_active_ch_v
+                self._tfmf_period_buf_v[_tfmf_fill_v:_tfmf_fill_v + _n_acc_v] = \
+                    ch_block_v[_acv, :_n_acc_v]
+                self._tfmf_period_fill_v += _n_acc_v
 
         # Block-primary cutover (Option 2): metrics + heatmap history
         # writes above have already happened — that's what feeds the
@@ -987,6 +1108,12 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
             # Pick the channel with the highest pair_metric in this cluster.
             _best = int(_cl[np.argmax(pair_metric[_cl])])
             if _best not in self._detect_cooldowns:
+                # Track the triggered channel for the TFMF display surface.
+                if pair_metric_h[_best] >= (pair_metric_v[_best]
+                                             if ch_block_v is not None else -1e9):
+                    self._tfmf_active_ch_h = _best
+                else:
+                    self._tfmf_active_ch_v = _best
                 _launch_channels.append((_best, _cl))
                 # Launch happened: suppress only the launched channel itself.
                 # Suppressing neighbours risks blocking a real signal whose center

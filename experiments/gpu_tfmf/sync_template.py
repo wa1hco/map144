@@ -52,6 +52,38 @@ _MSK144_SYMBOL_RATE_HZ = 2000
 SECOND_SYNC_OFFSET_SYMBOLS = 56
 
 
+def build_dual_sync_template(sample_rate_hz: int = 48_000) -> np.ndarray:
+    """Sparse template covering both MSK144 sync sub-blocks in one frame.
+
+    MSK144 places identical 8-symbol sync words at symbols 0-7 and 56-63
+    within each 144-symbol frame.  This template has the sync waveform at
+    both positions and zeros at the 48 data-symbol positions in between.
+
+    Template length = (56 + 8) symbols × SPS = 64 × SPS samples.
+    At 48 kHz: 64 × 24 = 1536 samples.
+    At 12 kHz: 64 × 6  =  384 samples.
+
+    The frequency resolution of the resulting TF surface is Fs / (64×SPS)
+    = Fs / (64 × Fs/2000) = 2000/64 = 31.25 Hz/bin at all sample rates.
+
+    Coherent combining geometry: the second sync starts at sample
+    SECOND_SYNC_OFFSET_SYMBOLS × SPS = 56 × SPS = 1344 samples (at 48 kHz).
+    The FFT window (1536 samples) sees both syncs simultaneously and coherently
+    accumulates their matched-filter energy in each frequency bin.
+
+    Expected gain over single-sync: +3 dB (doubles the template energy
+    ‖h‖², which is the matched-filter SNR numerator).
+    """
+    sps = sample_rate_hz // _MSK144_SYMBOL_RATE_HZ
+    single = build_sync_template(sample_rate_hz, edge_truncate=True)  # 8*SPS
+    total_len = (SECOND_SYNC_OFFSET_SYMBOLS + 8) * sps               # 64*SPS
+    h = np.zeros(total_len, dtype=np.complex64)
+    h[:len(single)] = single                                           # sync1
+    h[SECOND_SYNC_OFFSET_SYMBOLS * sps :
+      SECOND_SYNC_OFFSET_SYMBOLS * sps + len(single)] = single        # sync2
+    return h
+
+
 def build_sync_template(sample_rate_hz: int = 48_000,
                         edge_truncate: bool = True
                         ) -> np.ndarray:

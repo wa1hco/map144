@@ -441,57 +441,56 @@ def setup_ui(self):
     )
     self.ch_detect_plot_v.hide()
 
-    # ── Coherent sync-correlator detection heatmap (parallel to squared-FFT) ──
-    # Same axes (frequency vertical, time horizontal) and same circle overlay
-    # showing decode progress; the difference is the underlying detector — this
-    # one shows ``_sync_snr_history_*`` (matched-filter sync correlation in dB
-    # above the rolling 25th-percentile baseline).  Lives in its own panel
-    # window so the user can A/B against the existing squared-FFT heatmap.
-    _sync_title = (f"Coherent Sync-Word Detection  (threshold {DETECT_THRESH_DB:.0f} dB above baseline)"
-                   f"   circles: cyan=SPD  green=jt9  red=running  orange=no_decode")
+    # ── TFMF time-frequency surface (replaces channels×time sync heatmap) ───────
+    # Shows the 2D matched-filter SNR surface (time on X, audio freq on Y) for
+    # the most recently triggered channel.  Computed once per 15-s period at the
+    # boundary; rendered by displays.py.  Peak-picked candidates appear as yellow
+    # scatter dots.  Decode-lifecycle circles (cyan/green/red/orange) remain for
+    # cross-referencing decodes, but are not redrawn on this panel (they live on
+    # the tone-detection heatmap which retains the full-bandwidth channel view).
+    _sync_title = ("TFMF Peak Detection  (dual-sync template, ±6 kHz audio)"
+                   "   yellow dots = peak-picked candidates")
     self.sync_detect_plot = pg.PlotWidget(title="H — " + _sync_title)
-    self.sync_detect_plot.setLabel('left', 'Dial offset (kHz)')
+    self.sync_detect_plot.setLabel('left', 'Audio freq (kHz)')
+    self.sync_detect_plot.setLabel('bottom', 'Time in period (s)')
     self.sync_detect_plot.setAspectLocked(False)
     self.sync_detect_img = pg.ImageItem(axisOrder='col-major')
     self.sync_detect_plot.addItem(self.sync_detect_img)
     self.sync_detect_img.setColorMap(colormap)
-    self.sync_detect_curve_cyan   = pg.PlotCurveItem(pen=pg.mkPen((0, 220, 220),  width=1.5))
-    self.sync_detect_curve_green  = pg.PlotCurveItem(pen=pg.mkPen('g',            width=1.5))
-    self.sync_detect_curve_red    = pg.PlotCurveItem(pen=pg.mkPen('r',            width=1.5))
-    self.sync_detect_curve_orange = pg.PlotCurveItem(pen=pg.mkPen((255, 140, 0),  width=1.5))
-    self.sync_detect_plot.addItem(self.sync_detect_curve_cyan)
-    self.sync_detect_plot.addItem(self.sync_detect_curve_green)
-    self.sync_detect_plot.addItem(self.sync_detect_curve_red)
-    self.sync_detect_plot.addItem(self.sync_detect_curve_orange)
-    self.sync_detect_plot.setXRange(0, 15.5, padding=0)
-    self.sync_detect_plot.getAxis('bottom').hide()
-    self.sync_detect_plot.setYRange(
-        self._detect_freq_min_khz - 0.5,
-        self._detect_freq_min_khz + self._detect_freq_span_khz + 0.5,
-        padding=0,
+    self.sync_detect_scatter = pg.ScatterPlotItem(
+        size=8, pen=pg.mkPen('y', width=1.5), brush=pg.mkBrush(None),
+        symbol='o',
     )
+    self.sync_detect_plot.addItem(self.sync_detect_scatter)
+    # Keep curve items so existing code that addresses them by name doesn't fail,
+    # but do not add them to the plot — they're no longer drawn here.
+    self.sync_detect_curve_cyan   = pg.PlotCurveItem()
+    self.sync_detect_curve_green  = pg.PlotCurveItem()
+    self.sync_detect_curve_red    = pg.PlotCurveItem()
+    self.sync_detect_curve_orange = pg.PlotCurveItem()
+    self.sync_detect_plot.setXRange(0, 15.5, padding=0)
+    self.sync_detect_plot.getAxis('bottom').show()
+    self.sync_detect_plot.setYRange(-6.1, 6.1, padding=0)
 
     self.sync_detect_plot_v = pg.PlotWidget(title="V — " + _sync_title)
-    self.sync_detect_plot_v.setLabel('left', 'Dial offset (kHz)')
-    self.sync_detect_plot_v.getAxis('bottom').hide()
+    self.sync_detect_plot_v.setLabel('left', 'Audio freq (kHz)')
+    self.sync_detect_plot_v.setLabel('bottom', 'Time in period (s)')
+    self.sync_detect_plot_v.getAxis('bottom').show()
     self.sync_detect_plot_v.setAspectLocked(False)
     self.sync_detect_img_v = pg.ImageItem(axisOrder='col-major')
     self.sync_detect_plot_v.addItem(self.sync_detect_img_v)
     self.sync_detect_img_v.setColorMap(colormap)
-    self.sync_detect_curve_cyan_v   = pg.PlotCurveItem(pen=pg.mkPen((0, 220, 220), width=1.5))
-    self.sync_detect_curve_green_v  = pg.PlotCurveItem(pen=pg.mkPen('g',           width=1.5))
-    self.sync_detect_curve_red_v    = pg.PlotCurveItem(pen=pg.mkPen('r',           width=1.5))
-    self.sync_detect_curve_orange_v = pg.PlotCurveItem(pen=pg.mkPen((255, 140, 0), width=1.5))
-    self.sync_detect_plot_v.addItem(self.sync_detect_curve_cyan_v)
-    self.sync_detect_plot_v.addItem(self.sync_detect_curve_green_v)
-    self.sync_detect_plot_v.addItem(self.sync_detect_curve_red_v)
-    self.sync_detect_plot_v.addItem(self.sync_detect_curve_orange_v)
-    self.sync_detect_plot_v.setXRange(0, 15.5, padding=0)
-    self.sync_detect_plot_v.setYRange(
-        self._detect_freq_min_khz - 0.5,
-        self._detect_freq_min_khz + self._detect_freq_span_khz + 0.5,
-        padding=0,
+    self.sync_detect_scatter_v = pg.ScatterPlotItem(
+        size=8, pen=pg.mkPen('y', width=1.5), brush=pg.mkBrush(None),
+        symbol='o',
     )
+    self.sync_detect_plot_v.addItem(self.sync_detect_scatter_v)
+    self.sync_detect_curve_cyan_v   = pg.PlotCurveItem()
+    self.sync_detect_curve_green_v  = pg.PlotCurveItem()
+    self.sync_detect_curve_red_v    = pg.PlotCurveItem()
+    self.sync_detect_curve_orange_v = pg.PlotCurveItem()
+    self.sync_detect_plot_v.setXRange(0, 15.5, padding=0)
+    self.sync_detect_plot_v.setYRange(-6.1, 6.1, padding=0)
     self.sync_detect_plot_v.hide()
     self.sync_detect_plot.getViewBox().disableAutoRange()
 

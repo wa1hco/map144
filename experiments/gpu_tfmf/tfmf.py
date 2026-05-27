@@ -30,6 +30,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from experiments.gpu_tfmf import sync_template as _sync_template
+
 try:
     import cupy as cp                                 # type: ignore[import-not-found]
     _HAS_CUPY = True
@@ -54,11 +56,23 @@ class TFMFConfig:
     #: resolution; set > template length to zero-pad for finer freq
     #: viewing (does NOT improve underlying resolution).
     fft_length: int | None = None
+    #: Use the dual-sync sparse template (both sync words in one 1536-sample
+    #: window) instead of the single 192-sample sync-1 template.  Gives +3 dB
+    #: coherent combining gain at the cost of 8× longer FFT.  Ignored when an
+    #: explicit template is passed to detect().
+    use_dual_sync: bool = True
     #: Detection threshold in dB above the per-bin noise-floor estimate.
     threshold_db: float = 10.0
     #: Per-bin noise-floor estimator: rolling-median window length, in
     #: number of correlation windows.
     noise_window: int = 300
+    #: 2-D local-max peak-picking footprint — time axis (windows, must be odd).
+    #: Collapses a ping cluster spanning ~15 windows to exactly one candidate.
+    peak_picking_time_windows: int = 15
+    #: 2-D local-max peak-picking footprint — frequency half-width (Hz).
+    #: Converted to bins at runtime; rounded up to the nearest odd integer.
+    #: 500 Hz ≈ ±2 bins at 250 Hz/bin (single) or ±16 bins at 31 Hz/bin (dual).
+    peak_picking_freq_hz: float = 500.0
 
 
 # ── CPU reference ────────────────────────────────────────────────────────────
@@ -164,12 +178,50 @@ def compute_tf_surface_gpu(iq_cp, template_cp, stride_samples: int,
 
 @dataclass
 class Candidate:
-    """One detection candidate from the time-frequency correlation surface."""
-    time_sample: int          # input-IQ sample index of the window centre
-    time_s: float             # seconds from start of input
-    freq_hz: float            # frequency offset from IQ DC
-    snr_db: float             # ratio of magnitude to per-bin noise-floor
-    raw_magnitude: float      # |matched_filter_output|
+    """One detection candidate from the time-frequency correlation surface.
+
+    ``time_sample`` locates the candidate at the nearest stride boundary
+    (resolution = cfg.stride_samples).  ``sample_epoch_offset_samples``
+    refines that to sub-stride precision via parabolic interpolation and
+    represents the fractional timing of the sync onset relative to the
+    sample-clock grid.
+
+    For a given transmitting station the propagation delay is essentially
+    constant within a 15-second period, so ``sample_epoch_offset_samples``
+    is constant across frames from the same station but differs between
+    stations.  Two candidates with matching ``sample_epoch_offset_samples``
+    (within measurement noise) but different ``freq_hz`` can therefore be
+    tentatively associated with the same physical transmitter.
+    """
+    time_sample: int          # input-IQ sample index of the nearest stride boundary
+    time_s: float             # seconds from start of input (stride-aligned)
+    freq_hz: float            # frequency offset from IQ DC (Hz)
+    snr_db: float             # matched-filter SNR above per-bin noise floor (dB)
+    raw_magnitude: float      # |matched_filter_output| at peak cell
+    #: Sub-stride parabolic time refinement (samples).  Range ≈ ±stride/2.
+    #: Refined sync-onset sample = time_sample - template_length//2 + sample_epoch_offset_samples.
+    sample_epoch_offset_samples: float
+
+
+def _parabolic_subpixel(row: np.ndarray, idx: int) -> float:
+    """3-point parabolic interpolation: fractional peak offset from idx (in bin units).
+
+    Fits a downward parabola through (idx-1, idx, idx+1) and returns the
+    offset of its peak from idx.  Range is clamped to (-1, +1).  Returns 0.0
+    at array boundaries or when the local shape is not concave downward.
+
+    Math: for values A = row[idx-1], B = row[idx], C = row[idx+1] at positions
+    -1, 0, +1, the parabola peak is at  δ = 0.5*(A−C)/(A−2B+C).
+    """
+    if idx <= 0 or idx >= len(row) - 1:
+        return 0.0
+    a = float(row[idx - 1])
+    b = float(row[idx])
+    c = float(row[idx + 1])
+    denom = a - 2.0 * b + c
+    if denom >= -1e-10:   # flat or convex — not a valid peak
+        return 0.0
+    return float(np.clip(0.5 * (a - c) / denom, -1.0, 1.0))
 
 
 def extract_candidates(surface_cp, cfg: TFMFConfig,
@@ -182,8 +234,6 @@ def extract_candidates(surface_cp, cfg: TFMFConfig,
     floor.
 
     TODO: this is the simplest possible peak-picker.  Improvements:
-        - 2D local-max filter (suppress same-burst multi-detection)
-        - Parabolic interpolation around the peak for sub-bin freq
         - Coherent integration across multiple frames (later)
     """
     if not _HAS_CUPY:
@@ -202,32 +252,44 @@ def extract_candidates(surface_cp, cfg: TFMFConfig,
     snr_lin = magnitude / noise_floor[None, :]
     snr_db = 20.0 * cp.log10(snr_lin)
 
-    # Above threshold mask
-    above = snr_db > cfg.threshold_db                         # bool (n_win, n_freq)
-    if not bool(above.any()):
+    # 2-D local-max peak filter: keeps only the highest-SNR cell within
+    # each (peak_picking_time_windows × footprint_f) neighbourhood.
+    # Collapses a single ping's ~75-cell above-threshold cluster to 1.
+    n_freq = surface_cp.shape[1]
+    freq_res = cfg.sample_rate_hz / n_freq
+    footprint_t = cfg.peak_picking_time_windows
+    footprint_f = max(1, round(2.0 * cfg.peak_picking_freq_hz / freq_res))
+    if footprint_f % 2 == 0:
+        footprint_f += 1
+
+    from cupyx.scipy.ndimage import maximum_filter as _mf_gpu   # type: ignore[import-not-found]
+    local_max = _mf_gpu(snr_db, size=(footprint_t, footprint_f),
+                         mode='constant', cval=float('-inf'))
+    is_peak = (snr_db >= local_max - 1e-6) & (snr_db > cfg.threshold_db)
+
+    if not bool(is_peak.any()):
         return []
 
-    # Pull to CPU to do the (small) post-processing.  TODO: do peak-
-    # picking on GPU too once volume justifies it.
-    above_np = cp.asnumpy(above)
-    snr_db_np = cp.asnumpy(snr_db)
+    is_peak_np  = cp.asnumpy(is_peak)
+    snr_db_np   = cp.asnumpy(snr_db)
     magnitude_np = cp.asnumpy(magnitude)
-    n_freq = surface_cp.shape[1]
 
     # Frequency axis: FFT bins map to fftfreq(n_freq, 1/fs).  Bins 0..n/2
     # are positive freqs; n/2..n-1 wrap to negative.
     freq_axis = np.fft.fftfreq(n_freq, 1.0 / cfg.sample_rate_hz)
 
     out: list[Candidate] = []
-    win_idxs, freq_idxs = np.where(above_np)
+    win_idxs, freq_idxs = np.where(is_peak_np)
     for t, f in zip(win_idxs.tolist(), freq_idxs.tolist()):
         sample_idx = t * cfg.stride_samples + template_length // 2
+        delta_t    = _parabolic_subpixel(magnitude_np[:, f], t)
         out.append(Candidate(
             time_sample=int(sample_idx),
             time_s=float(sample_idx / cfg.sample_rate_hz),
             freq_hz=float(freq_axis[f]),
             snr_db=float(snr_db_np[t, f]),
             raw_magnitude=float(magnitude_np[t, f]),
+            sample_epoch_offset_samples=delta_t * cfg.stride_samples,
         ))
     return out
 
@@ -242,8 +304,8 @@ def extract_candidates_cpu(surface: np.ndarray, cfg: TFMFConfig,
     sensitivity-test driver in ``test_sensitivity.py``.
 
     Per-freq-bin noise floor estimated as the median magnitude across
-    windows.  Detections are bins above ``cfg.threshold_db`` over their
-    per-bin noise floor.
+    windows.  A 2-D local-max filter then collapses each ping cluster to
+    exactly one candidate before applying the SNR threshold.
     """
     if surface.shape[0] == 0:
         return []
@@ -252,23 +314,38 @@ def extract_candidates_cpu(surface: np.ndarray, cfg: TFMFConfig,
     noise_floor = np.maximum(noise_floor, 1e-30)
     snr_lin = magnitude / noise_floor[None, :]
     snr_db = 20.0 * np.log10(snr_lin)
-    above = snr_db > cfg.threshold_db
-    if not above.any():
+
+    # 2-D local-max peak filter: keeps only the highest-SNR cell within
+    # each (peak_picking_time_windows × footprint_f) neighbourhood.
+    n_freq = surface.shape[1]
+    freq_res = cfg.sample_rate_hz / n_freq
+    footprint_t = cfg.peak_picking_time_windows
+    footprint_f = max(1, round(2.0 * cfg.peak_picking_freq_hz / freq_res))
+    if footprint_f % 2 == 0:
+        footprint_f += 1
+
+    from scipy.ndimage import maximum_filter as _mf
+    local_max = _mf(snr_db, size=(footprint_t, footprint_f),
+                    mode='constant', cval=float('-inf'))
+    is_peak = (snr_db >= local_max - 1e-6) & (snr_db > cfg.threshold_db)
+
+    if not is_peak.any():
         return []
 
-    n_freq = surface.shape[1]
     freq_axis = np.fft.fftfreq(n_freq, 1.0 / cfg.sample_rate_hz)
 
     out: list[Candidate] = []
-    win_idxs, freq_idxs = np.where(above)
+    win_idxs, freq_idxs = np.where(is_peak)
     for t, f in zip(win_idxs.tolist(), freq_idxs.tolist()):
         sample_idx = t * cfg.stride_samples + template_length // 2
+        delta_t    = _parabolic_subpixel(magnitude[:, f], t)
         out.append(Candidate(
             time_sample=int(sample_idx),
             time_s=float(sample_idx / cfg.sample_rate_hz),
             freq_hz=float(freq_axis[f]),
             snr_db=float(snr_db[t, f]),
             raw_magnitude=float(magnitude[t, f]),
+            sample_epoch_offset_samples=delta_t * cfg.stride_samples,
         ))
     return out
 
@@ -276,7 +353,7 @@ def extract_candidates_cpu(surface: np.ndarray, cfg: TFMFConfig,
 # ── Convenience entry point ─────────────────────────────────────────────────
 
 
-def detect(iq: np.ndarray, template: np.ndarray,
+def detect(iq: np.ndarray, template: np.ndarray | None = None,
            cfg: TFMFConfig | None = None,
            use_gpu: bool = True
            ) -> list[Candidate]:
@@ -286,8 +363,11 @@ def detect(iq: np.ndarray, template: np.ndarray,
     ----------
     iq : complex64 ndarray, shape (n_samples,)
         Input IQ at ``cfg.sample_rate_hz``.
-    template : complex64 ndarray, shape (N,)
+    template : complex64 ndarray, shape (N,) or None
         Sync template at the same sample rate (see ``sync_template.py``).
+        If None, the template is built from ``cfg``: dual-sync (1536 samples,
+        +3 dB gain) when ``cfg.use_dual_sync`` is True (the default), or
+        single-sync (192 samples) otherwise.
     cfg : TFMFConfig
         Detector config.  Default config = 48 kHz, stride=24, threshold=10 dB.
     use_gpu : bool
@@ -299,6 +379,12 @@ def detect(iq: np.ndarray, template: np.ndarray,
     """
     if cfg is None:
         cfg = TFMFConfig()
+
+    if template is None:
+        if cfg.use_dual_sync:
+            template = _sync_template.build_dual_sync_template(cfg.sample_rate_hz)
+        else:
+            template = _sync_template.build_sync_template(cfg.sample_rate_hz)
 
     if use_gpu and _HAS_CUPY:
         iq_cp = cp.asarray(iq, dtype=cp.complex64)
