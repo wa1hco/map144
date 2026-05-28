@@ -190,16 +190,60 @@ def load_capture(wav_path: Path) -> tuple[np.ndarray, dict]:
             audio_bytes = data[pos:pos+chunk_size]
         pos += chunk_size
 
-    if audio_bytes is None or fmt_code != 3 or n_channels not in (2, 4):
-        raise ValueError(f"Expected stereo or 4-ch float32 capture WAV: {wav_path}")
-
-    interleaved = np.frombuffer(audio_bytes, dtype=np.float32)
-    if n_channels == 4:
-        h = (interleaved[0::4] + 1j * interleaved[1::4]).astype(np.complex64)
-        v = (interleaved[2::4] + 1j * interleaved[3::4]).astype(np.complex64)
-        iq = np.stack([h, v], axis=1)   # shape (N, 2)
+    # Accept three formats:
+    #   (a) stereo / 4-ch float32 IQ capture     — MAP144 capture format
+    #   (b) mono 16-bit / 32-bit-int real audio  — MAP144 burst WAV (12 kHz)
+    #         or WSJT-X save (12 kHz).  Treated as audio centred on the
+    #         calling-freq channel; Hilbert-transformed → complex baseband
+    #         and resampled to 48 kHz so the downstream pipeline (channelizer,
+    #         TFMF, etc.) sees a 48 kHz complex IQ stream just like (a).
+    is_audio_burst = False
+    if audio_bytes is not None and fmt_code == 3 and n_channels in (2, 4):
+        # Format (a) — float32 IQ capture.
+        interleaved = np.frombuffer(audio_bytes, dtype=np.float32)
+        if n_channels == 4:
+            h = (interleaved[0::4] + 1j * interleaved[1::4]).astype(np.complex64)
+            v = (interleaved[2::4] + 1j * interleaved[3::4]).astype(np.complex64)
+            iq = np.stack([h, v], axis=1)   # shape (N, 2)
+        else:
+            iq = (interleaved[0::2] + 1j * interleaved[1::2]).astype(np.complex64)
+        load_sr = sample_rate or _SAMPLE_RATE
+    elif (audio_bytes is not None and fmt_code == 1
+            and n_channels == 1 and sampwidth in (2, 4)
+            and sample_rate is not None):
+        # Format (b) — mono real audio (12 kHz burst or WSJT-X save).
+        # Convert to complex baseband and resample to 48 kHz so the
+        # downstream code path is uniform.  scipy.signal is the only
+        # external dep needed; both Hilbert and resample_poly are stable
+        # and well-vectorised for the ~30 k-sample burst lengths we see.
+        from scipy import signal as _sps
+        if sampwidth == 2:
+            audio = (np.frombuffer(audio_bytes, dtype=np.int16)
+                     .astype(np.float32) / 32768.0)
+        else:  # sampwidth == 4 (int32, rare but supported)
+            audio = (np.frombuffer(audio_bytes, dtype=np.int32)
+                     .astype(np.float32) / 2147483648.0)
+        # Hilbert → analytic signal at the original sample rate.
+        analytic = _sps.hilbert(audio).astype(np.complex64)
+        # Resample to 48 kHz so AnalysisEngine + TFMF see their expected rate.
+        target_sr = 48_000
+        if sample_rate != target_sr:
+            up = target_sr // sample_rate
+            down = 1
+            # Use polyphase resample for clean upsample.
+            iq = _sps.resample_poly(analytic, up, down).astype(np.complex64)
+        else:
+            iq = analytic
+        load_sr = target_sr
+        is_audio_burst = True
+        # Default dual_pol = False; the file is mono so we have no V.
+        n_channels = 2   # for the dual_pol-default check below
     else:
-        iq = (interleaved[0::2] + 1j * interleaved[1::2]).astype(np.complex64)
+        raise ValueError(
+            f"Unsupported WAV format ({wav_path}): "
+            f"fmt={fmt_code}, ch={n_channels}, width={sampwidth}.  "
+            f"Expected stereo/4-ch float32 capture or mono 16-bit audio burst."
+        )
 
     meta = {}
     if json_path.exists():
@@ -208,15 +252,21 @@ def load_capture(wav_path: Path) -> tuple[np.ndarray, dict]:
         except Exception:
             pass
 
-    # Fill defaults for any missing metadata keys
-    meta.setdefault('center_freq_mhz', 0.0)
-    meta.setdefault('sample_rate',     sample_rate or _SAMPLE_RATE)
+    # Fill defaults for any missing metadata keys.  ``sample_rate`` reflects
+    # what the engine will see (48 kHz for both capture and resampled-burst
+    # paths) — NOT the source WAV's native rate.
+    meta.setdefault('center_freq_mhz', 50.260)
+    meta.setdefault('sample_rate',     load_sr)
     meta.setdefault('source',          'unknown')
     meta.setdefault('nb_factor',       6.0)
     meta.setdefault('nb_enabled',      True)
     meta.setdefault('is_test_wav',     False)
     meta.setdefault('source_wav_path', None)
     meta.setdefault('dual_pol',        n_channels == 4)
+    # Tag the audio-burst path so the analysis window can adapt its display
+    # (the IQ wideband spectrogram and channel-SNR heatmap aren't physically
+    # meaningful here — the source had only ~0..2.7 kHz of audio content).
+    meta.setdefault('source_was_audio', is_audio_burst)
 
     return iq, meta
 

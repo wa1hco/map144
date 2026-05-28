@@ -801,7 +801,8 @@ def extract_and_decode(
                 msg_safe  = re.sub(r'[^A-Za-z0-9]+', '_', full_msg).strip('_')
                 rf_int    = int(round(radio_khz))
                 save_name = f"{_ts_file}_{rf_int}kHz_{msg_safe}.wav"
-                shutil.move(tmp_path, str(out_dir / save_name))
+                _saved_wav_path = str(out_dir / save_name)
+                shutil.move(tmp_path, _saved_wav_path)
                 _pol_str = f"  θ={theta_deg:.0f}°" if dual_pol else ""
                 print(f"[MSK144 SPD]  t={t_sec:.2f}s  radio={radio_khz:.3f} kHz{_pol_str}"
                       f"  det={det_source}  navg={spd_navg}  {full_msg}", flush=True)
@@ -820,6 +821,7 @@ def extract_and_decode(
                         'audio':     audio.copy(),
                         'theta_deg': round(theta_deg, 1),
                         'dphi_deg':  round(dphi_deg, 1),
+                        'wav_path':  _saved_wav_path,
                     })
 
                 decode_entry = {
@@ -932,7 +934,8 @@ def extract_and_decode(
                     msg_safe  = re.sub(r'[^A-Za-z0-9]+', '_', full_msg).strip('_')
                     rf_int    = int(round(radio_khz))
                     save_name = f"{_ts_file}_{rf_int}kHz_{msg_safe}.wav"
-                    shutil.move(tmp_path, str(out_dir / save_name))
+                    _saved_wav_path = str(out_dir / save_name)
+                    shutil.move(tmp_path, _saved_wav_path)
                     _pol_str = f"  θ={theta_deg:.0f}°" if dual_pol else ""
                     print(f"[MSK144 DECODE]  t={t_sec:.2f}s  radio={radio_khz:.3f} kHz{_pol_str}"
                           f"  det={det_source}  {decoded}", flush=True)
@@ -951,6 +954,7 @@ def extract_and_decode(
                             'audio':     audio.copy(),
                             'theta_deg': round(theta_deg, 1),
                             'dphi_deg':  round(dphi_deg, 1),
+                            'wav_path':  _saved_wav_path,
                         })
 
                     decode_entry = {

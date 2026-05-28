@@ -566,6 +566,14 @@ def setup_ui(self):
         "QListWidget { background: #1a1a1a; color: #e0e0e0; border: 1px solid #555; }"
         "QListWidget::item { padding: 2px 4px; }"
     )
+    # Right-click context menu — opens the AnalysisWindow on the WAV that
+    # was saved for the right-clicked decode.  WAV path is stashed in the
+    # item's data at Qt.UserRole + 1 by displays.py when the decode arrives;
+    # see detection.py for where the path is added to the decode_queue dict.
+    self.decode_panel.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+    self.decode_panel.customContextMenuRequested.connect(
+        lambda pos: _on_decode_panel_context_menu(self, pos)
+    )
     central = QtWidgets.QWidget()
     self.setCentralWidget(central)
     central_vbox = QtWidgets.QVBoxLayout(central)
@@ -811,6 +819,10 @@ def setup_ui(self):
     self._age_timer = QtCore.QTimer()
     self._age_timer.timeout.connect(lambda: recolor_decode_panel(self.decode_panel))
     self._age_timer.start(15_000)   # recolor every 15 s
+
+    # Populate decode_panel with recent history from decodes.jsonl so a
+    # restart doesn't lose the operator's right-click access to past WAVs.
+    _restore_decode_history(self, n=200)
 
 
 def on_min_level_changed(self, value):
@@ -1163,6 +1175,123 @@ def _on_fast_graph_click(self, x_sec, y_mhz, modifiers, window='current'):
 
     if modifiers & Qt.ShiftModifier:
         _open_analysis_window(self, wav_path)
+
+
+def _restore_decode_history(self, n: int = 200) -> None:
+    """Populate ``self.decode_panel`` with the last ``n`` decoded entries
+    from ``decodes.jsonl`` on startup.
+
+    Without this, every restart wipes the panel and the operator loses
+    right-click access to the saved-burst WAVs that were generated in
+    previous sessions (the WAVs are still on disk in
+    ``MSK144/detections/`` — only the panel state is volatile).  We
+    reconstruct each item using the same display format as the live
+    add-on path in ``displays.py``, and stash the reconstructed WAV path
+    on the item so the context-menu lookup works for restored entries
+    too.
+
+    The age timestamp is the decode's own launch time so the existing
+    ``recolor_decode_panel`` ages restored items correctly.
+    """
+    import json
+    import re
+    import time as _time
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from .detection import production_output_dir
+    from .displays import _align_msk144_message, _age_color
+
+    log_path = production_output_dir() / 'decodes.jsonl'
+    if not log_path.exists():
+        return
+    try:
+        with log_path.open() as f:
+            lines = f.readlines()
+    except OSError:
+        return
+    if not lines:
+        return
+
+    recent = lines[-n:]
+    calling_khz = float(self.calling_freq_mhz) * 1000.0
+
+    # Insert items in REVERSE-chronological order from the panel's
+    # perspective (insertItem(0, …) puts new ones on top), so we walk
+    # from oldest to newest and insertItem(0) each.
+    for raw in recent:
+        try:
+            r = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        msg = r.get('message') or ''
+        if not msg:
+            continue
+        ts_str    = r.get('timestamp', '')
+        radio_khz = r.get('radio_khz')
+        if radio_khz is None:
+            continue
+        snr       = r.get('jt9_snr_db')
+        theta_deg = r.get('theta_deg')
+
+        # Parse timestamp once for both display and WAV-path components.
+        try:
+            ts_dt = datetime.strptime(ts_str, "%Y-%m-%d_%H:%M:%S.%f").replace(
+                tzinfo=timezone.utc)
+        except ValueError:
+            try:
+                ts_dt = datetime.strptime(ts_str, "%Y-%m-%d_%H:%M:%S").replace(
+                    tzinfo=timezone.utc)
+            except ValueError:
+                continue
+
+        utc_time = ts_dt.strftime('%H:%M:%S')
+        df_hz    = int(round((float(radio_khz) - calling_khz) * 1000))
+        pol_str  = (f"{int(round(theta_deg)):3d}°"
+                    if theta_deg is not None else "  --")
+        snr_str  = f"{int(snr):+d} dB" if snr is not None else "     ?"
+
+        item = QtWidgets.QListWidgetItem(
+            f"{utc_time}  {float(radio_khz):9.3f}  {df_hz:+5d}  "
+            f"{pol_str}  {snr_str:>7}  {_align_msk144_message(msg)}"
+        )
+        epoch = ts_dt.timestamp()
+        item.setData(QtCore.Qt.UserRole, epoch)
+        item.setForeground(_age_color(max(0.0, _time.time() - epoch)))
+
+        # Reconstruct the saved-burst WAV path so the right-click menu
+        # works on restored entries.  Path template matches detection.py:
+        #   YYYYMMDD_HHMMSSZ_<rf_int>kHz_<msg_safe>.wav
+        ts_file = ts_dt.strftime('%Y%m%d_%H%M%SZ')
+        msg_safe = re.sub(r'[^A-Za-z0-9]+', '_', msg).strip('_')
+        rf_int = int(round(float(radio_khz)))
+        wav_path = (production_output_dir() /
+                    f"{ts_file}_{rf_int}kHz_{msg_safe}.wav")
+        if wav_path.exists():
+            item.setData(QtCore.Qt.UserRole + 1, str(wav_path))
+
+        self.decode_panel.insertItem(0, item)
+
+
+def _on_decode_panel_context_menu(self, pos):
+    """Right-click on the main-window decode list: offer to open the
+    just-decoded burst's saved WAV in the AnalysisWindow.  The WAV path is
+    stashed on each QListWidgetItem at ``Qt.UserRole + 1`` by displays.py.
+    Items with no path (e.g. a decode from a replay where the burst WAV
+    wasn't saved) get a greyed-out menu entry explaining why.
+    """
+    from pathlib import Path
+    item = self.decode_panel.itemAt(pos)
+    if item is None:
+        return
+    wav_path = item.data(QtCore.Qt.UserRole + 1)
+    menu = QtWidgets.QMenu(self.decode_panel)
+    if wav_path and Path(wav_path).exists():
+        act = menu.addAction(f"Open in Analysis Window  ({Path(wav_path).name})")
+        act.triggered.connect(lambda: _open_analysis_window(self, wav_path))
+    else:
+        act = menu.addAction("(no saved WAV for this decode)")
+        act.setEnabled(False)
+    menu.exec_(self.decode_panel.viewport().mapToGlobal(pos))
 
 
 def _open_analysis_window(self, wav_path):

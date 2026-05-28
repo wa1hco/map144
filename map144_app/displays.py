@@ -364,6 +364,11 @@ def update_displays(self):
                 )
                 _item.setForeground(_age_color(0))        # brand-new — white
                 _item.setData(QtCore.Qt.UserRole, time.time())
+                # Stash the saved-burst WAV path so the right-click context
+                # menu in the main window can open it in the AnalysisWindow.
+                _wav_path = result.get('wav_path')
+                if _wav_path:
+                    _item.setData(QtCore.Qt.UserRole + 1, str(_wav_path))
                 self.decode_panel.insertItem(0, _item)
                 # Forward to reporter (WSJT-X UDP + PSKReporter).
                 # Suppress reporting when replaying a WAV file — test signals
