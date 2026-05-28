@@ -343,7 +343,8 @@ class AnalysisWindow(QtWidgets.QWidget):
         row_ft = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self._row_ft = row_ft
         self._env_plot = pg.PlotWidget(
-            title="|IQ| envelope, dB above pct25 (per-burst noise reference)")
+            title="TFMF peak SNR per time row  "
+                  "(max over freq, dB above per-bin pct25)")
         self._env_plot.setLabel('left', 'dB')
         self._env_plot.getAxis('bottom').hide()
         self._env_plot.setAspectLocked(False)
@@ -351,20 +352,20 @@ class AnalysisWindow(QtWidgets.QWidget):
         self._env_curve = pg.PlotCurveItem(pen=pg.mkPen((100, 180, 255), width=1.5),
                                             connect='finite')
         self._env_plot.addItem(self._env_curve)
-        # Burst threshold reference line at +6 dB above pct25.  pct25 sits
-        # ~3.82 dB below median on AWGN, so a "+4 dB above median" burst is
-        # a "+7.8 dB above pct25" burst — round to 6 dB so weaker bursts
-        # are still marked.
+        # Burst threshold reference line = TFMF's own detector threshold
+        # (17.3 dB above pct25 = same FA rate as 13.5 dB above median on
+        # AWGN).  A peak crossing this line is what TFMF itself would have
+        # flagged as a candidate at that instant.
         self._env_thresh_line = pg.InfiniteLine(
-            pos=6.0, angle=0,
+            pos=17.3, angle=0,
             pen=pg.mkPen('r', width=1, style=QtCore.Qt.DashLine),
         )
         self._env_plot.addItem(self._env_thresh_line)
         row_ft.addWidget(self._env_plot)
 
         self._ift_plot = pg.PlotWidget(
-            title="Instantaneous carrier freq  (offset from IQ centre)   "
-                  "grey = sub-threshold,  green = in-burst"
+            title="TFMF peak freq per time row  (argmax over freq)   "
+                  "grey = below 17.3 dB,  green = above"
         )
         self._ift_plot.setLabel('left',   'Freq (Hz)')
         self._ift_plot.setLabel('bottom', 'Time (s)')
@@ -914,21 +915,28 @@ class AnalysisWindow(QtWidgets.QWidget):
             _set_tfmf(self._tfmf_plot_v, self._tfmf_img_v, self._tfmf_scatter_v,
                        results.get('tfmf_surface_v'), results.get('tfmf_candidates_v', []))
 
-        # ── Freq-vs-time + envelope traces (audio-frame, calling-freq-centric) ─
+        # ── Freq-vs-time + envelope traces (derived from TFMF surface) ─────
         _ift_f   = results.get('inst_freq_audio')
         _ift_t   = results.get('inst_freq_t')
         _env_db  = results.get('env_db')
         if _ift_f is not None and _ift_t is not None and _ift_t.size > 0:
             # Envelope (top sub-plot)
             self._env_curve.setData(_ift_t, _env_db)
-            _env_lo = float(np.min(_env_db)) - 1.0 if _env_db is not None and _env_db.size else -5
-            _env_hi = max(8.0, float(np.max(_env_db)) + 1.0) if _env_db is not None and _env_db.size else 12
+            _env_lo = (float(np.min(_env_db)) - 1.0
+                       if _env_db is not None and _env_db.size else -5)
+            _env_hi = (max(20.0, float(np.max(_env_db)) + 2.0)
+                       if _env_db is not None and _env_db.size else 22)
             self._env_plot.setXRange(0, duration, padding=0)
             self._env_plot.setYRange(_env_lo, _env_hi, padding=0)
 
-            # Inst-freq scatter — split by burst threshold (+4 dB above median).
-            _ENV_THRESH_DB = 4.0
-            _is_burst = _env_db > _ENV_THRESH_DB if _env_db is not None else None
+            # Burst-vs-noise classification at TFMF's own detector threshold
+            # (17.3 dB above per-bin pct25).  Points above = "what TFMF would
+            # have flagged as a candidate at this instant"; below = "what
+            # TFMF saw as noise" so the operator can still see where the
+            # argmax was wandering.
+            _TFMF_THRESH_DB = 17.3
+            _is_burst = (_env_db > _TFMF_THRESH_DB
+                          if _env_db is not None else None)
             if _is_burst is None or not np.any(_is_burst):
                 self._ift_scatter_sub.setData(x=_ift_t, y=_ift_f)
                 self._ift_scatter_burst.setData(x=[], y=[])
@@ -938,20 +946,25 @@ class AnalysisWindow(QtWidgets.QWidget):
                 self._ift_scatter_burst.setData(
                     x=_ift_t[_is_burst], y=_ift_f[_is_burst])
             self._ift_plot.setXRange(0, duration, padding=0)
-            # Y-range: auto-fit to the in-burst points (the ones the operator
-            # cares about); fall back to all points; final fallback ±200 Hz.
-            _y_for_range = (_ift_f[_is_burst]
-                            if _is_burst is not None and np.any(_is_burst)
-                            else _ift_f)
-            if _y_for_range.size > 0:
-                _y_med = float(np.median(_y_for_range))
-                _y_dev = max(50.0,
-                              float(np.std(_y_for_range)) * 3.0,
-                              float(np.max(np.abs(_y_for_range - _y_med))) + 20.0)
-                self._ift_plot.setYRange(_y_med - _y_dev, _y_med + _y_dev,
-                                          padding=0)
+            # Y-range: for audio-burst sources clamp to the audio band so
+            # noise-driven argmax scatter outside 0..6 kHz doesn't dominate;
+            # otherwise auto-fit to the in-burst (TFMF-flagged) points.
+            if _is_audio:
+                self._ift_plot.setYRange(-200, 6500, padding=0)
             else:
-                self._ift_plot.setYRange(-200, 200, padding=0)
+                _y_for_range = (_ift_f[_is_burst]
+                                if _is_burst is not None and np.any(_is_burst)
+                                else _ift_f)
+                if _y_for_range.size > 0:
+                    _y_med = float(np.median(_y_for_range))
+                    _y_dev = max(50.0,
+                                  float(np.std(_y_for_range)) * 3.0,
+                                  float(np.max(np.abs(_y_for_range - _y_med)))
+                                  + 20.0)
+                    self._ift_plot.setYRange(_y_med - _y_dev, _y_med + _y_dev,
+                                              padding=0)
+                else:
+                    self._ift_plot.setYRange(-200, 200, padding=0)
         else:
             self._env_curve.setData([], [])
             self._ift_scatter_sub.setData(x=[], y=[])

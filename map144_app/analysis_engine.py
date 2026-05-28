@@ -45,6 +45,43 @@ def fc_mhz_calling(engine) -> float:
     return float(getattr(engine, 'center_freq_mhz', 50.260))
 
 
+def _tfmf_peak_freq_envelope(surface: np.ndarray
+                              ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-time-row peak freq and peak SNR-dB from a TFMF SNR-dB surface.
+
+    ``surface`` is the fftshifted (n_windows, n_freq_bins) float32 SNR-dB
+    array returned by ``_build_tfmf_display_surface``.  This function
+    reduces it to two 1-D traces aligned to the same time axis the TFMF
+    surface uses, so the freq-vs-time + envelope plots show literally
+    "what TFMF saw at each instant" — no parallel estimator.
+
+    Returns
+    -------
+    peak_freq_hz : (n_windows,) float32 — argmax-bin freq, in Hz, signed,
+                   relative to the IQ centre (TFMF's freq convention).
+    t_centre_s   : (n_windows,) float32 — centre time of each MF window
+                   from the start of the input IQ, in seconds.
+    peak_snr_db  : (n_windows,) float32 — max SNR-dB across freq per row;
+                   reads as "dB above pct25 of |MF| in that bin" because
+                   the surface itself is built that way.
+    """
+    # TFMF display constants — kept in sync with processing.py.  We import
+    # them late to avoid a circular import at module load time.
+    from .processing import (_TFMF_DISP_FS_HZ as _FS,
+                              _TFMF_DISP_STRIDE as _STRIDE,
+                              _TFMF_DISP_TMPL_N as _N)
+    n_win, n_freq = surface.shape
+    peak_bin = np.argmax(surface, axis=1)                # (n_win,)
+    peak_snr = surface[np.arange(n_win), peak_bin].astype(np.float32)
+    # Display surface is fftshifted (DC at centre column); recover signed
+    # freq via fftshift'd fftfreq.
+    freq_axis_shifted = np.fft.fftshift(np.fft.fftfreq(n_freq, 1.0 / _FS))
+    peak_freq = freq_axis_shifted[peak_bin].astype(np.float32)
+    # Time at the centre of each MF window.
+    t_centre = ((np.arange(n_win) * _STRIDE + _N // 2) / _FS).astype(np.float32)
+    return peak_freq, t_centre, peak_snr
+
+
 def _analysis_freq_vs_time(iq: np.ndarray, sample_rate_hz: int,
                             win_s: float = 0.064,
                             ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -307,18 +344,26 @@ class AnalysisEngine(Engine):
             tfmf_candidates_v = [c for c in tfmf_candidates_v
                                  if _AUDIO_F_MIN_HZ <= c.freq_hz <= _AUDIO_F_MAX_HZ]
 
-        # ── Instantaneous carrier-freq trace (audio frame) ────────────────
-        # Squared-FFT carrier estimator on the channelizer-mixed-down audio
-        # at the calling-freq channel.  Same algorithm as
-        # tools/measure_ping_freq_vs_time.py — produces the kind of
-        # freq-vs-time plot in docs/figures/freq_vs_time_corpus/.
+        # ── Instantaneous carrier-freq + envelope from TFMF surface ────────
+        # Derive both freq-vs-time and the envelope DIRECTLY from the TFMF
+        # surface (rather than a separate squared-FFT estimator).  Whatever
+        # we plot here is then provably "what TFMF saw" at each instant —
+        # which is the whole point of the analysis window.  Method:
+        #
+        #   freq trace : argmax across freq per time row → tfmf's strongest
+        #                peak's freq at that instant (in MAP144 audio-Hz)
+        #   envelope   : max SNR-dB across freq per time row → tfmf's
+        #                strongest peak's SNR-dB at that instant (already
+        #                in "dB above pct25 per-bin noise floor")
         inst_freq_audio = None; inst_freq_t = None; env_db = None
-        try:
-            inst_freq_audio, inst_freq_t, env_db = _analysis_freq_vs_time(
-                iq_h_arr, rate)
-        except Exception as _e:
-            import logging as _lg
-            _lg.getLogger(__name__).warning("Analysis freq-vs-time failed: %s", _e)
+        if tfmf_surface_h is not None and tfmf_surface_h.size:
+            try:
+                inst_freq_audio, inst_freq_t, env_db = \
+                    _tfmf_peak_freq_envelope(tfmf_surface_h)
+            except Exception as _e:
+                import logging as _lg
+                _lg.getLogger(__name__).warning(
+                    "TFMF-derived freq/envelope failed: %s", _e)
 
         return {
             'spectrogram_data':   self.spectrogram_data,
