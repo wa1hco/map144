@@ -36,6 +36,112 @@ from .engine import Engine
 from .processing import NB_FFT_SIZE
 
 
+# ── Helpers for the analysis-window freq-vs-time plot ────────────────────────
+
+
+def fc_mhz_calling(engine) -> float:
+    """Calling-freq estimate for ``engine``.  AnalysisEngine sets
+    ``center_freq_mhz`` to the calling freq during __init__."""
+    return float(getattr(engine, 'center_freq_mhz', 50.260))
+
+
+def _analysis_freq_vs_time(iq: np.ndarray, sample_rate_hz: int,
+                            win_s: float = 0.064,
+                            ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Squared-FFT instantaneous carrier estimator on complex IQ.
+
+    Same algorithm as ``tools/measure_ping_freq_vs_time.py::_instantaneous_freq``
+    but operates on the 48 kHz wideband IQ directly.  For each sliding
+    window: square the IQ (multiplies all freqs by 2), FFT, find the two
+    MSK tone images at 2·(f_calling ± 500 Hz), parabolic-interpolate each
+    bin, recover carrier as midpoint/2.
+
+    Returns
+    -------
+    f_carrier_hz : (n_windows,) — instantaneous carrier freq estimate,
+                   in Hz absolute (i.e. centred near calling freq, not 0).
+    t_centre_s   : (n_windows,) — window-centre time, seconds from start of IQ.
+    env_db       : (n_windows,) — magnitude envelope in dB above per-window median.
+    """
+    if iq.ndim != 1:
+        iq = iq.reshape(-1)
+    fs = float(sample_rate_hz)
+    n_win = max(256, int(win_s * fs) // 2 * 2)
+    step  = n_win // 4   # 25 % overlap
+    n_samp = iq.shape[0]
+    n_steps = max(0, (n_samp - n_win) // step + 1)
+    if n_steps == 0:
+        return (np.array([], dtype=np.float32),
+                np.array([], dtype=np.float32),
+                np.array([], dtype=np.float32))
+
+    sq = (iq.astype(np.complex64)) ** 2   # complex squared → tones at 2·f_carrier ± 1000 Hz
+    hann = np.hanning(n_win).astype(np.float32)
+    df = fs / n_win
+
+    # Target tones in the squared spectrum (complex FFT covers ±fs/2).
+    # Reference is "audio offset relative to calling freq" — here calling freq
+    # is the pan-centre + channel_offset.  AnalysisEngine sets center_freq_mhz
+    # to the calling freq, so for the offline path we treat the IQ as already
+    # centred on calling freq and look for tones at ±1000 Hz of DC.  (The 48 kHz
+    # capture IS centred on the pan; the calling freq is offset.  We compensate
+    # by mixing the carrier-offset out, see below.)
+    # Compensate for the channel_offset_hz between pan and calling:
+    # AnalysisEngine.center_freq_mhz IS the calling freq, so a mix is needed.
+    # For simplicity we estimate tones at ±1000 Hz of fc=0 in the de-mixed IQ.
+    # (For the operator's Flex pan=50.259 + calling=50.260, the offset is
+    # +1000 Hz, which we don't have access to here; passing fc_mhz tells us
+    # nothing about pan.)  Instead: search across the natural complex
+    # spectrum for two strong peaks 2 kHz apart and average them.
+    n_freq = n_win
+    bin_search_half = int(round(3000.0 / df))   # ±3 kHz search either side
+
+    f_carr  = np.zeros(n_steps, dtype=np.float32)
+    t_c     = np.zeros(n_steps, dtype=np.float32)
+    env_lin = np.zeros(n_steps, dtype=np.float32)
+
+    for k in range(n_steps):
+        start = k * step
+        seg = sq[start:start + n_win] * hann
+        spec = np.abs(np.fft.fftshift(np.fft.fft(seg)))
+        env_lin[k] = float(np.mean(np.abs(iq[start:start + n_win])))
+        # Find the two tallest peaks within the search range.
+        centre = n_freq // 2
+        lo_idx = max(0, centre - bin_search_half)
+        hi_idx = min(n_freq, centre + bin_search_half)
+        sub = spec[lo_idx:hi_idx]
+        if sub.size < 4:
+            continue
+        peak1 = int(np.argmax(sub))
+        # Zero out a window around peak1, find peak2.
+        guard = max(2, int(round(500.0 / df)))
+        sub2 = sub.copy()
+        sub2[max(0, peak1 - guard):peak1 + guard + 1] = 0
+        if not np.any(sub2):
+            continue
+        peak2 = int(np.argmax(sub2))
+
+        def _parabolic(arr, i):
+            if 1 <= i < arr.size - 1:
+                a, b, c = float(arr[i-1]), float(arr[i]), float(arr[i+1])
+                den = (a - 2*b + c)
+                if den != 0:
+                    return i + 0.5 * (a - c) / den
+            return float(i)
+
+        f1 = (_parabolic(sub, peak1) + lo_idx - centre) * df
+        f2 = (_parabolic(sub, peak2) + lo_idx - centre) * df
+        # In the squared-IQ spectrum, MSK tones appear at 2·(fc ± 500).
+        # The carrier estimate is the midpoint / 2.
+        f_carr[k] = float((f1 + f2) / 4.0)   # /2 for squaring, /2 for midpoint
+        t_c[k]    = (start + n_win / 2) / fs
+
+    # Envelope in dB above median (matches the figure's "dB above median").
+    env_lin = np.maximum(env_lin, 1e-12)
+    env_db = 20.0 * np.log10(env_lin / max(np.median(env_lin), 1e-12))
+    return f_carr.astype(np.float32), t_c.astype(np.float32), env_db.astype(np.float32)
+
+
 class AnalysisEngine(Engine):
     """DSP replay engine for offline IQ capture analysis.
 
@@ -148,6 +254,50 @@ class AnalysisEngine(Engine):
         if self.dual_pol:
             self.spectrogram_data_v = self.spec_staging_v.copy()
 
+        # ── TFMF surface for the whole capture ────────────────────────────
+        # Run synchronously on the loaded IQ (the background-thread periodic
+        # dispatcher may still have work in flight; bypass it for analysis).
+        # Uses the same _build_tfmf_display_surface as the live runtime, so
+        # what the operator sees here matches the live sync-det display.
+        from .processing import _build_tfmf_display_surface, _TFMF_PERIOD_SAMPLES
+        tfmf_surface_h = None; tfmf_candidates_h = []
+        tfmf_surface_v = None; tfmf_candidates_v = []
+        # H and V channels.  `iq` is 1D for single-pol, 2D (N,2) for dual.
+        if iq.ndim == 2 and iq.shape[1] >= 1:
+            iq_h_arr = iq[:, 0]
+            iq_v_arr = iq[:, 1] if iq.shape[1] >= 2 else None
+        else:
+            iq_h_arr = iq
+            iq_v_arr = None
+        try:
+            wb_h = (iq_h_arr[-_TFMF_PERIOD_SAMPLES:]
+                    if iq_h_arr.shape[0] >= _TFMF_PERIOD_SAMPLES else iq_h_arr)
+            tfmf_surface_h, tfmf_candidates_h = _build_tfmf_display_surface(wb_h)
+        except Exception as _e:
+            import logging as _lg
+            _lg.getLogger(__name__).warning("Analysis TFMF H compute failed: %s", _e)
+        if self.dual_pol and iq_v_arr is not None:
+            try:
+                wb_v = (iq_v_arr[-_TFMF_PERIOD_SAMPLES:]
+                        if iq_v_arr.shape[0] >= _TFMF_PERIOD_SAMPLES else iq_v_arr)
+                tfmf_surface_v, tfmf_candidates_v = _build_tfmf_display_surface(wb_v)
+            except Exception as _e:
+                import logging as _lg
+                _lg.getLogger(__name__).warning("Analysis TFMF V compute failed: %s", _e)
+
+        # ── Instantaneous carrier-freq trace (audio frame) ────────────────
+        # Squared-FFT carrier estimator on the channelizer-mixed-down audio
+        # at the calling-freq channel.  Same algorithm as
+        # tools/measure_ping_freq_vs_time.py — produces the kind of
+        # freq-vs-time plot in docs/figures/freq_vs_time_corpus/.
+        inst_freq_audio = None; inst_freq_t = None; env_db = None
+        try:
+            inst_freq_audio, inst_freq_t, env_db = _analysis_freq_vs_time(
+                iq_h_arr, rate)
+        except Exception as _e:
+            import logging as _lg
+            _lg.getLogger(__name__).warning("Analysis freq-vs-time failed: %s", _e)
+
         return {
             'spectrogram_data':   self.spectrogram_data,
             'spectrogram_data_v': self.spectrogram_data_v if self.dual_pol else None,
@@ -161,6 +311,13 @@ class AnalysisEngine(Engine):
             'duration_secs':      n / rate,
             'meta':               self._meta,
             'n_launched':         n_launched,
+            'tfmf_surface_h':     tfmf_surface_h,
+            'tfmf_candidates_h':  tfmf_candidates_h,
+            'tfmf_surface_v':     tfmf_surface_v,
+            'tfmf_candidates_v':  tfmf_candidates_v,
+            'inst_freq_audio':    inst_freq_audio,
+            'inst_freq_t':        inst_freq_t,
+            'env_db':             env_db,
         }
 
     # ------------------------------------------------------------------

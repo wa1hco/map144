@@ -324,8 +324,13 @@ _TFMF_TEMPLATE_48K_CP = None    # cupy.ndarray when _HAS_CUPY, else unused
 #                pan center 50.259 MHz; non-Rayleigh narrowband content.
 # Each entry is (lo_hz, hi_hz), inclusive lo / exclusive hi.
 _TFMF_EXCLUDED_BANDS_HZ = (
-    (-24500.0, -22000.0),
-    ( 22000.0,  24500.0),
+    # Extended to ±20-24 kHz after the first overnight bake: the band-edge
+    # cluster persisted past ±22 kHz into ±20-22 kHz (6.4 k cands in the
+    # +20..+22 bin alone, second-largest FA peak after the calling-freq
+    # channel).  ±20 kHz exclusion still leaves +0..+19 kHz audio search,
+    # well past the useful 6-m MSK144 band.
+    (-24500.0, -20000.0),
+    ( 20000.0,  24500.0),
     (-10500.0,  -9500.0),
 )
 

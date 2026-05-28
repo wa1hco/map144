@@ -214,6 +214,58 @@ class AnalysisWindow(QtWidgets.QWidget):
         row0.setStretchFactor(0, 1); row0.setStretchFactor(1, 0)
         rows_vsplit.addWidget(row0)
 
+        # ── Row TFMF: TFMF wideband matched-filter SNR surface ──────────────
+        # Image: (time × freq), ±24 kHz audio range, SNR-dB above per-bin
+        # pct25 noise floor.  Yellow circles overlay the peak-picked
+        # candidates (post all the live-runtime filters).
+        row_tfmf = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        row_tfmf_specs = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self._row_tfmf_specs = row_tfmf_specs
+
+        self._tfmf_plot = pg.PlotWidget(
+            title="H  TFMF Surface  (dual-sync, 48 kHz, ±24 kHz)   "
+                  "yellow = peak-picked candidates"
+        )
+        self._tfmf_plot.setLabel('left',   'H  Freq offset (kHz)')
+        self._tfmf_plot.getAxis('bottom').hide()
+        self._tfmf_img = pg.ImageItem(axisOrder='col-major')
+        self._tfmf_img.setColorMap(_COLORMAP)
+        self._tfmf_plot.addItem(self._tfmf_img)
+        self._tfmf_plot.setAspectLocked(False)
+        self._tfmf_plot.getViewBox().disableAutoRange()
+        self._tfmf_scatter = pg.ScatterPlotItem(
+            size=8, pen=pg.mkPen('y', width=1.5), brush=pg.mkBrush(None),
+            symbol='o',
+        )
+        self._tfmf_plot.addItem(self._tfmf_scatter)
+        row_tfmf_specs.addWidget(self._tfmf_plot)
+
+        self._tfmf_plot_v = pg.PlotWidget()
+        self._tfmf_plot_v.setLabel('left',   'V  Freq offset (kHz)')
+        self._tfmf_plot_v.setLabel('bottom', 'Time (s)')
+        self._tfmf_img_v = pg.ImageItem(axisOrder='col-major')
+        self._tfmf_img_v.setColorMap(_COLORMAP)
+        self._tfmf_plot_v.addItem(self._tfmf_img_v)
+        self._tfmf_plot_v.setAspectLocked(False)
+        self._tfmf_plot_v.getViewBox().disableAutoRange()
+        self._tfmf_scatter_v = pg.ScatterPlotItem(
+            size=8, pen=pg.mkPen('y', width=1.5), brush=pg.mkBrush(None),
+            symbol='o',
+        )
+        self._tfmf_plot_v.addItem(self._tfmf_scatter_v)
+        self._tfmf_plot_v.hide()
+        row_tfmf_specs.addWidget(self._tfmf_plot_v)
+
+        row_tfmf.addWidget(row_tfmf_specs)
+        row_tfmf.addWidget(_vslider_pane(
+            "TFMF dB",
+            '_tfmf_vmin_slider', (-5, 25),   0,
+            '_tfmf_vmax_slider', ( 5, 40),  20,
+            self._on_tfmf_level_changed,
+        ))
+        row_tfmf.setStretchFactor(0, 1); row_tfmf.setStretchFactor(1, 0)
+        rows_vsplit.addWidget(row_tfmf)
+
         # ── Row 1: Detection heatmaps (H always; V hidden until dual-pol) ─────
         row1 = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         row1_hms = QtWidgets.QSplitter(QtCore.Qt.Vertical)
@@ -274,6 +326,62 @@ class AnalysisWindow(QtWidgets.QWidget):
         row1.setStretchFactor(0, 1); row1.setStretchFactor(1, 0)
         rows_vsplit.addWidget(row1)
 
+        # ── Row FT: envelope + instantaneous carrier-freq trace ─────────────
+        # Mirrors docs/figures/freq_vs_time_corpus/freqtime_*.png — the
+        # squared-FFT carrier estimator shows fine-grained freq vs time
+        # so dual-Doppler paths (a ping with two reflection components at
+        # different velocities) become visually obvious.
+        row_ft = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self._row_ft = row_ft
+        self._env_plot = pg.PlotWidget(title="Envelope (dB above median)")
+        self._env_plot.setLabel('left', 'dB')
+        self._env_plot.getAxis('bottom').hide()
+        self._env_plot.setAspectLocked(False)
+        self._env_plot.getViewBox().disableAutoRange()
+        self._env_curve = pg.PlotCurveItem(pen=pg.mkPen((100, 180, 255), width=1.5),
+                                            connect='finite')
+        self._env_plot.addItem(self._env_curve)
+        # Burst-threshold reference line at +4 dB (matches measure_ping_freq_vs_time
+        # default ENV_THRESH_DB).
+        self._env_thresh_line = pg.InfiniteLine(
+            pos=4.0, angle=0,
+            pen=pg.mkPen('r', width=1, style=QtCore.Qt.DashLine),
+        )
+        self._env_plot.addItem(self._env_thresh_line)
+        row_ft.addWidget(self._env_plot)
+
+        self._ift_plot = pg.PlotWidget(
+            title="Instantaneous carrier freq  (offset from IQ centre)   "
+                  "grey = sub-threshold,  green = in-burst"
+        )
+        self._ift_plot.setLabel('left',   'Freq (Hz)')
+        self._ift_plot.setLabel('bottom', 'Time (s)')
+        self._ift_plot.setAspectLocked(False)
+        self._ift_plot.getViewBox().disableAutoRange()
+        # X-link the envelope and inst-freq plots so they pan/zoom together.
+        self._env_plot.getViewBox().setXLink(self._ift_plot.getViewBox())
+        # Sub-threshold points (grey).
+        self._ift_scatter_sub = pg.ScatterPlotItem(
+            size=4, pen=pg.mkPen(None),
+            brush=pg.mkBrush((180, 180, 180, 200)), symbol='o',
+        )
+        # In-burst points (green).
+        self._ift_scatter_burst = pg.ScatterPlotItem(
+            size=6, pen=pg.mkPen('g', width=1.5),
+            brush=pg.mkBrush((60, 220, 80, 180)), symbol='o',
+        )
+        self._ift_plot.addItem(self._ift_scatter_sub)
+        self._ift_plot.addItem(self._ift_scatter_burst)
+        # Zero-line reference (calling freq).
+        self._ift_zero_line = pg.InfiniteLine(
+            pos=0.0, angle=0,
+            pen=pg.mkPen((200, 200, 200, 90), width=1, style=QtCore.Qt.DashLine),
+        )
+        self._ift_plot.addItem(self._ift_zero_line)
+        row_ft.addWidget(self._ift_plot)
+        row_ft.setStretchFactor(0, 1); row_ft.setStretchFactor(1, 2)
+        rows_vsplit.addWidget(row_ft)
+
         # ── Row 2: (audio_plot | tone_plot) | audio_vsliders ─────────────────
         row2 = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
 
@@ -333,9 +441,23 @@ class AnalysisWindow(QtWidgets.QWidget):
                 for o in others:
                     o.setSizes(sizes)
             return _cb
-        row0.splitterMoved.connect(_sync_rows(row0, [row1, row2]))
-        row1.splitterMoved.connect(_sync_rows(row1, [row0, row2]))
-        row2.splitterMoved.connect(_sync_rows(row2, [row0, row1]))
+        # Keep the H/V-split rows in sync so the H pane / V pane heights
+        # match across IQ-spec, TFMF-surface, and sq_det-HM rows.
+        _sync_row_list = [row0, row_tfmf, row1]
+        for _src in _sync_row_list:
+            _others = [r for r in _sync_row_list if r is not _src]
+            _src.splitterMoved.connect(_sync_rows(_src, _others))
+
+        # Initial row heights — operator suggested:
+        #   IQ specs (row0)   shrunk to ~½ their default
+        #   TFMF surface      full
+        #   sq_det HM (row1)  shrunk to ~½
+        #   freq-vs-time (FT) full
+        #   audio + ping (r2) full
+        # Use stretch factors 2:3:2:3:3 → row0 / row1 get ~15 %, others ~23 %.
+        # Old layout was 1:1:1 (~33 % each), so row0 and row1 are ~½ of before.
+        for _idx, _f in enumerate((2, 3, 2, 3, 3)):
+            rows_vsplit.setStretchFactor(_idx, _f)
 
         # ── Right col pane 0: status counts + decode list ────────────────────
         _decode_pane = QtWidgets.QWidget()
@@ -622,9 +744,12 @@ class AnalysisWindow(QtWidgets.QWidget):
                 self._spec_plot_v.show()
             if not self._det_plot_v.isVisible():
                 self._det_plot_v.show()
+            if not self._tfmf_plot_v.isVisible():
+                self._tfmf_plot_v.show()
             # H pane: hide time axis (V pane below has it)
             self._spec_plot.getAxis('bottom').hide()
             self._det_plot.getAxis('bottom').hide()
+            self._tfmf_plot.getAxis('bottom').hide()
             # On transition to dual-pol: grow window height and equalize H/V splits.
             if not _prev_dual:
                 self._dual_shown = True
@@ -634,15 +759,18 @@ class AnalysisWindow(QtWidgets.QWidget):
                 # Defer until the event loop has processed the resize — calling
                 # setSizes immediately reads pre-resize heights and halves H.
                 def _equalize():
-                    for spl in (self._row0_specs, self._row1_hms):
+                    for spl in (self._row0_specs, self._row_tfmf_specs,
+                                 self._row1_hms):
                         spl.setSizes([10000, 10000])   # equal large values → 50/50
                 QtCore.QTimer.singleShot(0, _equalize)
         else:
             self._dual_shown = False
             self._spec_plot_v.hide()
             self._det_plot_v.hide()
+            self._tfmf_plot_v.hide()
             self._spec_plot.getAxis('bottom').show()
             self._det_plot.getAxis('bottom').show()
+            self._tfmf_plot.getAxis('bottom').show()
 
         # ── Spectrogram image ─────────────────────────────────────────────────
         # Y axis: frequency offset in kHz, ±rate/2 kHz
@@ -698,6 +826,88 @@ class AnalysisWindow(QtWidgets.QWidget):
         _set_hm(self._det_plot, self._det_img, hm)
         if dual and hm_v is not None:
             _set_hm(self._det_plot_v, self._det_img_v, hm_v)
+
+        # ── TFMF surface (H, optionally V) ────────────────────────────────────
+        # _tfmf_surface_* is (n_windows, n_freq_bins) float32 SNR-dB; axis 0
+        # is time (col-major image → X axis), axis 1 is freq fftshifted (DC
+        # in middle).  ±24 kHz on the 48 kHz IQ.
+        from .processing import (_TFMF_FREQ_MIN_KHZ as _TF_F_MIN,
+                                  _TFMF_FREQ_SPAN_KHZ as _TF_F_SPAN,
+                                  _TFMF_DISP_STRIDE as _TF_STRIDE,
+                                  _TFMF_DISP_FS_HZ as _TF_FS)
+        _tfmf_lvl = [self._tfmf_vmin_slider.value(), self._tfmf_vmax_slider.value()]
+        _tfmf_pan_offset_khz = (50.260 - fc_mhz) * 1000.0  # 0 when fc_mhz IS calling
+        # NB: AnalysisEngine sets center_freq_mhz to the calling freq, so the
+        # TFMF freq axis (relative to pan centre) lines up with the call-freq
+        # offset axis here.  No further translation needed for the rect.
+
+        def _set_tfmf(plot, img, scatter, surf, cands):
+            if surf is None:
+                img.setImage(np.zeros((1, 1), dtype=np.float32),
+                             autoLevels=False, levels=_tfmf_lvl)
+                scatter.setData(x=[], y=[])
+                return
+            n_win = surf.shape[0]
+            t_span = n_win * _TF_STRIDE / _TF_FS
+            _rect = QtCore.QRectF(0.0, _TF_F_MIN, t_span, _TF_F_SPAN)
+            img.setImage(surf, autoLevels=False, levels=_tfmf_lvl)
+            img.setRect(_rect)
+            plot.setXRange(0, duration, padding=0)
+            plot.setYRange(_TF_F_MIN - 0.5, _TF_F_MIN + _TF_F_SPAN + 0.5, padding=0)
+            if cands:
+                scatter.setData(x=[c.time_s for c in cands],
+                                y=[c.freq_hz / 1000.0 for c in cands])
+            else:
+                scatter.setData(x=[], y=[])
+
+        _set_tfmf(self._tfmf_plot, self._tfmf_img, self._tfmf_scatter,
+                   results.get('tfmf_surface_h'), results.get('tfmf_candidates_h', []))
+        if dual:
+            _set_tfmf(self._tfmf_plot_v, self._tfmf_img_v, self._tfmf_scatter_v,
+                       results.get('tfmf_surface_v'), results.get('tfmf_candidates_v', []))
+
+        # ── Freq-vs-time + envelope traces (audio-frame, calling-freq-centric) ─
+        _ift_f   = results.get('inst_freq_audio')
+        _ift_t   = results.get('inst_freq_t')
+        _env_db  = results.get('env_db')
+        if _ift_f is not None and _ift_t is not None and _ift_t.size > 0:
+            # Envelope (top sub-plot)
+            self._env_curve.setData(_ift_t, _env_db)
+            _env_lo = float(np.min(_env_db)) - 1.0 if _env_db is not None and _env_db.size else -5
+            _env_hi = max(8.0, float(np.max(_env_db)) + 1.0) if _env_db is not None and _env_db.size else 12
+            self._env_plot.setXRange(0, duration, padding=0)
+            self._env_plot.setYRange(_env_lo, _env_hi, padding=0)
+
+            # Inst-freq scatter — split by burst threshold (+4 dB above median).
+            _ENV_THRESH_DB = 4.0
+            _is_burst = _env_db > _ENV_THRESH_DB if _env_db is not None else None
+            if _is_burst is None or not np.any(_is_burst):
+                self._ift_scatter_sub.setData(x=_ift_t, y=_ift_f)
+                self._ift_scatter_burst.setData(x=[], y=[])
+            else:
+                self._ift_scatter_sub.setData(
+                    x=_ift_t[~_is_burst], y=_ift_f[~_is_burst])
+                self._ift_scatter_burst.setData(
+                    x=_ift_t[_is_burst], y=_ift_f[_is_burst])
+            self._ift_plot.setXRange(0, duration, padding=0)
+            # Y-range: auto-fit to the in-burst points (the ones the operator
+            # cares about); fall back to all points; final fallback ±200 Hz.
+            _y_for_range = (_ift_f[_is_burst]
+                            if _is_burst is not None and np.any(_is_burst)
+                            else _ift_f)
+            if _y_for_range.size > 0:
+                _y_med = float(np.median(_y_for_range))
+                _y_dev = max(50.0,
+                              float(np.std(_y_for_range)) * 3.0,
+                              float(np.max(np.abs(_y_for_range - _y_med))) + 20.0)
+                self._ift_plot.setYRange(_y_med - _y_dev, _y_med + _y_dev,
+                                          padding=0)
+            else:
+                self._ift_plot.setYRange(-200, 200, padding=0)
+        else:
+            self._env_curve.setData([], [])
+            self._ift_scatter_sub.setData(x=[], y=[])
+            self._ift_scatter_burst.setData(x=[], y=[])
 
         # ── Marker circles ────────────────────────────────────────────────────
         r_y = 2.5   # kHz radius
@@ -991,6 +1201,12 @@ class AnalysisWindow(QtWidgets.QWidget):
             lvl = [self._det_vmin_slider.value(), self._det_vmax_slider.value()]
             self._det_img.setLevels(lvl)
             self._det_img_v.setLevels(lvl)
+
+    def _on_tfmf_level_changed(self):
+        if self._results is not None:
+            lvl = [self._tfmf_vmin_slider.value(), self._tfmf_vmax_slider.value()]
+            self._tfmf_img.setLevels(lvl)
+            self._tfmf_img_v.setLevels(lvl)
 
     def _on_audio_level_changed(self):
         self._audio_img.setLevels([self._audio_vmin_slider.value(), self._audio_vmax_slider.value()])
