@@ -1763,8 +1763,11 @@ class CompareGUI(QtWidgets.QMainWindow):
     def _run(self):
         self._run_btn.setEnabled(False)
         self._save_all_btn.setEnabled(False)
-        self.statusBar().showMessage("Loading…")
-        QtWidgets.QApplication.processEvents()
+        # Override the cursor to a wait spinner so the operator can see at a
+        # glance that work is in progress — the per-step status updates below
+        # show *what* is happening.
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        self._set_status("Loading…  (step 0)")
 
         try:
             self._do_run()
@@ -1773,11 +1776,27 @@ class CompareGUI(QtWidgets.QMainWindow):
             self._summary.setPlainText(f"Error:\n{exc}\n\n{traceback.format_exc()}")
             self.statusBar().showMessage(f"Error: {exc}")
         finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
             self._run_btn.setEnabled(True)
+            # Final status — clear the per-step text once we're done.
+            if not self.statusBar().currentMessage().startswith("Error"):
+                self.statusBar().showMessage("Ready.", 4000)
+
+    def _set_status(self, msg: str) -> None:
+        """Update the status bar and pump the event loop so the GUI stays
+        responsive during long-running ``_do_run`` steps.  Without the
+        ``processEvents`` call, the OS shows the window-manager "Not
+        responding" prompt while data loading + matplotlib figure builds
+        consume the main thread."""
+        self.statusBar().showMessage(msg)
+        QtWidgets.QApplication.processEvents()
 
     def _do_run(self):
         # ── Load data ─────────────────────────────────────────────────────────
+        self._set_status("Step 1/8: Loading WSJT-X ALL.TXT…")
         wsjtx_all  = parse_wsjtx(WSJTX_ALL)
+        self._set_status(f"Step 2/8: Loading MAP144 decodes.jsonl…  "
+                         f"({len(wsjtx_all)} WSJT-X)")
         map144_all = parse_map144(MAP144_LOG)
 
         n_test = sum(1 for d in map144_all if is_test_message(d['message']))
@@ -1808,12 +1827,18 @@ class CompareGUI(QtWidgets.QMainWindow):
         # we don't json.loads the entire file (700k+ lines after a month).
         launches: list[dict] = []
         if not self._no_launches_cb.isChecked():
+            self._set_status(
+                f"Step 3/8: Loading MAP144 launches.jsonl…  "
+                f"({len(wsjtx_all)} WSJT-X · {len(map144_all)} MAP144 decodes)"
+            )
             launches = parse_launches(
                 MAP144_LAUNCHES,
                 date_str=date_str if date_str else None,
             )
 
         # ── Match ─────────────────────────────────────────────────────────────
+        self._set_status(f"Step 4/8: Matching decodes…  "
+                         f"({len(launches)} launches loaded)")
         win = self._win_spin.value()
         matched, wsjtx_only, map144_only = match_decodes(wsjtx_all, map144_all, win)
 
@@ -1826,6 +1851,7 @@ class CompareGUI(QtWidgets.QMainWindow):
         local_calls = _local_callsigns(all_decodes, self._local_spin.value())
 
         # ── Summary text ──────────────────────────────────────────────────────
+        self._set_status("Step 5/8: Building summary…")
         summary = _format_summary(
             matched, wsjtx_only, map144_only,
             wsjtx_all, map144_all,
@@ -1837,6 +1863,7 @@ class CompareGUI(QtWidgets.QMainWindow):
         self._summary.setPlainText(summary)
 
         # ── Classification (density + range) ──────────────────────────────────
+        self._set_status("Step 6/8: Classifying callsigns by density and range…")
         my_grid = self._mygrid_edit.text().strip().upper() or "FN42EV"
         try:
             my_lat, my_lon = grid_to_lat_lon(my_grid)
@@ -1866,6 +1893,7 @@ class CompareGUI(QtWidgets.QMainWindow):
         }
 
         # ── Callsign table (left pane) ────────────────────────────────────────
+        self._set_status("Step 7/8: Building callsign table…")
         rows = build_callsign_rows(
             map144_all + wsjtx_all, cs2cls, map144_all + wsjtx_all,
             cs2grid=cs2grid, my_lat=my_lat, my_lon=my_lon,
@@ -1877,22 +1905,27 @@ class CompareGUI(QtWidgets.QMainWindow):
 
         # ── Build figures ─────────────────────────────────────────────────────
         date_label = self._date_label()
+        self._set_status("Step 8/8: Figure 1/6 — timeline…")
         timeline_fig = _make_timeline_fig(
             matched, wsjtx_only, map144_only,
             wsjtx_tags=wsjtx_tags or None,
             date_label=date_label,
             local_calls=local_calls or None,
         )
+        self._set_status("Step 8/8: Figure 2/6 — detection rate…")
         detrate_fig = _make_detection_rate_fig(matched, wsjtx_only, date_label)
+        self._set_status("Step 8/8: Figure 3/6 — SNR scatter…")
         scatter_fig = _make_snr_scatter_fig(
             matched, wsjtx_only, map144_only, date_label,
             wsjtx_tags=wsjtx_tags or None,
             local_calls=local_calls or None,
         )
+        self._set_status("Step 8/8: Figure 4/6 — detection rate by class…")
         detrate_byclass_fig = _make_detection_rate_by_class_fig(
             matched, wsjtx_only, period_slip_ids, cs2cls,
             date_label=f"{date_label} @{my_grid}",
         )
+        self._set_status("Step 8/8: Figure 5/6 — SNR scatter by class…")
         scatter_byclass_fig = _make_snr_scatter_by_class_fig(
             matched, wsjtx_only, map144_only, cs2cls,
             date_label=f"{date_label} @{my_grid}",
@@ -1911,6 +1944,7 @@ class CompareGUI(QtWidgets.QMainWindow):
         else:
             launch_since = None
             launch_until = None
+        self._set_status("Step 8/8: Figure 6/6 — launch-pattern (parsing launches.jsonl)…")
         launch_pattern_fig = _make_launch_pattern_fig(
             MAP144_LAUNCHES, calling_khz=50260.0,
             since=launch_since, until=launch_until,
