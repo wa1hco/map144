@@ -136,9 +136,16 @@ def _analysis_freq_vs_time(iq: np.ndarray, sample_rate_hz: int,
         f_carr[k] = float((f1 + f2) / 4.0)   # /2 for squaring, /2 for midpoint
         t_c[k]    = (start + n_win / 2) / fs
 
-    # Envelope in dB above median (matches the figure's "dB above median").
+    # Envelope (|IQ|) in dB above the per-burst 25th-percentile noise floor.
+    # pct25 (vs median) is more robust to signal contamination — burst windows
+    # don't pull the reference up when the signal occupies > 50 % of the
+    # capture (a common case for short single-ping bursts).  Matches the
+    # baseline convention sq_det + TFMF use elsewhere in the project.
     env_lin = np.maximum(env_lin, 1e-12)
-    env_db = 20.0 * np.log10(env_lin / max(np.median(env_lin), 1e-12))
+    _sorted = np.sort(env_lin)
+    _k_pct25 = max(0, _sorted.size // 4)
+    _ref = float(max(_sorted[_k_pct25], 1e-12))
+    env_db = 20.0 * np.log10(env_lin / _ref)
     return f_carr.astype(np.float32), t_c.astype(np.float32), env_db.astype(np.float32)
 
 
@@ -284,6 +291,21 @@ class AnalysisEngine(Engine):
             except Exception as _e:
                 import logging as _lg
                 _lg.getLogger(__name__).warning("Analysis TFMF V compute failed: %s", _e)
+        # For audio-burst sources, the native signal had content only in
+        # ~0–3 kHz (and after Hilbert+upsample, ZERO in negative freqs and
+        # above ~6 kHz aside from numerical noise).  The per-bin pct25
+        # noise floor in those quiet bins is dominated by float-roundoff
+        # leakage; dividing by it produces "high SNR" candidates at freqs
+        # where no signal can physically exist.  Mask candidates outside
+        # the audio band so the display only shows freqs that the source
+        # could have carried.
+        if self._meta.get('source_was_audio'):
+            _AUDIO_F_MIN_HZ = -200.0       # tiny margin for Hilbert ringing
+            _AUDIO_F_MAX_HZ = 6500.0       # 6 kHz audio Nyquist + margin
+            tfmf_candidates_h = [c for c in tfmf_candidates_h
+                                 if _AUDIO_F_MIN_HZ <= c.freq_hz <= _AUDIO_F_MAX_HZ]
+            tfmf_candidates_v = [c for c in tfmf_candidates_v
+                                 if _AUDIO_F_MIN_HZ <= c.freq_hz <= _AUDIO_F_MAX_HZ]
 
         # ── Instantaneous carrier-freq trace (audio frame) ────────────────
         # Squared-FFT carrier estimator on the channelizer-mixed-down audio
@@ -318,6 +340,9 @@ class AnalysisEngine(Engine):
             'inst_freq_audio':    inst_freq_audio,
             'inst_freq_t':        inst_freq_t,
             'env_db':             env_db,
+            'source_was_audio':   bool(self._meta.get('source_was_audio')),
+            'native_audio':       self._meta.get('native_audio'),
+            'native_audio_sr':    self._meta.get('native_audio_sr'),
         }
 
     # ------------------------------------------------------------------

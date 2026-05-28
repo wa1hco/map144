@@ -333,7 +333,8 @@ class AnalysisWindow(QtWidgets.QWidget):
         # different velocities) become visually obvious.
         row_ft = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self._row_ft = row_ft
-        self._env_plot = pg.PlotWidget(title="Envelope (dB above median)")
+        self._env_plot = pg.PlotWidget(
+            title="|IQ| envelope, dB above pct25 (per-burst noise reference)")
         self._env_plot.setLabel('left', 'dB')
         self._env_plot.getAxis('bottom').hide()
         self._env_plot.setAspectLocked(False)
@@ -341,10 +342,12 @@ class AnalysisWindow(QtWidgets.QWidget):
         self._env_curve = pg.PlotCurveItem(pen=pg.mkPen((100, 180, 255), width=1.5),
                                             connect='finite')
         self._env_plot.addItem(self._env_curve)
-        # Burst-threshold reference line at +4 dB (matches measure_ping_freq_vs_time
-        # default ENV_THRESH_DB).
+        # Burst threshold reference line at +6 dB above pct25.  pct25 sits
+        # ~3.82 dB below median on AWGN, so a "+4 dB above median" burst is
+        # a "+7.8 dB above pct25" burst — round to 6 dB so weaker bursts
+        # are still marked.
         self._env_thresh_line = pg.InfiniteLine(
-            pos=4.0, angle=0,
+            pos=6.0, angle=0,
             pen=pg.mkPen('r', width=1, style=QtCore.Qt.DashLine),
         )
         self._env_plot.addItem(self._env_thresh_line)
@@ -773,7 +776,11 @@ class AnalysisWindow(QtWidgets.QWidget):
             self._tfmf_plot.getAxis('bottom').show()
 
         # ── Spectrogram image ─────────────────────────────────────────────────
-        # Y axis: frequency offset in kHz, ±rate/2 kHz
+        # Y axis: frequency offset in kHz, ±rate/2 kHz.  For audio-burst
+        # sources (a 12 kHz mono WAV Hilbert+upsampled here) the only
+        # physical content sits in 0..3 kHz; zoom in so the operator can
+        # actually see it rather than a sliver in the middle of ±24 kHz.
+        _is_audio = bool(results.get('source_was_audio'))
         half_rate_khz = rate / 2000.0    # e.g. 24.0 kHz for 48 kHz
         _spec_rect = QtCore.QRectF(0.0, -half_rate_khz, duration, 2 * half_rate_khz)
 
@@ -784,7 +791,10 @@ class AnalysisWindow(QtWidgets.QWidget):
                          autoLevels=False, levels=[vmin, vmax])
             img.setRect(_spec_rect)
             plot.setXRange(0, duration, padding=0)
-            plot.setYRange(-half_rate_khz, half_rate_khz, padding=0)
+            if _is_audio:
+                plot.setYRange(0, 3, padding=0)             # audio band only
+            else:
+                plot.setYRange(-half_rate_khz, half_rate_khz, padding=0)
 
         _set_spec(self._spec_plot, self._spec_img, spec)
         if dual and spec_v is not None:
@@ -853,7 +863,14 @@ class AnalysisWindow(QtWidgets.QWidget):
             img.setImage(surf, autoLevels=False, levels=_tfmf_lvl)
             img.setRect(_rect)
             plot.setXRange(0, duration, padding=0)
-            plot.setYRange(_TF_F_MIN - 0.5, _TF_F_MIN + _TF_F_SPAN + 0.5, padding=0)
+            if _is_audio:
+                # Same audio-band zoom as the IQ spectrogram for visual
+                # alignment.  The image still extends across ±24 kHz; the
+                # viewbox just shows the 0–3 kHz slice.
+                plot.setYRange(0, 3, padding=0)
+            else:
+                plot.setYRange(_TF_F_MIN - 0.5, _TF_F_MIN + _TF_F_SPAN + 0.5,
+                                padding=0)
             if cands:
                 scatter.setData(x=[c.time_s for c in cands],
                                 y=[c.freq_hz / 1000.0 for c in cands])
@@ -908,6 +925,24 @@ class AnalysisWindow(QtWidgets.QWidget):
             self._env_curve.setData([], [])
             self._ift_scatter_sub.setData(x=[], y=[])
             self._ift_scatter_burst.setData(x=[], y=[])
+
+        # ── Audio-burst: auto-show the native 12 kHz spectrogram + tone view ─
+        # _show_audio_spectrogram is normally triggered by a manual decode
+        # click; for audio-source WAVs we have the burst right here, so
+        # render it on load.
+        if _is_audio:
+            _native_audio = results.get('native_audio')
+            _native_sr    = results.get('native_audio_sr')
+            if _native_audio is not None and _native_sr:
+                try:
+                    self._show_audio_spectrogram(
+                        _native_audio,
+                        label=f"{_native_sr // 1000} kHz audio source",
+                    )
+                except Exception as _e:
+                    import logging as _lg
+                    _lg.getLogger(__name__).warning(
+                        "Auto-show audio spectrogram failed: %s", _e)
 
         # ── Marker circles ────────────────────────────────────────────────────
         r_y = 2.5   # kHz radius

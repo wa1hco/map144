@@ -236,6 +236,8 @@ def load_capture(wav_path: Path) -> tuple[np.ndarray, dict]:
             iq = analytic
         load_sr = target_sr
         is_audio_burst = True
+        _native_audio = audio.astype(np.float32)
+        _native_audio_sr = int(sample_rate)
         # Default dual_pol = False; the file is mono so we have no V.
         n_channels = 2   # for the dual_pol-default check below
     else:
@@ -267,6 +269,12 @@ def load_capture(wav_path: Path) -> tuple[np.ndarray, dict]:
     # (the IQ wideband spectrogram and channel-SNR heatmap aren't physically
     # meaningful here — the source had only ~0..2.7 kHz of audio content).
     meta.setdefault('source_was_audio', is_audio_burst)
+    # Pass the native audio + its rate through so AnalysisWindow can render
+    # the 12 kHz spectrogram directly (the upsampled-complex iq doesn't
+    # round-trip cleanly to mono).
+    if is_audio_burst:
+        meta['native_audio']    = _native_audio       # noqa: F841
+        meta['native_audio_sr'] = _native_audio_sr    # noqa: F841
 
     return iq, meta
 
