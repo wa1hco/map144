@@ -33,6 +33,12 @@ from .channelizer import N_CHANNELS
 from .processing import DETECT_THRESH_DB
 from .displays import _align_msk144_message
 
+# Light-mode plot styling — must be set BEFORE any PlotWidget is constructed.
+# Heatmap colormaps below stay the same (they're explicit), only the axes,
+# titles, and curve foreground swap from dark→light.
+pg.setConfigOption('background', 'w')
+pg.setConfigOption('foreground', 'k')
+
 
 # ── colormap (same as main window) ────────────────────────────────────────────
 def _make_colormap():
@@ -275,8 +281,11 @@ class AnalysisWindow(QtWidgets.QWidget):
         self._det_freq_min_khz  = -float(_half_ch) - 0.5
         self._det_freq_span_khz =  float(N_CHANNELS)
         self._det_plot = pg.PlotWidget(
-            title=f"H  Channel SNR  (threshold {DETECT_THRESH_DB:.0f} dB)"
-                  f"   circles: green=decoded  orange=detected/no-decode"
+            title=f"H  sq_det per-channel SNR  "
+                  f"(dB above rolling pct25 of squared-FFT pair metric; "
+                  f"detector fires at ≥ {DETECT_THRESH_DB:.0f} dB) — "
+                  f"circles: green = decoded by jt9/SPD,  "
+                  f"orange = launched but no decode"
         )
         self._det_plot.setLabel('left',   'H  Dial offset (kHz)')
         self._det_plot.getAxis('bottom').hide()
@@ -782,14 +791,29 @@ class AnalysisWindow(QtWidgets.QWidget):
         # actually see it rather than a sliver in the middle of ±24 kHz.
         _is_audio = bool(results.get('source_was_audio'))
         half_rate_khz = rate / 2000.0    # e.g. 24.0 kHz for 48 kHz
-        _spec_rect = QtCore.QRectF(0.0, -half_rate_khz, duration, 2 * half_rate_khz)
+
+        def _trim_valid(arr):
+            """Return the leading slice of ``arr`` along axis 0 that contains
+            non-zero data.  spec_staging is sized for a 15-s period so a
+            short burst only fills the first N rows; the trailing zeros
+            would otherwise show up as black space and visually compress the
+            valid data into a small fraction of the plot width."""
+            nz = np.any(arr != 0, axis=tuple(range(1, arr.ndim)))
+            if not nz.any():
+                return arr
+            last = int(np.where(nz)[0].max()) + 1
+            return arr[:last]
 
         def _set_spec(plot, img, arr):
+            arr_v = _trim_valid(arr)
             _dw  = max(plot.width(), 1)
-            _rep = max(1, -(-_dw // arr.shape[0]))
-            img.setImage(np.repeat(arr[:, ::4], _rep, axis=0),
+            _rep = max(1, -(-_dw // arr_v.shape[0]))
+            img.setImage(np.repeat(arr_v[:, ::4], _rep, axis=0),
                          autoLevels=False, levels=[vmin, vmax])
-            img.setRect(_spec_rect)
+            # Rect spans the full burst duration; image data is trimmed and
+            # stretched so the valid samples cover the whole plot width.
+            img.setRect(QtCore.QRectF(0.0, -half_rate_khz,
+                                       duration, 2 * half_rate_khz))
             plot.setXRange(0, duration, padding=0)
             if _is_audio:
                 plot.setYRange(0, 3, padding=0)             # audio band only
@@ -817,21 +841,28 @@ class AnalysisWindow(QtWidgets.QWidget):
             self._blank_bars.setData(x=[], y=[])
 
         # ── Detection heatmaps ────────────────────────────────────────────────
-        _det_rect = QtCore.QRectF(0.0, self._det_freq_min_khz,
-                                  duration, self._det_freq_span_khz)
-        _det_ylo  = self._det_freq_min_khz - 0.5
-        _det_yhi  = self._det_freq_min_khz + self._det_freq_span_khz + 0.5
+        # Image data extends across all N_CHANNELS (±24 kHz dial offset); the
+        # *viewbox* gets zoomed to the audio band 0..6 kHz when the source is
+        # a 12 kHz audio WAV — that's where any real sq_det channel response
+        # could possibly sit.
         _dlvl     = [self._det_vmin_slider.value(), self._det_vmax_slider.value()]
 
         def _set_hm(plot, img, arr):
-            hm_d = np.fft.fftshift(arr, axes=1)
+            arr_v = _trim_valid(arr)
+            hm_d = np.fft.fftshift(arr_v, axes=1)
             _dw  = max(plot.width(), 1)
             _rep = max(1, -(-_dw // hm_d.shape[0]))
             img.setImage(np.repeat(hm_d, _rep, axis=0),
                          autoLevels=False, levels=_dlvl)
-            img.setRect(_det_rect)
+            img.setRect(QtCore.QRectF(0.0, self._det_freq_min_khz,
+                                       duration, self._det_freq_span_khz))
             plot.setXRange(0, duration, padding=0)
-            plot.setYRange(_det_ylo, _det_yhi, padding=0)
+            if _is_audio:
+                plot.setYRange(-0.5, 6.5, padding=0)        # 0–6 kHz audio band
+            else:
+                plot.setYRange(self._det_freq_min_khz - 0.5,
+                                self._det_freq_min_khz + self._det_freq_span_khz + 0.5,
+                                padding=0)
 
         _set_hm(self._det_plot, self._det_img, hm)
         if dual and hm_v is not None:
