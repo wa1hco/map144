@@ -101,6 +101,15 @@ class TFMFConfig:
     #: a stable freq; for short meteor pings (< 144 ms) K-frame > 2 may
     #: not have enough frames to integrate.
     k_frame_integration: int = 1
+    #: Per-freq-bin noise-floor estimator: which order-statistic percentile of
+    #: |MF| (across windows) to use as the denominator in SNR computation.
+    #: 50.0 (median, default) is robust to ≤ 50% signal contamination per bin;
+    #: 25.0 is robust to ≤ 75% — better when a freq bin carries an intermittent
+    #: interferer or persistent carrier whose duty cycle exceeds 50% of the
+    #: window.  Under pure AWGN they differ only by a constant: pct25 ≈
+    #: 0.7585·σ, median ≈ 1.177·σ, so equivalent FA-rate threshold above pct25
+    #: is +3.82 dB compared to above median.
+    noise_floor_percentile: float = 50.0
 
 
 # Hard-coded MSK144 geometry constants
@@ -391,9 +400,13 @@ def extract_candidates(surface_cp, cfg: TFMFConfig,
 
     magnitude = cp.abs(surface_cp)                            # (n_win, n_freq)
 
-    # Per-freq-bin noise floor: median across windows.  Cheap and
-    # signal-robust (median ignores rare spike windows).
-    noise_floor = cp.median(magnitude, axis=0)                # (n_freq,)
+    # Per-freq-bin noise floor: order-statistic percentile across windows.
+    # 50th (median) tolerates ≤ 50% signal contamination per bin; 25th
+    # tolerates ≤ 75% — switchable via cfg.noise_floor_percentile.
+    n_win_mag = magnitude.shape[0]
+    k_pct = max(0, min(n_win_mag - 1,
+                       int(n_win_mag * cfg.noise_floor_percentile / 100.0)))
+    noise_floor = cp.partition(magnitude, k_pct, axis=0)[k_pct]   # (n_freq,)
     # Avoid div-by-zero in fully-zero bins (edge cases at fft boundaries).
     noise_floor = cp.maximum(noise_floor, 1e-30)
 
@@ -466,7 +479,12 @@ def extract_candidates_cpu(surface: np.ndarray, cfg: TFMFConfig,
     if surface.shape[0] == 0:
         return []
     magnitude = np.abs(surface)
-    noise_floor = np.median(magnitude, axis=0)
+    # Order-statistic percentile per freq bin — 50 = median (≤50% robust),
+    # 25 = pct25 (≤75% robust).  See TFMFConfig.noise_floor_percentile.
+    n_win_mag = magnitude.shape[0]
+    k_pct = max(0, min(n_win_mag - 1,
+                       int(n_win_mag * cfg.noise_floor_percentile / 100.0)))
+    noise_floor = np.partition(magnitude, k_pct, axis=0)[k_pct]
     noise_floor = np.maximum(noise_floor, 1e-30)
     snr_lin = magnitude / noise_floor[None, :]
     snr_db = 20.0 * np.log10(snr_lin)

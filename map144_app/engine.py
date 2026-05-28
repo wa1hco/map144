@@ -362,24 +362,42 @@ class Engine:
         self._sync_snr_history_v = np.full((N_SNR_HIST, N_CHANNELS), -999.0, dtype=np.float32)
         self._ch_snr_hop_count = 0
 
-        # TFMF display state — per-period single-channel IQ accumulation.
-        # At each 15-s boundary the buffer is processed into a (n_windows,
-        # n_freq_bins) SNR surface stored in _tfmf_surface_h/v.  The display
-        # thread renders it as a time×frequency heatmap with candidate scatter.
-        _TFMF_PERIOD_SAMPLES = 15 * CH_SAMPLE_RATE   # 180 000 samples
-        self._tfmf_active_ch_h    = 0
-        self._tfmf_period_buf_h   = np.zeros(_TFMF_PERIOD_SAMPLES, dtype=np.complex64)
-        self._tfmf_period_fill_h  = 0
+        # TFMF display state — surface and candidates produced once per 15-s
+        # boundary from the post-blanker 48 kHz IQ ring (see _build_tfmf_display_surface
+        # in processing.py).  No accumulation buffer here — the ring already
+        # holds the wideband IQ.  The wideband CPU compute is heavy (~7 s) so it
+        # runs in a background thread; `_tfmf_worker_busy` gates re-entry so we
+        # drop the next period rather than queuing back-to-back computes.
         self._tfmf_surface_h      = None   # float32 (n_win, n_bins) SNR dB, freq-axis fftshifted
         self._tfmf_candidates_h   = []
         self._tfmf_surface_dirty_h = False
-        # V-pol counterparts (dual_pol path only)
-        self._tfmf_active_ch_v    = 0
-        self._tfmf_period_buf_v   = np.zeros(_TFMF_PERIOD_SAMPLES, dtype=np.complex64)
-        self._tfmf_period_fill_v  = 0
         self._tfmf_surface_v      = None
         self._tfmf_candidates_v   = []
         self._tfmf_surface_dirty_v = False
+        self._tfmf_worker_busy    = False
+        # Wall-clock timestamp of the last TFMF compute dispatch.  Used by
+        # the periodic-trigger gate in process_iq_data to throttle redisplays
+        # to ~_TFMF_REDISPLAY_INTERVAL_S.
+        self._tfmf_last_dispatch_time = 0.0
+        # Time in seconds into the current 15-s period at which the first
+        # sample of each polarisation's surface was captured.  Non-zero only
+        # when the engine started mid-period and we don't have IQ all the
+        # way back to the period boundary; displays.py shifts the image
+        # rect right by this much so it lands at the correct period-relative
+        # time.
+        self._tfmf_surface_offset_s_h = 0.0
+        self._tfmf_surface_offset_s_v = 0.0
+        # Accumulating candidate list for the current period.  Each dispatch
+        # extends this with candidates whose time_s falls in the
+        # newly-covered region (past _tfmf_period_max_t_*); already-published
+        # circles do NOT move when the surface is re-rendered with a longer
+        # median window.  Cleared on period rollover.
+        self._tfmf_period_candidates_h = []
+        self._tfmf_period_candidates_v = []
+        self._tfmf_period_max_t_h = 0.0   # seconds-into-period covered so far
+        self._tfmf_period_max_t_v = 0.0
+        self._tfmf_period_idx_h   = -1    # period index of the current accum
+        self._tfmf_period_idx_v   = -1
 
         # Pre-computed FFT window
         self._fft_window = np.hanning(self.fft_size).astype(np.float32)

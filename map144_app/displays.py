@@ -416,12 +416,13 @@ def update_displays(self):
 
     # ── TFMF time-frequency surface (period-boundary update) ─────────────────
     # _tfmf_surface_h is (n_windows, n_bins) float32 SNR-dB computed once per
-    # 15-s period.  Image col=time, row=audio-freq (fftshifted, DC centred).
-    # Candidate scatter uses fftfreq-ordered freq_hz converted to kHz.
-    _TFMF_FREQ_MIN_KHZ  = -6.0    # after fftshift, bin 0 → −6 kHz
-    _TFMF_FREQ_SPAN_KHZ = 12.0    # ±6 kHz audio range
-    _TFMF_DISP_STRIDE   = 24      # samples/window at 12 kHz = 2 ms/window
-    _TFMF_FS            = 12000   # channel sample rate
+    # 15-s period from the post-blanker 48 kHz IQ ring.  Image col=time,
+    # row=audio-freq (fftshifted, DC centred).  Candidate scatter uses
+    # fftfreq-ordered freq_hz converted to kHz.
+    _TFMF_FREQ_MIN_KHZ  = -24.0   # after fftshift, bin 0 → −24 kHz
+    _TFMF_FREQ_SPAN_KHZ = 48.0    # ±24 kHz wideband
+    _TFMF_DISP_STRIDE   = 24      # samples/window at 48 kHz = 0.5 ms/window
+    _TFMF_FS            = 48000   # post-blanker IQ rate
 
     _sync_win = getattr(self, '_sync_detect_win', None)
     if _sync_win is None or _sync_win.isVisible():
@@ -433,14 +434,21 @@ def update_displays(self):
             if _surf_h is not None:
                 _n_win_h = _surf_h.shape[0]
                 _time_span_h = _n_win_h * _TFMF_DISP_STRIDE / _TFMF_FS
+                # Image x-anchor is the surface's first-sample time within
+                # the current 15-s period.  Normally 0.0 (we have IQ all the
+                # way back to the boundary).  As the period fills the image
+                # grows from x=0 toward x=15; at the next boundary it resets.
+                _offset_h = getattr(self, '_tfmf_surface_offset_s_h', 0.0)
                 _tfmf_rect_h = QtCore.QRectF(
-                    0.0, _TFMF_FREQ_MIN_KHZ, _time_span_h, _TFMF_FREQ_SPAN_KHZ
+                    _offset_h, _TFMF_FREQ_MIN_KHZ, _time_span_h, _TFMF_FREQ_SPAN_KHZ
                 )
                 self.sync_detect_img.setImage(
                     _surf_h, autoLevels=False, levels=_sync_levels,
                 )
                 self.sync_detect_img.setRect(_tfmf_rect_h)
-                _sync_plot.setXRange(0, _time_span_h + 0.5, padding=0)
+                # X range is fixed to the full period so the image's position
+                # within the period is visually correct as it fills.
+                _sync_plot.setXRange(0, float(self.history_secs) + 0.5, padding=0)
 
                 _scatter = getattr(self, 'sync_detect_scatter', None)
                 if _scatter is not None:
@@ -459,14 +467,15 @@ def update_displays(self):
                 if _surf_v is not None:
                     _n_win_v = _surf_v.shape[0]
                     _time_span_v = _n_win_v * _TFMF_DISP_STRIDE / _TFMF_FS
+                    _offset_v = getattr(self, '_tfmf_surface_offset_s_v', 0.0)
                     _tfmf_rect_v = QtCore.QRectF(
-                        0.0, _TFMF_FREQ_MIN_KHZ, _time_span_v, _TFMF_FREQ_SPAN_KHZ
+                        _offset_v, _TFMF_FREQ_MIN_KHZ, _time_span_v, _TFMF_FREQ_SPAN_KHZ
                     )
                     self.sync_detect_img_v.setImage(
                         _surf_v, autoLevels=False, levels=_sync_levels,
                     )
                     self.sync_detect_img_v.setRect(_tfmf_rect_v)
-                    _sync_plot_v.setXRange(0, _time_span_v + 0.5, padding=0)
+                    _sync_plot_v.setXRange(0, float(self.history_secs) + 0.5, padding=0)
 
                     _scatter_v = getattr(self, 'sync_detect_scatter_v', None)
                     if _scatter_v is not None:

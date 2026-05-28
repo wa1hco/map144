@@ -448,7 +448,7 @@ def setup_ui(self):
     # scatter dots.  Decode-lifecycle circles (cyan/green/red/orange) remain for
     # cross-referencing decodes, but are not redrawn on this panel (they live on
     # the tone-detection heatmap which retains the full-bandwidth channel view).
-    _sync_title = ("TFMF Peak Detection  (dual-sync template, ±6 kHz audio)"
+    _sync_title = ("TFMF Peak Detection  (dual-sync template, ±24 kHz wideband)"
                    "   yellow dots = peak-picked candidates")
     self.sync_detect_plot = pg.PlotWidget(title="H — " + _sync_title)
     self.sync_detect_plot.setLabel('left', 'Audio freq (kHz)')
@@ -469,13 +469,18 @@ def setup_ui(self):
     self.sync_detect_curve_red    = pg.PlotCurveItem()
     self.sync_detect_curve_orange = pg.PlotCurveItem()
     self.sync_detect_plot.setXRange(0, 15.5, padding=0)
-    self.sync_detect_plot.getAxis('bottom').show()
-    self.sync_detect_plot.setYRange(-6.1, 6.1, padding=0)
+    # Hide this plot's own bottom axis — the shared time_ruler at the bottom
+    # of the sync_detect window already carries the time scale (same
+    # convention as realtime_plot in the fast-graph window).  Without this
+    # hide, both axes render and the panel shows two redundant time scales.
+    self.sync_detect_plot.getAxis('bottom').hide()
+    self.sync_detect_plot.setYRange(-24.5, 24.5, padding=0)
 
     self.sync_detect_plot_v = pg.PlotWidget(title="V — " + _sync_title)
     self.sync_detect_plot_v.setLabel('left', 'Audio freq (kHz)')
-    self.sync_detect_plot_v.setLabel('bottom', 'Time in period (s)')
-    self.sync_detect_plot_v.getAxis('bottom').show()
+    # Bottom axis hidden — shared time_ruler at the bottom of the window
+    # carries the scale (same convention as H, see comment above).
+    self.sync_detect_plot_v.getAxis('bottom').hide()
     self.sync_detect_plot_v.setAspectLocked(False)
     self.sync_detect_img_v = pg.ImageItem(axisOrder='col-major')
     self.sync_detect_plot_v.addItem(self.sync_detect_img_v)
@@ -490,9 +495,14 @@ def setup_ui(self):
     self.sync_detect_curve_red_v    = pg.PlotCurveItem()
     self.sync_detect_curve_orange_v = pg.PlotCurveItem()
     self.sync_detect_plot_v.setXRange(0, 15.5, padding=0)
-    self.sync_detect_plot_v.setYRange(-6.1, 6.1, padding=0)
+    self.sync_detect_plot_v.setYRange(-24.5, 24.5, padding=0)
     self.sync_detect_plot_v.hide()
     self.sync_detect_plot.getViewBox().disableAutoRange()
+    # Lock V's range too — without this, when the V panel becomes visible
+    # (after a resize / dual-pol switch) its viewbox auto-fits and the
+    # scatter dots end up at the right data coords but the image at a
+    # different visible region.
+    self.sync_detect_plot_v.getViewBox().disableAutoRange()
 
     # Do NOT setXLink here — PyQtGraph's link is bidirectional and would
     # override explicit setXRange calls on realtime_plot.
