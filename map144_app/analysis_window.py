@@ -793,20 +793,25 @@ class AnalysisWindow(QtWidgets.QWidget):
         _is_audio = bool(results.get('source_was_audio'))
         half_rate_khz = rate / 2000.0    # e.g. 24.0 kHz for 48 kHz
 
-        def _trim_valid(arr):
+        def _trim_valid(arr, idle: float = 0.0):
             """Return the leading slice of ``arr`` along axis 0 that contains
-            non-zero data.  spec_staging is sized for a 15-s period so a
-            short burst only fills the first N rows; the trailing zeros
-            would otherwise show up as black space and visually compress the
-            valid data into a small fraction of the plot width."""
-            nz = np.any(arr != 0, axis=tuple(range(1, arr.ndim)))
+            rows the engine actually wrote.  ``spec_staging`` is initialised
+            to **-130.0** (dB) and ``_ch_snr_history`` to **-999.0** by
+            Engine.__init__; pre-fix this function checked != 0 and treated
+            every initial-sentinel row as populated, leaving the actual data
+            squashed into the leftmost ~20 % of the plot width on a 2.9-s
+            burst sitting in a 15-s-period buffer."""
+            n_rows = arr.shape[0]
+            flat = arr.reshape(n_rows, -1)
+            is_idle_row = np.all(np.abs(flat - idle) < 0.01, axis=1)
+            nz = ~is_idle_row
             if not nz.any():
                 return arr
             last = int(np.where(nz)[0].max()) + 1
             return arr[:last]
 
         def _set_spec(plot, img, arr):
-            arr_v = _trim_valid(arr)
+            arr_v = _trim_valid(arr, idle=-130.0)
             _dw  = max(plot.width(), 1)
             _rep = max(1, -(-_dw // arr_v.shape[0]))
             img.setImage(np.repeat(arr_v[:, ::4], _rep, axis=0),
@@ -821,9 +826,19 @@ class AnalysisWindow(QtWidgets.QWidget):
             else:
                 plot.setYRange(-half_rate_khz, half_rate_khz, padding=0)
 
-        _set_spec(self._spec_plot, self._spec_img, spec)
-        if dual and spec_v is not None:
-            _set_spec(self._spec_plot_v, self._spec_img_v, spec_v)
+        # Audio-burst sources have no wideband content above ~3 kHz aside from
+        # numerical leakage; the bottom 12 kHz audio spectrogram (row 2) shows
+        # the same band at *better* freq resolution (46.875 Hz/bin vs
+        # 187.5 Hz/bin here).  Hide this row entirely so the operator doesn't
+        # see what looks like a duplicate.
+        if _is_audio:
+            self._spec_plot.hide()
+            self._spec_plot_v.hide()
+        else:
+            self._spec_plot.show()
+            _set_spec(self._spec_plot, self._spec_img, spec)
+            if dual and spec_v is not None:
+                _set_spec(self._spec_plot_v, self._spec_img_v, spec_v)
 
         # Blanked-block overlay: draw a short vertical stroke at each block start
         if len(blanked) > 0:
@@ -849,7 +864,7 @@ class AnalysisWindow(QtWidgets.QWidget):
         _dlvl     = [self._det_vmin_slider.value(), self._det_vmax_slider.value()]
 
         def _set_hm(plot, img, arr):
-            arr_v = _trim_valid(arr)
+            arr_v = _trim_valid(arr, idle=-999.0)
             hm_d = np.fft.fftshift(arr_v, axes=1)
             _dw  = max(plot.width(), 1)
             _rep = max(1, -(-_dw // hm_d.shape[0]))
