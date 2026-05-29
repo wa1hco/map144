@@ -445,6 +445,10 @@ class AnalysisWindow(QtWidgets.QWidget):
         ))
         row2.setStretchFactor(0, 1); row2.setStretchFactor(1, 0)
         rows_vsplit.addWidget(row2)
+        # Operator decision 2026-05-29: drop the bottom 12 kHz audio
+        # spectrogram + ping spectrum + audio sliders.  The wideband IQ
+        # spectrogram at the top is the single primary (time, freq) view.
+        row2.hide()
 
         # Sync all three row splitters so the plot widths stay equal across rows.
         # setSizes does not emit splitterMoved, so no feedback loop.
@@ -826,19 +830,14 @@ class AnalysisWindow(QtWidgets.QWidget):
             else:
                 plot.setYRange(-half_rate_khz, half_rate_khz, padding=0)
 
-        # Audio-burst sources have no wideband content above ~3 kHz aside from
-        # numerical leakage; the bottom 12 kHz audio spectrogram (row 2) shows
-        # the same band at *better* freq resolution (46.875 Hz/bin vs
-        # 187.5 Hz/bin here).  Hide this row entirely so the operator doesn't
-        # see what looks like a duplicate.
-        if _is_audio:
-            self._spec_plot.hide()
-            self._spec_plot_v.hide()
-        else:
-            self._spec_plot.show()
-            _set_spec(self._spec_plot, self._spec_img, spec)
-            if dual and spec_v is not None:
-                _set_spec(self._spec_plot_v, self._spec_img_v, spec_v)
+        # Top wideband-IQ spec stays visible for all source types — it's the
+        # primary, consistent (time, freq) view across captures.  Operator
+        # decision 2026-05-29: prefer one consistent IQ-based view at the
+        # top over a separate 12 kHz audio spectrogram at the bottom (the
+        # latter is dropped — see ``_audio_plot.hide()`` below).
+        _set_spec(self._spec_plot, self._spec_img, spec)
+        if dual and spec_v is not None:
+            _set_spec(self._spec_plot_v, self._spec_img_v, spec_v)
 
         # Blanked-block overlay: draw a short vertical stroke at each block start
         if len(blanked) > 0:
@@ -935,14 +934,13 @@ class AnalysisWindow(QtWidgets.QWidget):
         _ift_t   = results.get('inst_freq_t')
         _env_db  = results.get('env_db')
         if _ift_f is not None and _ift_t is not None and _ift_t.size > 0:
-            # Envelope (top sub-plot)
+            # Envelope (top sub-plot).  Y fixed 0..25 dB — covers the
+            # interesting range (17.3 dB threshold visible, room above it
+            # for strong-burst peaks) without auto-fit-driven re-zoom that
+            # made cross-burst comparisons hard.
             self._env_curve.setData(_ift_t, _env_db)
-            _env_lo = (float(np.min(_env_db)) - 1.0
-                       if _env_db is not None and _env_db.size else -5)
-            _env_hi = (max(20.0, float(np.max(_env_db)) + 2.0)
-                       if _env_db is not None and _env_db.size else 22)
             self._env_plot.setXRange(0, duration, padding=0)
-            self._env_plot.setYRange(_env_lo, _env_hi, padding=0)
+            self._env_plot.setYRange(0, 25, padding=0)
 
             # Burst-vs-noise classification at TFMF's own detector threshold
             # (17.3 dB above per-bin pct25).  Points above = "what TFMF would
@@ -961,11 +959,13 @@ class AnalysisWindow(QtWidgets.QWidget):
                 self._ift_scatter_burst.setData(
                     x=_ift_t[_is_burst], y=_ift_f[_is_burst])
             self._ift_plot.setXRange(0, duration, padding=0)
-            # Y-range: for audio-burst sources clamp to the audio band so
-            # noise-driven argmax scatter outside 0..6 kHz doesn't dominate;
-            # otherwise auto-fit to the in-burst (TFMF-flagged) points.
+            # Y-range: for audio-burst sources clamp to 0..3 kHz — TFMF is
+            # NOT a squared detector (verified by reading
+            # ``compute_tf_surface_cpu`` directly), so the matched-filter
+            # peak sits at the actual audio carrier (~1500 Hz for MSK144),
+            # not at 2·carrier.  Otherwise auto-fit to the in-burst points.
             if _is_audio:
-                self._ift_plot.setYRange(-200, 6500, padding=0)
+                self._ift_plot.setYRange(0, 3000, padding=0)
             else:
                 _y_for_range = (_ift_f[_is_burst]
                                 if _is_burst is not None and np.any(_is_burst)
