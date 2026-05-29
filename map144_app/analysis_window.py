@@ -874,13 +874,17 @@ class AnalysisWindow(QtWidgets.QWidget):
             f_lo_khz = float(freq_hz_axis[0])  / 1000.0
             f_hi_khz = float(freq_hz_axis[-1]) / 1000.0
             n_t, n_f = spec_db.shape
-            # Normalise to "dB above pct25 noise floor" before display so the
-            # existing heatmap sliders (which span 0..50 dB) are useful.
-            # Raw squared-power dB sits at around −150 to −60 dB, well outside
-            # the slider range; subtracting the 25th-percentile re-centres
-            # the noise at 0 dB and puts signal peaks in 0..30 dB territory.
-            _ref = float(np.percentile(spec_db, 25))
-            spec_db_norm = (spec_db - _ref).astype(np.float32)
+            # Raw squared-power dB is bimodal: cells with no signal sit at
+            # ≈ −200 dB (the ``+1e-20`` ε floor inside the log) while burst
+            # cells jump to ≈ −70 dB — almost nothing in between.  Clipping
+            # the floor at −130 dB (well below real-signal noise but above
+            # the ε floor) and then subtracting pct25 spreads the noise
+            # population around 0 dB and leaves the burst peaks 50-100 dB
+            # above, which the 0..50 dB sliders can render as a useful
+            # gradient.
+            _clipped = np.maximum(spec_db, -130.0)
+            _ref = float(np.percentile(_clipped, 25))
+            spec_db_norm = (_clipped - _ref).astype(np.float32)
             _dw  = max(plot.width(), 1)
             _rep = max(1, -(-_dw // n_t))
             img.setImage(np.repeat(spec_db_norm, _rep, axis=0),
@@ -1038,24 +1042,18 @@ class AnalysisWindow(QtWidgets.QWidget):
         dec_h,  dec_v  = _split_pol(decoded)
         nod_h,  nod_v  = _split_pol(no_decode)
 
-        for curve, mlist in (
-            (self._det_curve_green,  dec_h),
-            (self._det_curve_orange, nod_h),
-        ):
-            if mlist:
-                curve.setData(*_circle_path(mlist), connect='finite')
-            else:
-                curve.setData(x=[], y=[])
-
+        # Clear the green/orange marker curves on the sq_det row.  Their
+        # ``freq_khz`` is "dial offset from calling" (where 0 = the
+        # calling-freq channel), inherited from the channel-SNR HM layout.
+        # That coordinate doesn't align with the squared-spec Y axis here
+        # (which is 2·audio_carrier kHz; signal at audio 1.5 kHz lives at
+        # 3 kHz, not 0).  Leave the curves empty until we rewire the marker
+        # freq to squared-spec coordinates.
+        for curve in (self._det_curve_green, self._det_curve_orange):
+            curve.setData(x=[], y=[])
         if dual:
-            for curve, mlist in (
-                (self._det_curve_green_v,  dec_v),
-                (self._det_curve_orange_v, nod_v),
-            ):
-                if mlist:
-                    curve.setData(*_circle_path(mlist), connect='finite')
-                else:
-                    curve.setData(x=[], y=[])
+            for curve in (self._det_curve_green_v, self._det_curve_orange_v):
+                curve.setData(x=[], y=[])
 
     # ── Manual decode ──────────────────────────────────────────────────────────
 
