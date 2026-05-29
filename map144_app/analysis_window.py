@@ -874,9 +874,16 @@ class AnalysisWindow(QtWidgets.QWidget):
             f_lo_khz = float(freq_hz_axis[0])  / 1000.0
             f_hi_khz = float(freq_hz_axis[-1]) / 1000.0
             n_t, n_f = spec_db.shape
+            # Normalise to "dB above pct25 noise floor" before display so the
+            # existing heatmap sliders (which span 0..50 dB) are useful.
+            # Raw squared-power dB sits at around −150 to −60 dB, well outside
+            # the slider range; subtracting the 25th-percentile re-centres
+            # the noise at 0 dB and puts signal peaks in 0..30 dB territory.
+            _ref = float(np.percentile(spec_db, 25))
+            spec_db_norm = (spec_db - _ref).astype(np.float32)
             _dw  = max(plot.width(), 1)
             _rep = max(1, -(-_dw // n_t))
-            img.setImage(np.repeat(spec_db, _rep, axis=0),
+            img.setImage(np.repeat(spec_db_norm, _rep, axis=0),
                          autoLevels=False, levels=_dlvl)
             img.setRect(QtCore.QRectF(0.0, f_lo_khz,
                                        duration, f_hi_khz - f_lo_khz))
@@ -989,23 +996,9 @@ class AnalysisWindow(QtWidgets.QWidget):
             self._ift_scatter_sub.setData(x=[], y=[])
             self._ift_scatter_burst.setData(x=[], y=[])
 
-        # ── Audio-burst: auto-show the native 12 kHz spectrogram + tone view ─
-        # _show_audio_spectrogram is normally triggered by a manual decode
-        # click; for audio-source WAVs we have the burst right here, so
-        # render it on load.
-        if _is_audio:
-            _native_audio = results.get('native_audio')
-            _native_sr    = results.get('native_audio_sr')
-            if _native_audio is not None and _native_sr:
-                try:
-                    self._show_audio_spectrogram(
-                        _native_audio,
-                        label=f"{_native_sr // 1000} kHz audio source",
-                    )
-                except Exception as _e:
-                    import logging as _lg
-                    _lg.getLogger(__name__).warning(
-                        "Auto-show audio spectrogram failed: %s", _e)
+        # (Auto-show of the 12 kHz audio spectrogram was removed when the
+        # bottom row was dropped; the wideband IQ spectrogram at the top
+        # is now the single primary view across source types.)
 
         # ── Marker circles ────────────────────────────────────────────────────
         r_y = 2.5   # kHz radius
