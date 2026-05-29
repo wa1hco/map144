@@ -45,6 +45,122 @@ def fc_mhz_calling(engine) -> float:
     return float(getattr(engine, 'center_freq_mhz', 50.260))
 
 
+# ── Squared-signal spectrogram (sq_det / msk144spd.f90 algorithm) ────────────
+# Copied (verbatim, minor renames) from
+# ``analyze_msk144.py::_compute_squared_spectrogram`` so the analysis window
+# can render the canonical sq_det view (0 ≤ f ≤ rate/2, the squared-domain
+# spectrum with expected MSK144 tones at 2·(fc±500)) without depending on the
+# top-level matplotlib tool.  See analyze_msk144.py for the design comments
+# and reference equations from msk144spd.f90.
+
+_NSPM_12K      = 864    # samples / MSK144 frame at 12 000 Hz  (72 ms)
+_STEP_12K      = 216    # step at 12 000 Hz                    (18 ms = NSPM/4)
+_EDGE_FADE_12K = 12     # raised-cosine edge length at 12 kHz (each end)
+
+
+def _lp_filter_iq(samples: np.ndarray, rate: int,
+                  cutoff_hz: float) -> np.ndarray:
+    n = samples.size
+    freq = np.fft.fftfreq(n, 1.0 / rate)
+    X = np.fft.fft(samples.astype(np.complex128))
+    taper_bw = 0.10 * cutoff_hz
+    f_abs = np.abs(freq)
+    gain = np.zeros(n, dtype=np.float64)
+    gain[f_abs <= cutoff_hz] = 1.0
+    trans = (f_abs > cutoff_hz) & (f_abs <= cutoff_hz + taper_bw)
+    if np.any(trans):
+        t = (f_abs[trans] - cutoff_hz) / taper_bw
+        gain[trans] = 0.5 + 0.5 * np.cos(np.pi * t)
+    return np.fft.ifft(X * gain).astype(np.complex64)
+
+
+def _real_to_analytic(samples: np.ndarray) -> np.ndarray:
+    """Real → analytic single-sideband complex via FFT (zero negative half)."""
+    n = samples.size
+    X = np.fft.fft(samples.astype(np.float64))
+    Y = np.zeros(n, dtype=np.complex128)
+    Y[0] = X[0]
+    if n % 2 == 0:
+        Y[1:n // 2]    = 2.0 * X[1:n // 2]
+        Y[n // 2]      = X[n // 2]
+    else:
+        Y[1:(n + 1) // 2] = 2.0 * X[1:(n + 1) // 2]
+    return np.fft.ifft(Y).astype(np.complex64)
+
+
+def _compute_squared_spectrogram(samples: np.ndarray, rate: int,
+                                  fc_hz: float = 1500.0,
+                                  ntol_hz: float = 100.0):
+    """Sliding-window squared-signal spectrogram (msk144spd.f90 algorithm).
+
+    Returns ``(time_s, freq_hz, spec_db, det_norm)`` — see
+    ``analyze_msk144.py::_compute_squared_spectrogram`` for full doc.  For
+    complex IQ inputs the spectrum is fftshifted and bilateral (−rate/2 …
+    +rate/2); for real inputs it covers 0 … rate/2.
+    """
+    nspm   = int(round(_NSPM_12K      * rate / 12000))
+    step   = int(round(_STEP_12K      * rate / 12000))
+    edge_n = int(round(_EDGE_FADE_12K * rate / 12000))
+    nfft   = nspm
+    df     = rate / nfft
+    npos   = nfft // 2 + 1
+    rcw = (1.0 - np.cos(np.arange(edge_n) * np.pi / edge_n)) / 2.0
+    i_high = max(0, min(npos - 1, int(round(2.0 * (fc_hz + 500.0) / df))))
+    i_low  = max(0, min(npos - 1, int(round(2.0 * (fc_hz - 500.0) / df))))
+    hw     = max(1, int(round(2.0 * ntol_hz / df)))
+
+    is_complex = np.iscomplexobj(samples)
+    if is_complex:
+        analytic = _lp_filter_iq(samples, rate, cutoff_hz=10000.0
+                                  ).astype(np.complex128)
+        freq_hz = np.fft.fftshift(np.fft.fftfreq(nfft, 1.0 / rate))
+        n_spec = nfft
+    else:
+        analytic = _real_to_analytic(samples)
+        freq_hz = np.arange(npos, dtype=np.float64) * df
+        n_spec = npos
+
+    n = analytic.size
+    frames = []; times = []; det_raw = []
+    istp = 0
+    while True:
+        ns = istp * step
+        ne = ns + nspm
+        if ne > n:
+            break
+        blk = analytic[ns:ne].astype(np.complex128)
+        blk_sq = blk ** 2
+        blk_sq[:edge_n]            *= rcw
+        blk_sq[nspm - edge_n:]     *= rcw[::-1]
+        fft_sq = np.fft.fft(blk_sq, n=nfft)
+        tone_pos = np.abs(fft_sq[:npos]) ** 2
+        if is_complex:
+            spec_frame = 10.0 * np.log10(
+                np.fft.fftshift(np.abs(fft_sq) ** 2) + 1e-20)
+        else:
+            spec_frame = 10.0 * np.log10(tone_pos + 1e-20)
+        frames.append(spec_frame)
+        times.append((ns + nspm / 2.0) / rate)
+        hi_lo = max(0, i_high - hw);  hi_hi = min(npos - 1, i_high + hw)
+        lo_lo = max(0, i_low  - hw);  lo_hi = min(npos - 1, i_low  + hw)
+        ah = float(tone_pos[hi_lo:hi_hi + 1].max()) if hi_hi >= hi_lo else 0.0
+        al = float(tone_pos[lo_lo:lo_hi + 1].max()) if lo_hi >= lo_lo else 0.0
+        det_raw.append(max(ah, al))
+        istp += 1
+
+    if not frames:
+        return (np.array([0.0]), freq_hz,
+                np.zeros((1, n_spec), dtype=np.float32), np.zeros(1))
+    spec_db = np.stack(frames).astype(np.float32)
+    time_s  = np.array(times,   dtype=np.float32)
+    det_arr = np.array(det_raw, dtype=np.float64)
+    pct25    = float(np.percentile(det_arr, 25)) if det_arr.size > 1 else float(det_arr[0])
+    mean_val = float(np.mean(det_arr)) if det_arr.size > 0 else 1.0
+    ref      = max(pct25, mean_val * 0.001, 1e-20)
+    det_norm = (det_arr / ref).astype(np.float32)
+    return time_s, freq_hz.astype(np.float32), spec_db, det_norm
+
+
 def _tfmf_peak_freq_envelope(surface: np.ndarray
                               ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Per-time-row peak freq and peak SNR-dB from a TFMF SNR-dB surface.
@@ -344,6 +460,21 @@ class AnalysisEngine(Engine):
             tfmf_candidates_v = [c for c in tfmf_candidates_v
                                  if _AUDIO_F_MIN_HZ <= c.freq_hz <= _AUDIO_F_MAX_HZ]
 
+        # ── sq_det squared-signal spectrogram (canonical msk144spd view) ──
+        # Y axis 0..rate/2 for real input, ±rate/2 for complex.  Display
+        # zooms to 0..6 kHz on the analysis window — that's where the
+        # squared MSK144 tones live (2·(fc±500) for fc=1500 → 2000 and 4000).
+        sq_spec_time_s = sq_spec_freq_hz = sq_spec_db = None
+        try:
+            # Use the H-channel IQ at engine sample rate (48 kHz for both
+            # native captures and audio-burst-upsampled inputs).
+            _fc_audio = 1500.0 if self._meta.get('source_was_audio') else 1000.0
+            sq_spec_time_s, sq_spec_freq_hz, sq_spec_db, _det_norm = \
+                _compute_squared_spectrogram(iq_h_arr, rate, fc_hz=_fc_audio)
+        except Exception as _e:
+            import logging as _lg
+            _lg.getLogger(__name__).warning("sq_det squared spec failed: %s", _e)
+
         # ── Instantaneous carrier-freq + envelope from TFMF surface ────────
         # Derive both freq-vs-time and the envelope DIRECTLY from the TFMF
         # surface (rather than a separate squared-FFT estimator).  Whatever
@@ -388,6 +519,9 @@ class AnalysisEngine(Engine):
             'source_was_audio':   bool(self._meta.get('source_was_audio')),
             'native_audio':       self._meta.get('native_audio'),
             'native_audio_sr':    self._meta.get('native_audio_sr'),
+            'sq_spec_time_s':     sq_spec_time_s,
+            'sq_spec_freq_hz':    sq_spec_freq_hz,
+            'sq_spec_db':         sq_spec_db,
         }
 
     # ------------------------------------------------------------------

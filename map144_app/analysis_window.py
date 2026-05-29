@@ -281,13 +281,13 @@ class AnalysisWindow(QtWidgets.QWidget):
         self._det_freq_min_khz  = -float(_half_ch) - 0.5
         self._det_freq_span_khz =  float(N_CHANNELS)
         self._det_plot = pg.PlotWidget(
-            title=f"H  sq_det per-channel SNR  "
-                  f"(dB above rolling pct25 of squared-FFT pair metric; "
-                  f"detector fires at ≥ {DETECT_THRESH_DB:.0f} dB) — "
-                  f"circles: green = decoded by jt9/SPD,  "
-                  f"orange = launched but no decode"
+            title="H  sq_det squared-signal spectrogram  "
+                  "(msk144spd.f90 algorithm, 72 ms × 18 ms-step; "
+                  "expected MSK144 tones at 2·(fc±500) = 2000 & 4000 Hz) — "
+                  "circles: green = decoded by jt9/SPD, "
+                  "orange = launched but no decode"
         )
-        self._det_plot.setLabel('left',   'H  Dial offset (kHz)')
+        self._det_plot.setLabel('left',   'H  Squared-spec freq (kHz)')
         self._det_plot.getAxis('bottom').hide()
         self._det_img = pg.ImageItem(axisOrder='col-major')
         self._det_img.setColorMap(_COLORMAP)
@@ -306,7 +306,7 @@ class AnalysisWindow(QtWidgets.QWidget):
         row1_hms.addWidget(self._det_plot)
 
         self._det_plot_v = pg.PlotWidget()
-        self._det_plot_v.setLabel('left',   'V  Dial offset (kHz)')
+        self._det_plot_v.setLabel('left',   'V  Squared-spec freq (kHz)')
         self._det_plot_v.setLabel('bottom', 'Time (s)')
         self._det_img_v = pg.ImageItem(axisOrder='col-major')
         self._det_img_v.setColorMap(_COLORMAP)
@@ -855,33 +855,37 @@ class AnalysisWindow(QtWidgets.QWidget):
         else:
             self._blank_bars.setData(x=[], y=[])
 
-        # ── Detection heatmaps ────────────────────────────────────────────────
-        # Image data extends across all N_CHANNELS (±24 kHz dial offset); the
-        # *viewbox* gets zoomed to the audio band 0..6 kHz when the source is
-        # a 12 kHz audio WAV — that's where any real sq_det channel response
-        # could possibly sit.
+        # ── sq_det squared-signal spectrogram (replaces the channel-SNR HM) ─
+        # The image's freq axis is the FULL spectrum from the squared-spec
+        # function (0..rate/2 for real input, ±rate/2 for complex IQ); the
+        # display viewbox zooms to 0..6 kHz where the squared MSK144 tones
+        # actually sit (2·(fc±500) = 2000 and 4000 Hz for fc=1500).
+        _sq_db    = results.get('sq_spec_db')
+        _sq_freq  = results.get('sq_spec_freq_hz')
+        _sq_t     = results.get('sq_spec_time_s')
         _dlvl     = [self._det_vmin_slider.value(), self._det_vmax_slider.value()]
 
-        def _set_hm(plot, img, arr):
-            arr_v = _trim_valid(arr, idle=-999.0)
-            hm_d = np.fft.fftshift(arr_v, axes=1)
+        def _set_sq_spec(plot, img, spec_db, freq_hz_axis, t_arr):
+            if spec_db is None or spec_db.size == 0 or freq_hz_axis is None:
+                img.setImage(np.zeros((1, 1), dtype=np.float32),
+                             autoLevels=False, levels=_dlvl)
+                return
+            # Display freq axis in kHz; rect spans the actual freq range.
+            f_lo_khz = float(freq_hz_axis[0])  / 1000.0
+            f_hi_khz = float(freq_hz_axis[-1]) / 1000.0
+            n_t, n_f = spec_db.shape
             _dw  = max(plot.width(), 1)
-            _rep = max(1, -(-_dw // hm_d.shape[0]))
-            img.setImage(np.repeat(hm_d, _rep, axis=0),
+            _rep = max(1, -(-_dw // n_t))
+            img.setImage(np.repeat(spec_db, _rep, axis=0),
                          autoLevels=False, levels=_dlvl)
-            img.setRect(QtCore.QRectF(0.0, self._det_freq_min_khz,
-                                       duration, self._det_freq_span_khz))
+            img.setRect(QtCore.QRectF(0.0, f_lo_khz,
+                                       duration, f_hi_khz - f_lo_khz))
             plot.setXRange(0, duration, padding=0)
-            if _is_audio:
-                plot.setYRange(-0.5, 6.5, padding=0)        # 0–6 kHz audio band
-            else:
-                plot.setYRange(self._det_freq_min_khz - 0.5,
-                                self._det_freq_min_khz + self._det_freq_span_khz + 0.5,
-                                padding=0)
+            plot.setYRange(0, 6, padding=0)   # 0..6 kHz audio (squared band)
 
-        _set_hm(self._det_plot, self._det_img, hm)
-        if dual and hm_v is not None:
-            _set_hm(self._det_plot_v, self._det_img_v, hm_v)
+        _set_sq_spec(self._det_plot, self._det_img, _sq_db, _sq_freq, _sq_t)
+        if dual:
+            _set_sq_spec(self._det_plot_v, self._det_img_v, _sq_db, _sq_freq, _sq_t)
 
         # ── TFMF surface (H, optionally V) ────────────────────────────────────
         # _tfmf_surface_* is (n_windows, n_freq_bins) float32 SNR-dB; axis 0
