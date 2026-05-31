@@ -585,15 +585,110 @@ _TFMF_LOG_FH = None
 _TFMF_LOG_PATH = None
 
 
+def _tfmf_candidate_coherence(wb_iq: np.ndarray, c, template_length: int = 1536,
+                              ) -> float | None:
+    """Compute MSK144 within-frame sync coherence for one TFMF candidate.
+
+    Mixes the 48 kHz IQ to DC at the candidate's freq, decimates to 12 kHz,
+    extracts NSPM samples around the refined sync onset, runs the sync
+    correlator to locate the actual in-window peak shift, and evaluates
+    coherence at that peak with :func:`_sync_phase_features` — the same
+    pipeline the live runtime uses to produce ``sync_phase_coherence_h``
+    in launches.jsonl.  Real MSK144 → ≈ 0.6-0.8; impulse noise → ≈ 0.1-0.2.
+
+    Returns None on any failure (out-of-range time, missing field on the
+    candidate, decimate buffer too short, sync correlator error, …) —
+    caller logs as null.  **Must never raise** — the live TFMF worker
+    calls this for every candidate before publishing the surface to the
+    display, so any uncaught exception here blanks the TFMF window.
+
+    Empirical note (2026-05-30 shadow validation): an earlier version of
+    this function passed ish_best=0 to _sync_phase_features, assuming the
+    candidate's refined_onset placed the sync exactly at sample 0 of the
+    NSPM window.  That's only approximately true for genuine candidates
+    (sub-stride refinement is ±half-stride at 48 kHz = ~12 samples) and
+    completely wrong for spurious candidates.  Running _sync_correlate_batch
+    first finds the actual peak position regardless.
+    """
+    try:
+        from scipy.signal import decimate as _decimate
+        from .msk144_spd import (_sync_phase_features as _spf,
+                                  _sync_correlate_batch as _scb,
+                                  NSPM as _NSPM)
+        FS = 48000
+        PRE_PAD_48K  = 200      # ≥ filter group-delay window at 48 kHz
+        POST_PAD_48K = 100
+        NEED = _NSPM * 4 + PRE_PAD_48K + POST_PAD_48K
+        refined_onset = int(round(
+            c.time_sample - template_length // 2 + c.sample_epoch_offset_samples))
+        start = refined_onset - PRE_PAD_48K
+        if start < 0 or start + NEED > len(wb_iq):
+            return None
+        seg = wb_iq[start:start + NEED]
+        t = np.arange(len(seg), dtype=np.float32) / FS
+        seg_dc = (seg * np.exp(-2j * np.pi * float(c.freq_hz) * t)
+                  ).astype(np.complex64)
+        seg_12k = _decimate(seg_dc, 4, ftype='fir', zero_phase=True
+                            ).astype(np.complex64)
+        pre_pad_12k = PRE_PAD_48K // 4
+        if len(seg_12k) < pre_pad_12k + _NSPM:
+            return None
+        c_window = seg_12k[pre_pad_12k:pre_pad_12k + _NSPM].astype(np.complex64)
+        _xcc, _peak, _ish = _scb(c_window[np.newaxis, :])
+        ish_best = int(_ish[0])
+        coh, _ts, _foff = _spf(c_window, ish_best)
+        return float(coh)
+    except Exception as _exc:
+        # Logged at debug level only — these are expected for some
+        # corner-case candidates (very early in a period, malformed cand).
+        try:
+            logger.debug("tfmf coherence: %s", _exc)
+        except Exception:
+            pass
+        return None
+
+
 def _tfmf_log_candidates(cands, period_idx: int, side: str,
-                         period_secs: float = 15.0) -> None:
+                         period_secs: float = 15.0,
+                         wb_iq: 'np.ndarray | None' = None) -> None:
     """Append candidates to the JSONL log.  Caller passes only the newly-added
     accumulator entries (not the full accumulator) to avoid duplicate writes.
+
+    Enriched fields (2026-05-30, for overnight shadow-validation of TFMF
+    vs sq_det):
+      - time_sample / sample_epoch_offset_samples / template_length:
+        sub-sample refined sync onset → frame phase (mod NSPM at 12 kHz).
+      - sync_phase_coherence:
+        within-frame coherence ratio (MAP144's own metric).  ≈ 1.0 for
+        real MSK144, ≈ 0.1 for noise.  Only computed when ``wb_iq`` is
+        passed in (caller has it from the period worker).
     """
     if not cands:
         return
     global _TFMF_LOG_FH, _TFMF_LOG_PATH
     period_start_wall = period_idx * period_secs
+    # Pre-compute coherences outside the file lock so the lock duration
+    # stays sub-millisecond.  Per-candidate decimate is ~20-50 ms; running
+    # 5-10 of those in a row inside the lock would serialize threads.
+    # Wrap each call defensively — _tfmf_candidate_coherence is documented
+    # not to raise, but any leak would blank the TFMF display window since
+    # this function is called from the period worker BEFORE the display
+    # setattr lines in _publish.
+    # Kill-switch: set ``MAP144_TFMF_COHERENCE=0`` in the env to skip
+    # coherence entirely (live runtime stays safe from any native-code
+    # bug in scipy.signal.decimate or numba sync_correlate that might
+    # surface only on certain inputs).  Default ON.
+    import os as _os
+    _coh_enabled = _os.environ.get('MAP144_TFMF_COHERENCE', '1') != '0'
+    coherences = []
+    if wb_iq is not None and _coh_enabled:
+        for _c in cands:
+            try:
+                coherences.append(_tfmf_candidate_coherence(wb_iq, _c))
+            except Exception:
+                coherences.append(None)
+    else:
+        coherences = [None] * len(cands)
     with _TFMF_LOG_LOCK:
         try:
             if _TFMF_LOG_FH is None:
@@ -601,18 +696,22 @@ def _tfmf_log_candidates(cands, period_idx: int, side: str,
                 _TFMF_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
                 _TFMF_LOG_FH = open(_TFMF_LOG_PATH, 'a', buffering=1)
                 logger.info("[tfmf] candidate log: %s", _TFMF_LOG_PATH)
-            for c in cands:
+            for c, coh in zip(cands, coherences):
                 _abs_wall = period_start_wall + float(c.time_s)
                 _ts = datetime.fromtimestamp(_abs_wall, tz=timezone.utc).strftime(
                     "%Y-%m-%d_%H:%M:%S.%f")[:-5]
                 _TFMF_LOG_FH.write(_json.dumps({
-                    'timestamp':      _ts,
-                    'period_idx':     int(period_idx),
-                    'pol':            side,
-                    't_s_in_period':  float(c.time_s),
-                    'freq_hz':        float(c.freq_hz),
-                    'snr_db':         float(c.snr_db),
-                    'raw_magnitude':  float(c.raw_magnitude),
+                    'timestamp':       _ts,
+                    'period_idx':      int(period_idx),
+                    'pol':             side,
+                    't_s_in_period':   float(c.time_s),
+                    'freq_hz':         float(c.freq_hz),
+                    'snr_db':          float(c.snr_db),
+                    'raw_magnitude':   float(c.raw_magnitude),
+                    'time_sample':     int(c.time_sample),
+                    'sample_epoch_offset_samples':
+                                       float(c.sample_epoch_offset_samples),
+                    'sync_phase_coherence': coh,
                 }) + '\n')
         except Exception as _e:
             logger.warning("TFMF log write failed: %s", _e)
@@ -644,7 +743,7 @@ def _tfmf_period_worker(engine, wb_iq_h: np.ndarray,
     is re-rendered with a different (longer-window) per-bin noise floor.
     """
 
-    def _publish(surf, cands, side: str) -> None:
+    def _publish(surf, cands, side: str, wb_iq: 'np.ndarray | None') -> None:
         # Period rollover — drop accumulator from the previous period.
         idx_attr = f'_tfmf_period_idx_{side}'
         max_t_attr = f'_tfmf_period_max_t_{side}'
@@ -678,8 +777,16 @@ def _tfmf_period_worker(engine, wb_iq_h: np.ndarray,
 
         # Log newly-added candidates to the JSONL bake-in log (one line per
         # candidate; thread-safe via _tfmf_log_candidates' internal lock).
+        # Passing the wideband IQ lets the logger compute per-candidate
+        # within-frame coherence (channelize+_sync_phase_features path) so
+        # tomorrow's TFMF-vs-sq_det comparison has both SNR and coherence.
+        # Wrapped so any logging failure cannot blank the TFMF display:
+        # display setattr lines below MUST run on every successful surface.
         if _newly_added:
-            _tfmf_log_candidates(_newly_added, period_idx, side)
+            try:
+                _tfmf_log_candidates(_newly_added, period_idx, side, wb_iq=wb_iq)
+            except Exception as _exc:
+                logger.warning("TFMF log failed (display still updated): %s", _exc)
 
         # Advance covered-time pointer to the end of the current surface.
         n_win = surf.shape[0]
@@ -700,7 +807,7 @@ def _tfmf_period_worker(engine, wb_iq_h: np.ndarray,
             if offset_in_period_s:
                 for _c in _cands_h:
                     _c.time_s += offset_in_period_s
-            _publish(_surf_h, _cands_h, 'h')
+            _publish(_surf_h, _cands_h, 'h', wb_iq_h)
     except Exception as _e:
         logger.warning("TFMF worker (H): %s", _e)
     if wb_iq_v is not None:
@@ -710,7 +817,7 @@ def _tfmf_period_worker(engine, wb_iq_h: np.ndarray,
                 if offset_in_period_s:
                     for _c in _cands_v:
                         _c.time_s += offset_in_period_s
-                _publish(_surf_v, _cands_v, 'v')
+                _publish(_surf_v, _cands_v, 'v', wb_iq_v)
         except Exception as _e:
             logger.warning("TFMF worker (V): %s", _e)
     engine._tfmf_worker_busy = False
