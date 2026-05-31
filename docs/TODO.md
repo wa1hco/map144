@@ -6,7 +6,8 @@ numbers are stable IDs referenced from
 under `~/.claude/projects/-home-jeff-ham-map144/memory/` — do **not**
 renumber to close gaps (e.g. the missing `#19`).
 
-Last updated: 2026-05-07 (Phase 3 #5–#9a landed; metric enrichment
+Last updated: 2026-05-30 (#43 WAV-open paint-segfault diagnosed + filed).
+Earlier: 2026-05-07 (Phase 3 #5–#9a landed; metric enrichment
 landed-uncommitted; ML / clustering / classifier items added as #29–#39).
 
 ---
@@ -457,6 +458,46 @@ See `project_ml_qso_classifier_plan` memory for the full plan; see
     Architectural impact absorbed into `#11` Stage 2:
     DecoderBlock IQ ring sized for 15 s (was 5 s) so period-mode
     can read the full window when the time comes.
+
+43. ⬜ **Segfault: pyqtgraph zero-copy use-after-free on paint when
+    opening a WAV** — intermittent `Fatal Python error: Segmentation
+    fault` shortly after `Loaded WAV source`. Diagnosed 2026-05-30.
+
+    **Mechanism (consistent with evidence; code-grounded, not yet
+    caught in a live native frame):** `process_iq_data` *reassigns*
+    the spectrogram buffers at each 15-s boundary — `self.spectrogram_data
+    = self.spec_staging.copy()` and `self.spec_staging = np.full(...)`
+    (`processing.py:2052`, `:2055`; V variants `:2062-2063`). The GUI
+    thread paints from that same attribute via
+    `self.spectrogram_img.setImage(self.spectrogram_data)`
+    (`displays.py:232-246`). pyqtgraph's ImageItem can hold a **zero-copy
+    raw C pointer** into the numpy buffer for deferred QImage rendering;
+    if the worker thread replaces the Python array object while Qt is
+    mid-paint, the old buffer is freed under Qt → dangling pointer →
+    segfault on the paint event. This exact hazard is already documented
+    in `_reset_wav_timeline` (`runtime.py:741-744`), which deliberately
+    fills in-place (`[:]`) to avoid it — `process_iq_data` does **not**.
+
+    **Verified:** offscreen Qt (`QT_QPA_PLATFORM=offscreen`) never
+    crashes (no paint); 5 live `:1` repros across Flex-connected,
+    all-windows-open, and exact no-Flex conditions ran clean → it is an
+    intermittent paint-timing race, not the DSP path and not Flex
+    teardown (`FlexDAXIQ.stop()` after a failed `start()` is a no-op —
+    all native handles still `None`, `client.py:275-281`).
+
+    **Precondition that exposed it 2026-05-30:** power outage left the
+    Flex powered off; startup auto-restores the last source mode
+    (`ui.py:798`), `'radio'` → auto-select Flex → fails "No FlexRadio
+    found" → operator then opened a WAV, routing a fresh process straight
+    into the WAV-paint path. Normally (Flex on) the restored source
+    streams Flex and the WAV path isn't entered at startup.
+
+    **Fix direction:** make the period-boundary spectrogram updates
+    in-place like `_reset_wav_timeline` already does (reuse the same
+    buffer objects; double-buffer with two pre-allocated arrays and
+    fill, never reassign), or have the GUI `setImage` copy / hold a
+    snapshot ref under a lock. Repro harness + native-frame catcher in
+    `scratch/repro_segfault.py` / `scratch/catch_segfault.sh`.
 
 ---
 
