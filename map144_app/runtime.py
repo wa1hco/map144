@@ -159,6 +159,30 @@ def _fg_resize_for_plot_count(self):
 FLEX_DAXIQ_FULL_SCALE = 32768.0
 
 
+def _clear_decode_panel_on_source_start(self):
+    """Wipe the decode panel on a source start, EXCEPT for the very first
+    start of the session.
+
+    setup_ui calls _restore_decode_history to populate the panel with the
+    last 200 decodes from disk so right-click → analysis-window survives a
+    restart.  Without this gate, the first successful source start (which
+    fires shortly after via the deferred QTimer.singleShot in setup_ui)
+    would enqueue a panel-clear and wipe the restored history before the
+    operator even saw it.  Subsequent source switches still clear, so
+    "fresh source = fresh decode list" behaviour is preserved mid-session.
+    """
+    if not hasattr(self, 'decode_panel'):
+        return
+    if getattr(self, '_decode_panel_session_started', False):
+        # Enqueue a clear sentinel rather than touching the QListWidget from
+        # this (worker) thread — the GUI drain loop in displays.py performs
+        # the wipe on the GUI thread.  See _reset_wav_timeline.
+        dq = getattr(self, '_decode_queue', None)
+        if dq is not None:
+            dq.put({'clear': True})
+    self._decode_panel_session_started = True
+
+
 def setup_radio_client(self):
     """Start the runtime thread.  The DAXIQ connection is deferred until
     the user selects 'Flex Radio' from the File menu."""
@@ -225,8 +249,7 @@ def _start_airspy_source(self) -> bool:
         self._airspy_started = True
         if hasattr(self, '_jt9_markers'):
             self._jt9_markers.clear()
-        if hasattr(self, 'decode_panel'):
-            self.decode_panel.clear()
+        _clear_decode_panel_on_source_start(self)
         return True
     except Exception as exc:
         print(f"[airspy] start error: {exc}", flush=True)
@@ -272,8 +295,7 @@ def _start_rtlsdr_source(self) -> bool:
         self._rtlsdr_started = True
         if hasattr(self, '_jt9_markers'):
             self._jt9_markers.clear()
-        if hasattr(self, 'decode_panel'):
-            self.decode_panel.clear()
+        _clear_decode_panel_on_source_start(self)
         return True
     except Exception as exc:
         print(f"[rtlsdr] start error: {exc}", flush=True)
@@ -404,8 +426,7 @@ def _start_sdrangel_source(self) -> bool:
         self._sdrangel_started = True
         if hasattr(self, '_jt9_markers'):
             self._jt9_markers.clear()
-        if hasattr(self, 'decode_panel'):
-            self.decode_panel.clear()
+        _clear_decode_panel_on_source_start(self)
         return True
     except Exception as exc:
         print(f"[sdrangel] start error: {exc}", flush=True)
@@ -526,8 +547,7 @@ def _start_usrp_source(self) -> bool:
         self._usrp_started = True
         if hasattr(self, '_jt9_markers'):
             self._jt9_markers.clear()
-        if hasattr(self, 'decode_panel'):
-            self.decode_panel.clear()
+        _clear_decode_panel_on_source_start(self)
         return True
     except Exception as exc:
         logger.error("[usrp] start error: %s", exc)
@@ -690,8 +710,7 @@ def _start_radio_source(self) -> bool:
         self._radio_started = True
         if hasattr(self, '_jt9_markers'):
             self._jt9_markers.clear()
-        if hasattr(self, 'decode_panel'):
-            self.decode_panel.clear()
+        _clear_decode_panel_on_source_start(self)
         return True
     except Exception as exc:
         print(f"Radio client start error: {exc}", flush=True)
@@ -768,10 +787,13 @@ def _reset_wav_timeline(self):
     self._iq_ring_gen = getattr(self, '_iq_ring_gen', 0) + 1
     if hasattr(self, '_jt9_markers'):
         self._jt9_markers.clear()
-    if hasattr(self, 'decode_panel'):
-        self.decode_panel.clear()
-    # Drain any queued decode results from the previous WAV so stale marker
-    # updates don't arrive after _jt9_markers has been cleared.
+    # Drain stale queued decode results from the previous WAV (so they don't
+    # arrive after _jt9_markers has been cleared), THEN enqueue a clear
+    # sentinel.  This runs on the WAV worker thread; decode_panel is a
+    # QListWidget and must never be touched off the GUI thread.  The queue is
+    # the clean DSP->UI interface — the GUI drain loop in displays.py performs
+    # the actual clear on the GUI thread.  The sentinel goes in AFTER the
+    # drain so we don't discard it.
     dq = getattr(self, '_decode_queue', None)
     if dq is not None:
         import queue as _q
@@ -780,6 +802,7 @@ def _reset_wav_timeline(self):
                 dq.get_nowait()
             except _q.Empty:
                 break
+        dq.put({'clear': True})
 
     # Reset percentile baseline so the first frames of a new WAV are not
     # compared against a stale noise floor from the previous run.

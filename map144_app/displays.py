@@ -337,6 +337,14 @@ def update_displays(self):
                 result = dq.get_nowait()
             except Exception:
                 break
+            # Control sentinel: a worker thread requests a panel wipe (new WAV
+            # load / source start).  decode_panel is a QListWidget and must be
+            # mutated only on the GUI thread — which is here.  The worker
+            # enqueues {'clear': True} instead of touching the widget directly
+            # (see _reset_wav_timeline / _clear_decode_panel_on_source_start).
+            if isinstance(result, dict) and result.get('clear'):
+                self.decode_panel.clear()
+                continue
             mid = result.get('marker_id', -1)
             if mid in _marker_by_id:
                 outcome = result.get('outcome', 'decoded')
