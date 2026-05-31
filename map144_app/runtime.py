@@ -171,6 +171,10 @@ def _clear_decode_panel_on_source_start(self):
     operator even saw it.  Subsequent source switches still clear, so
     "fresh source = fresh decode list" behaviour is preserved mid-session.
     """
+    # Re-anchor the dual-clock TimeBase on this (live) source open so a stale
+    # WAV-relative anchor can't leak in (the 1970 TFMF-timestamp bug).  Must run
+    # regardless of whether a decode_panel exists (headless engines have none).
+    self._timebase_anchor_pending = True
     if not hasattr(self, 'decode_panel'):
         return
     if getattr(self, '_decode_panel_session_started', False):
@@ -780,6 +784,8 @@ def _reset_wav_timeline(self):
     self._iq_ring_pos = 0
     self._iq_abs_sample = 0
     self._iq_t0_wall = None
+    # Re-anchor the dual-clock TimeBase on WAV (re)load with this run's policy.
+    self._timebase_anchor_pending = True
     if hasattr(self, '_sync_buf'):
         self._sync_buf[:]   = 0
         self._sync_buf_v[:] = 0

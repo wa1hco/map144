@@ -650,7 +650,8 @@ def _tfmf_candidate_coherence(wb_iq: np.ndarray, c, template_length: int = 1536,
 
 def _tfmf_log_candidates(cands, period_idx: int, side: str,
                          period_secs: float = 15.0,
-                         wb_iq: 'np.ndarray | None' = None) -> None:
+                         wb_iq: 'np.ndarray | None' = None,
+                         period_start_wall_abs: 'float | None' = None) -> None:
     """Append candidates to the JSONL log.  Caller passes only the newly-added
     accumulator entries (not the full accumulator) to avoid duplicate writes.
 
@@ -666,7 +667,15 @@ def _tfmf_log_candidates(cands, period_idx: int, side: str,
     if not cands:
         return
     global _TFMF_LOG_FH, _TFMF_LOG_PATH
-    period_start_wall = period_idx * period_secs
+    # Absolute UTC of the period start.  Prefer the TimeBase-supplied value
+    # (block-stream-design §3.5 — anchored to time.time(), re-anchored per
+    # source open, so no WAV-relative anchor can leak in).  Fall back to the
+    # legacy relative form only if the caller didn't supply it (e.g. a unit
+    # test) — that form is what produced the 1970 stamps in production.
+    if period_start_wall_abs is not None:
+        period_start_wall = float(period_start_wall_abs)
+    else:
+        period_start_wall = period_idx * period_secs
     # Pre-compute coherences outside the file lock so the lock duration
     # stays sub-millisecond.  Per-candidate decimate is ~20-50 ms; running
     # 5-10 of those in a row inside the lock would serialize threads.
@@ -720,7 +729,8 @@ def _tfmf_log_candidates(cands, period_idx: int, side: str,
 def _tfmf_period_worker(engine, wb_iq_h: np.ndarray,
                          wb_iq_v: 'np.ndarray | None',
                          offset_in_period_s: float,
-                         period_idx: int) -> None:
+                         period_idx: int,
+                         period_start_utc: 'float | None' = None) -> None:
     """Background-thread worker: compute TFMF surface for H (and V if present)
     and publish results onto the engine.  Wideband CPU compute is ~7 s (CPU)
     or ~0.7 s (GPU); running either on the main process_iq_data thread starves
@@ -784,7 +794,8 @@ def _tfmf_period_worker(engine, wb_iq_h: np.ndarray,
         # display setattr lines below MUST run on every successful surface.
         if _newly_added:
             try:
-                _tfmf_log_candidates(_newly_added, period_idx, side, wb_iq=wb_iq)
+                _tfmf_log_candidates(_newly_added, period_idx, side, wb_iq=wb_iq,
+                                     period_start_wall_abs=period_start_utc)
             except Exception as _exc:
                 logger.warning("TFMF log failed (display still updated): %s", _exc)
 
@@ -1230,6 +1241,21 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
     # mid-period): the surface's first sample is the OLDEST available IQ,
     # which may be later than period_start — the offset shifts the image
     # rect right so it lands at the correct period-relative time.
+    # ── Dual-clock TimeBase: anchor on source open, mark periods (live) ──────
+    # The TFMF candidate timestamp is stamped from this (TimeBase.utc_at),
+    # never from period_idx*15 — the relative-anchor path that produced 1970
+    # stamps when a WAV-relative anchor leaked into a live run.  Re-anchored to
+    # time.time() on every source open (_timebase_anchor_pending).
+    if getattr(self, '_timebase_anchor_pending', False):
+        self.timebase.reset(sample=self._iq_abs_sample, wall=time.time())
+        self._timebase_anchor_pending = False
+    elif self.source_mode != "wav":
+        # Live: re-pair (sample, wall) at each 15-s UTC boundary so long-run
+        # TCXO drift cannot accumulate (block-stream-design §3.5).
+        _tb_now = time.time()
+        if self.timebase.should_mark_period(_tb_now):
+            self.timebase.mark_period_start(sample=self._iq_abs_sample, wall=_tb_now)
+
     if (self._iq_t0_wall is not None
             and not self._tfmf_worker_busy
             and (_loop_wall - self._tfmf_last_dispatch_time
@@ -1239,6 +1265,8 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         _period_start_abs = int(
             (_period_start_wall - self._iq_t0_wall) * self.sample_rate
         )
+        _period_start_utc = (self.timebase.utc_at(_period_start_abs)
+                             if self.timebase.is_anchored() else None)
         _ring_size = self._iq_ring.shape[0]
         _oldest_abs = self._iq_abs_sample - _ring_size
         _actual_start_abs = max(_period_start_abs, _oldest_abs)
@@ -1260,7 +1288,8 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
                 self._tfmf_last_dispatch_time = _loop_wall
                 threading.Thread(
                     target=_tfmf_period_worker,
-                    args=(self, _wb_h, _wb_v, _offset_s, _period_idx),
+                    args=(self, _wb_h, _wb_v, _offset_s, _period_idx,
+                          _period_start_utc),
                     daemon=True, name='tfmf-period',
                 ).start()
 

@@ -23,6 +23,7 @@ from pathlib import Path
 import numpy as np
 
 from .channelizer import design_channelizer_filter, make_channelizer_state, N_CHANNELS, CH_SAMPLE_RATE
+from .timebase import TimeBase
 from .processing import (
     process_iq_data as _process_iq_data,
     N_SNR_HIST, CH_DETECT_SIZE, _METRIC_HIST_DEPTH,
@@ -421,6 +422,12 @@ class Engine:
         # Used by extract_and_decode to derive the exact ping epoch from the IQ
         # sample index, immune to pipeline / queue latency.
         self._iq_t0_wall: float | None = None
+        # Dual-clock owner (block-stream-design §3.5).  Anchored to time.time()
+        # and re-anchored on every source open (_timebase_anchor_pending) so a
+        # WAV-relative anchor cannot leak into a live run (the 2026-05-31 "1970
+        # TFMF timestamp" bug).  Period-marked for live to bound long-run drift.
+        self.timebase = TimeBase(self.sample_rate, period_secs=15.0)
+        self._timebase_anchor_pending = True
         self._detect_cooldowns   = {}
         self._ch_above_thresh    = {}   # ch_k -> consecutive hops above threshold
         self._iq_ring_gen = 0
