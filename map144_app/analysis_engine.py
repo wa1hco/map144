@@ -461,16 +461,29 @@ class AnalysisEngine(Engine):
                                  if _AUDIO_F_MIN_HZ <= c.freq_hz <= _AUDIO_F_MAX_HZ]
 
         # ── sq_det squared-signal spectrogram (canonical msk144spd view) ──
-        # Y axis 0..rate/2 for real input, ±rate/2 for complex.  Display
-        # zooms to 0..6 kHz on the analysis window — that's where the
-        # squared MSK144 tones live (2·(fc±500) for fc=1500 → 2000 and 4000).
+        # For audio-burst sources (12 kHz mono saved by detection.py), feed
+        # the NATIVE 12 kHz real audio — that's the exact input contract
+        # msk144spd.f90 was written for (analytic-at-audio-carrier, 12 kHz
+        # sample rate, fc=1500 Hz audio carrier so squared lines fall at
+        # 2000 and 4000 Hz).  Running on the upsampled-to-48 kHz analytic
+        # form is mathematically equivalent but adds an upsample stage we
+        # have no operational reason to validate.
+        # For 48 kHz IQ captures (not yet on disk in this repo, but the
+        # path stays valid for when they appear), fall back to the 48 kHz
+        # complex-IQ form with fc=1000 (per existing live-runtime choice).
         sq_spec_time_s = sq_spec_freq_hz = sq_spec_db = None
         try:
-            # Use the H-channel IQ at engine sample rate (48 kHz for both
-            # native captures and audio-burst-upsampled inputs).
-            _fc_audio = 1500.0 if self._meta.get('source_was_audio') else 1000.0
-            sq_spec_time_s, sq_spec_freq_hz, sq_spec_db, _det_norm = \
-                _compute_squared_spectrogram(iq_h_arr, rate, fc_hz=_fc_audio)
+            _native_audio = self._meta.get('native_audio')
+            _native_sr    = self._meta.get('native_audio_sr')
+            if (self._meta.get('source_was_audio')
+                    and _native_audio is not None and _native_sr is not None):
+                sq_spec_time_s, sq_spec_freq_hz, sq_spec_db, _det_norm = \
+                    _compute_squared_spectrogram(
+                        np.asarray(_native_audio, dtype=np.float32),
+                        int(_native_sr), fc_hz=1500.0)
+            else:
+                sq_spec_time_s, sq_spec_freq_hz, sq_spec_db, _det_norm = \
+                    _compute_squared_spectrogram(iq_h_arr, rate, fc_hz=1000.0)
         except Exception as _e:
             import logging as _lg
             _lg.getLogger(__name__).warning("sq_det squared spec failed: %s", _e)

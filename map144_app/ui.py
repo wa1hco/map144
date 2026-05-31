@@ -830,6 +830,10 @@ def on_min_level_changed(self, value):
     self.min_level_label.setText(f"Min: {value} dB")
     self.spectrogram_img.setLevels([value, self.max_level])
     self.realtime_img.setLevels([value, self.max_level])
+    if hasattr(self, 'spectrogram_img_v'):
+        self.spectrogram_img_v.setLevels([value, self.max_level])
+    if hasattr(self, 'realtime_img_v'):
+        self.realtime_img_v.setLevels([value, self.max_level])
 
 
 def on_max_level_changed(self, value):
@@ -837,18 +841,26 @@ def on_max_level_changed(self, value):
     self.max_level_label.setText(f"Max: {value} dB")
     self.spectrogram_img.setLevels([self.min_level, value])
     self.realtime_img.setLevels([self.min_level, value])
+    if hasattr(self, 'spectrogram_img_v'):
+        self.spectrogram_img_v.setLevels([self.min_level, value])
+    if hasattr(self, 'realtime_img_v'):
+        self.realtime_img_v.setLevels([self.min_level, value])
 
 
 def on_detect_min_level_changed(self, value):
     self.detect_min_level = value * 0.5
     self.detect_min_level_label.setText(f"Min: {self.detect_min_level:.1f} dB")
     self.ch_detect_img.setLevels([self.detect_min_level, self.detect_max_level])
+    if hasattr(self, 'ch_detect_img_v'):
+        self.ch_detect_img_v.setLevels([self.detect_min_level, self.detect_max_level])
 
 
 def on_detect_max_level_changed(self, value):
     self.detect_max_level = value * 0.5
     self.detect_max_level_label.setText(f"Max: {self.detect_max_level:.1f} dB")
     self.ch_detect_img.setLevels([self.detect_min_level, self.detect_max_level])
+    if hasattr(self, 'ch_detect_img_v'):
+        self.ch_detect_img_v.setLevels([self.detect_min_level, self.detect_max_level])
 
 
 def on_sync_detect_min_level_changed(self, value):

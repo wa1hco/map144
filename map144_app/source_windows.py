@@ -600,14 +600,35 @@ def setup_flex_window(self, view_action):
         _saved_radio_ip = str(_SETTINGS.value('flex_radio_ip', ''))
     except Exception:
         _saved_radio_ip = ''
+    # Drop a previously-saved value that clearly isn't an address (e.g. a typo
+    # like "yes" that would crash socket.connect at startup).
+    if _saved_radio_ip and ('.' not in _saved_radio_ip and ':' not in _saved_radio_ip):
+        print(f"[radio] discarding non-address Radio IP from settings: {_saved_radio_ip!r}",
+              flush=True)
+        _saved_radio_ip = ''
+        _SETTINGS.setValue('flex_radio_ip', '')
     self._flex_radio_ip_edit = QtWidgets.QLineEdit(_saved_radio_ip)
     self._flex_radio_ip_edit.setPlaceholderText("auto-discover")
-    self._flex_radio_ip_edit.setStyleSheet(
-        f"QLineEdit {{ font-family: {_FONT}; font-size: {_FSZ}; }}"
-    )
-    self._flex_radio_ip_edit.textChanged.connect(
-        lambda text: _SETTINGS.setValue('flex_radio_ip', text.strip())
-    )
+    _radio_ip_base_ss = f"QLineEdit {{ font-family: {_FONT}; font-size: {_FSZ}; }}"
+    _radio_ip_bad_ss  = (f"QLineEdit {{ font-family: {_FONT}; font-size: {_FSZ};"
+                         f" background-color: #ffe0e0; }}")
+    self._flex_radio_ip_edit.setStyleSheet(_radio_ip_base_ss)
+
+    def _on_radio_ip_changed(text: str):
+        # Accept empty (auto-discover), or anything containing a dot (IPv4 /
+        # hostname) or colon (IPv6).  Refuse to persist bare tokens like
+        # "yes" — they survive textChanged but explode at socket.connect.
+        t = text.strip()
+        valid = (t == '' or '.' in t or ':' in t)
+        if valid:
+            self._flex_radio_ip_edit.setStyleSheet(_radio_ip_base_ss)
+            _SETTINGS.setValue('flex_radio_ip', t)
+        else:
+            self._flex_radio_ip_edit.setStyleSheet(_radio_ip_bad_ss)
+            print(f"[radio] Radio IP {t!r} doesn't look like an address; not saving",
+                  flush=True)
+
+    self._flex_radio_ip_edit.textChanged.connect(_on_radio_ip_changed)
     radio_form.addRow("Radio IP:", self._flex_radio_ip_edit)
 
     radio_form.addRow("Status:",   _sl("_flex_status_val", "Idle", "#c76000"))

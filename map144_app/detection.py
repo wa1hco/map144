@@ -241,6 +241,19 @@ _DECIMATE_FACTOR = 4        # 48 kHz → 12 kHz
 _TARGET_FC_HZ = 1500.0      # jt9 expects the signal at this frequency
 _JT9_SEMAPHORE = threading.Semaphore(4)   # max concurrent jt9 processes
 
+# Maximum saved-burst WAV duration in seconds.  The audio block that goes
+# into both SPD and jt9 (and the saved WAV) is constructed as
+# ``[pad_n][pre_n][burst+post_n][pad_n]``.  jt9 path uses the EXTENDED
+# pre-window (``_pre_n_jt9 = 1.500 s``); SPD path uses 0.500 s.  Numbers:
+#
+#    pre_n_jt9 + post_n + 2*pad_n_dec = 1.500 + 1.200 + 2*0.100 = 2.900 s
+#
+# Round up to 3.000 s for a clean default plot X-axis in the analysis
+# window.  Bumping ``_pre_n_jt9`` or ``post_n`` later should also bump
+# this constant — analysis_window's default time axis pulls from here so
+# all five rows stay aligned with the audio that was actually saved.
+BURST_WAV_MAX_DURATION_S = 3.0
+
 # Pre-computed SNR estimator constants (at _DECODE_RATE = 12000 Hz)
 _SNR_N_FFT    = 1024                         # ≈ 11.7 Hz/bin  → 85 ms window
 _SNR_WINDOW   = np.hanning(_SNR_N_FFT).astype(np.float64)
