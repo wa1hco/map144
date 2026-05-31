@@ -252,6 +252,21 @@ _COINCIDENCE_SPAN_CH = 8        # spread gate: if a single cluster spans > this 
                                  # is wideband noise (real MSK144 ping + sidelobes spans ≤ 3
                                  # channels; impulse noise spans 10+ kHz = 10+ channels).
 _CH_DETECT_HOP     = CH_DETECT_SIZE // 2   # 50 % overlap hop
+
+# TODO #41c pct25-freeze gate threshold.  Freeze the rolling-baseline UPDATE
+# only when a *significant* fraction of a chunk was blanked (a real impulse
+# burst), not on any single blanked sample.  Continuous magnitude-threshold
+# blankers (e.g. NR0V-Wideband) clip the noise's own Rayleigh tail on every
+# chunk (~0.8% mean on pure AWGN at k=3.0, occasionally spiking to ~3.6%),
+# which `blank_mask.any()` treats as a permanent freeze, starving the sq_det
+# baseline (it sticks at the 1.0 init placeholder, so raw_lin/pct25 reads
+# negative and detection dies).  Impulsive RFI bursts clip ~15-20% per chunk;
+# 5% sits above the AWGN-tail spikes and well below burst levels.  This whole
+# gate is a transitional heuristic — the durable fix is the doomed-detection
+# classifier subproject (gather detection/activity metrics, predict launches
+# that cannot decode); sq_det is also being superseded by TFMF.  Tunable.
+_BLANK_FREEZE_FRACTION = 0.05
+
 # Enough slots to cover one full 15-second window at the channeliser hop rate
 N_SNR_HIST = int(15 * CH_SAMPLE_RATE / _CH_DETECT_HOP)        # = 703 (exact integer hops)
 # 703 hops × (256 / 12000) s/hop = 14.997 s (3 ms shy of 15 s, well below display
@@ -920,9 +935,13 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
     # derived from the same input samples) is the natural unit; if
     # any sample in the chunk was blanked, every hop derived from
     # that chunk is tainted.
-    _chunk_had_blank_h = bool(blank_mask.any())
+    # Freeze the baseline only on SIGNIFICANT blanking (real impulse burst),
+    # not on the trace tail-clipping a continuous blanker does every chunk.
+    # See _BLANK_FREEZE_FRACTION.  blank_mask is float32 {0.0 keep, 1.0 blank},
+    # so .mean() is the blanked fraction.
+    _chunk_had_blank_h = bool(blank_mask.mean() >= _BLANK_FREEZE_FRACTION)
     _chunk_had_blank_v = (
-        bool(_nb_result.blank_mask_v.any())
+        bool(_nb_result.blank_mask_v.mean() >= _BLANK_FREEZE_FRACTION)
         if (dual_pol and _nb_result.blank_mask_v is not None)
         else _chunk_had_blank_h   # single-pol: H mask applies to V
     )

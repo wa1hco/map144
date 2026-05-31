@@ -52,23 +52,26 @@ from map144_app.noise_blanker import (   # noqa: E402
 
 
 class _FakeBlanker(BypassBlanker):
-    """Bypass blanker that lets us force a non-empty ``blank_mask`` —
-    so we can verify the pct25 gate fires on the engine's
-    ``_skip_pct25_update_h`` / ``_v`` flags without having to
-    synthesise an impulse strong enough to trip LinradBlanker."""
+    """Bypass blanker that lets us force a chosen blanked *fraction* —
+    so we can verify the pct25 gate fires only on SIGNIFICANT blanking
+    (a real impulse burst), not on the trace tail-clipping a continuous
+    magnitude-threshold blanker does on the noise's own Rayleigh tail
+    every chunk.  The gate threshold is ``_BLANK_FREEZE_FRACTION`` in
+    processing.py; ``blank_fraction`` lets a test sit either side of it."""
 
-    def __init__(self, force_blanking: bool = False):
+    def __init__(self, force_blanking: bool = False,
+                 blank_fraction: float = 1.0):
         self.force_blanking = force_blanking
+        self.blank_fraction = blank_fraction
 
     def process(self, engine, raw, raw_v, dual_pol):
         result = super().process(engine, raw, raw_v, dual_pol)
         if self.force_blanking:
-            # Mark a single sample as blanked.  The pct25 gate is
-            # boolean (any-sample-blanked → skip-the-chunk's-history-
-            # update), so one is plenty.
-            result.blank_mask[0] = 1.0
+            n = len(result.blank_mask)
+            k = max(1, int(round(n * self.blank_fraction)))
+            result.blank_mask[:k] = 1.0
             if result.blank_mask_v is not None:
-                result.blank_mask_v[0] = 1.0
+                result.blank_mask_v[:k] = 1.0
         return result
 
 
@@ -118,14 +121,15 @@ class TestPct25BlankerGate(unittest.TestCase):
         )
 
     def test_blanker_firing_freezes_history(self):
-        """When ``_FakeBlanker`` reports a blanked sample, all hops
-        derived from that chunk must skip the history append —
-        ``_metric_hist_cnt`` stays put for that chunk."""
+        """When the blanker excises a SIGNIFICANT fraction of a chunk (a
+        real impulse burst, here 100%), all hops derived from that chunk
+        must skip the history append — ``_metric_hist_cnt`` stays put."""
         # First push warms the channelizer + establishes a baseline.
         for _ in range(5):
             self._push()
         cnt_baseline = self.engine._metric_hist_cnt
-        # Flip the blanker into "blanking" mode for ONE chunk.
+        # Flip the blanker into "burst" mode (default blank_fraction=1.0)
+        # for ONE chunk — well above _BLANK_FREEZE_FRACTION.
         self.engine.blanker.force_blanking = True
         self._push()
         cnt_after_blanked = self.engine._metric_hist_cnt
@@ -141,6 +145,26 @@ class TestPct25BlankerGate(unittest.TestCase):
         self.assertGreater(
             self.engine._metric_hist_cnt, cnt_after_blanked,
             "Once blanker stops firing, history should resume growing.",
+        )
+
+    def test_trace_blanking_does_not_freeze_history(self):
+        """Trace tail-clipping BELOW ``_BLANK_FREEZE_FRACTION`` — what a
+        continuous magnitude-threshold blanker (e.g. NR0V-Wideband) does to
+        the noise's own Rayleigh tail on essentially every chunk — must NOT
+        freeze the baseline.  The old ``blank_mask.any()`` gate froze it,
+        starving the sq_det pct25 at its 1.0 init placeholder so detection
+        died.  Here ~0.5% blanked (< the 3% gate) must keep history growing."""
+        for _ in range(5):
+            self._push()
+        cnt_baseline = self.engine._metric_hist_cnt
+        self.engine.blanker.force_blanking = True
+        self.engine.blanker.blank_fraction = 0.005   # 0.5% << gate
+        self._push()
+        self.assertGreater(
+            self.engine._metric_hist_cnt, cnt_baseline,
+            "Trace blanking below _BLANK_FREEZE_FRACTION must NOT freeze the "
+            "pct25 baseline — otherwise a continuous blanker permanently "
+            "starves sq_det detection.",
         )
 
     def test_skip_flag_propagated_to_sync_correlator(self):
