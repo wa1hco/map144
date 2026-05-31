@@ -128,6 +128,49 @@ landed-uncommitted; ML / clustering / classifier items added as #29–#39).
        replace `process_iq_data` wholesale.  Cleanest architecturally;
        lands as part of Phase 5 cleanup (#13–#16).
 
+## 🔄 Stream-oriented refactor — de-monolith `process_iq_data` (active, 2026-05-31)
+
+Supersedes the stalled big-bang cut-over (§13.7 above): that step had no
+incremental payoff, so it kept losing to detection work. Re-sliced so each step
+ships a standalone, testable win. **Policy:** a legacy-path bug triggers the
+matching slice instead of an in-place patch (CLAUDE.md "Refactor / migration
+policy"). Built on the ratified dual-clock contract (block-stream-design §3.5).
+
+- R1. ⬜ **`TimeBase` — dual-clock value object owned by the Source.** Captures
+  the independent `(sample_counter, wall_clock)` pair per §3.5 (never derives one
+  from the other, never slews either). Per-period anchoring: `mark_period_start(
+  sample)` reads one synchronized `(period_start_sample, period_start_wall)` pair
+  at each 15-s boundary; `utc_at(event_sample) = period_start_wall + (event_sample
+  - period_start_sample)/rate` (sample-precise within the period, fresh UTC per
+  period, no cross-period drift). Also `period_index`. One reset point (source
+  open) with an explicit per-source anchor policy (radio = `time.time()`; WAV = a
+  chosen policy, not ≈0 by accident). Removes the scattered
+  `_iq_t0_wall` / `_loop_wall` / `_pkt_time*` arithmetic and the
+  `source_mode=='wav'` time branches from the DSP core. **Acceptance test: the
+  1970 TFMF-timestamp bug cannot recur** (WAV→radio transition; long-run drift).
+  Closes that bug structurally rather than by patch.
+- R2. ⬜ **Source emits timestamped sample-records.** Every record carries both
+  clocks as metadata (§3.5 "records carry both anchors"); downstream stages read
+  time from the record, never re-derive. Deletes per-section time recomputation
+  in `process_iq_data`.
+- R3. ⬜ **Split `process_iq_data` into stream stages** (blank → ring/buffer →
+  channelize → detect → display), each consuming/producing typed records. This is
+  the real cut-over (folds §13.7 option 2/3); lands stage-by-stage behind the
+  existing shadow/parity gates (Phase 4 §10), not all at once.
+- R4. ⬜ **`TFMFDetectorGPU` as a block — block-only, never on the legacy path.**
+  Lift `experiments/gpu_tfmf` + `_build_tfmf_display_surface` into a real block
+  consuming device IQ + dual-clock metadata, emitting candidate records.
+  Conditional on GPU via the graph builder (capability probe → topology):
+  CPU-parity graph = `Channelizer → Detector(sq+sync)`; GPU-beat graph =
+  `TFMFDetectorGPU` (drops channelizer + sq_det — matched filter is linear, no
+  intermod, per `experiments/gpu_tfmf/README.md`). Device-resident across GPU
+  blocks; host↔device transfer only at ingress (upload IQ) / egress (download the
+  small candidate set). GPU-vs-CPU parity is a first-class shadow gate.
+  **Forward intent (beat-WSJTX phase):** TFMF/GPU eventually owns *frame
+  selection* — finding the frames worth coherent integration, and finding
+  multipath frames that can be combined (multi-Doppler). Draw the R4 block
+  boundaries so they don't foreclose that.
+
 ## ⬜ Phase 5 — cleanup after the cut-over
 
 13. ⬜ Delete squared-FFT detector path (after sync detector validated

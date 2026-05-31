@@ -307,6 +307,41 @@ Every sample-bearing Record has both `start_sample` (sample clock) and
 - **Cross-station / cross-system correlation** uses wall-clock fields
   exclusively.
 
+#### Period anchoring — timing events within a 15-s period
+
+Keeping the clocks separate leaves one question: what absolute UTC do we stamp
+on an event detected mid-period? Two naive answers are both wrong:
+
+- `time.time()` read at *event-processing* time — contaminated by per-event
+  processing latency (detection/decode/log lag), so the stamp is later than when
+  the ping actually arrived.
+- `period_start_wall + event_sample / rate` from a *single session-start* anchor
+  — accumulates TCXO drift over the whole run. This is the legacy 1970-bug shape.
+
+The rule: **at each 15-s period boundary, capture one synchronized
+`(period_start_sample, period_start_wall)` pair** — both clocks read together,
+once per period. An event at `event_sample` within that period is stamped:
+
+    utc(event) = period_start_wall + (event_sample - period_start_sample) / sample_rate
+
+Why this is correct:
+
+- **Intra-period timing is sample-precise and monotonic.** The offset
+  `(event_sample - period_start_sample)` is exact, so sub-burst timing and event
+  ordering within the period are exact — which is what burst-mode placement and
+  coherent-integration frame selection need.
+- **The period's absolute UTC is fresh.** `period_start_wall` is re-read each
+  period, so cross-period drift cannot accumulate.
+- **No event-latency jitter.** The stamp reflects when the *samples* arrived, not
+  when a block got around to processing them.
+
+Drift *within* one period is negligible (15 s × 1 ppm = 15 µs), so the short
+sample-derived interval is safe; only *cross-period* extrapolation is unsafe, and
+the per-period re-pair eliminates it. This is "compare the two clocks once per
+period," **not** "slew either clock" — the clocks stay independent and
+uncorrected (next subsection). `TimeBase` owns this: `mark_period_start(sample)`
+captures the synchronized pair; `utc_at(event_sample)` applies the formula above.
+
 #### Drift is observable, not corrected
 
 The Source publishes a `ClockHealth` event roughly once per second:
@@ -383,6 +418,37 @@ preserved. DSP behaviour is unchanged — `start_sample` is untouched.
 
 The hook is **not** a production feature. It is the only practical way to
 write an automated test for clock-drift handling.
+
+#### Cautionary tale — the legacy monolith violates this section
+
+The pre-refactor `process_iq_data` (`processing.py`) **derives wall clock from
+sample count**, exactly what the rule above (this §3.5, "must not assume
+`start_sample / sample_rate_hz ≈ wall_clock_elapsed`") forbids:
+`_loop_wall = _iq_t0_wall + _iq_abs_sample / sample_rate`, then
+`period_idx = int(_loop_wall / 15)`. It keeps a single session-start anchor
+(`_iq_t0_wall`) as mutable engine state, reset in only one place
+(`_reset_wav_timeline`, the WAV path).
+
+On 2026-05-31 this produced the **1970-epoch TFMF-timestamp bug**: a session
+that ran WAV replays (anchor driven to ≈0) then switched to live radio
+inherited the stale ≈0 anchor — the live-start path never reset it — so
+`_loop_wall` became seconds-since-start, `period_idx` went tiny, and
+`datetime.fromtimestamp(period_idx*15)` landed in 1970. ~200k overnight
+candidates were unusable for time-windowed comparison; "TFMF saw 0/378 signals"
+was a measurement artifact of the broken timestamp, not a detection failure.
+
+The architecture keeps the two clocks independent and never slews either one.
+The *only* place they are compared is a synchronized re-pair at each period
+boundary ("Period anchoring" above), used to anchor intra-period event timing —
+once every 15 s, the natural cadence, never extrapolated across periods. The
+legacy bug is the opposite shape: a single session-start anchor, wall *derived*
+from sample, mutated as engine state, leaking across a source switch.
+
+The fix is **not** another anchor-reset patch (see CLAUDE.md "Refactor /
+migration policy") — it is the `TimeBase` migration: one owner (the Source),
+one reset point (source open) with an explicit per-source anchor policy
+(radio = `time.time()`; WAV = a chosen policy, not ≈0 by accident). **The 1970
+bug is `TimeBase`'s acceptance test.**
 
 ---
 

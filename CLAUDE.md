@@ -128,6 +128,28 @@ When discussing modifications, always state:
 - What downstream stage consumes it.
 - Whether the change affects timing, phase, scaling, or statistical assumptions.
 
+## Refactor / migration policy
+
+MAP144 is mid-migration from a legacy monolith (`process_iq_data`, ~1100 LOC in
+`processing.py`) to the block/stream architecture (`docs/block-stream-design.md`).
+The migration stalled once because the cut-over was framed as one big-bang step
+with no incremental payoff. To keep it moving:
+
+- **A bug in pre-refactor (legacy-monolith) code is a trigger to migrate that
+  piece onto the block/stream path — not to patch it in place.** Do not add
+  another patch to the legacy path. Fix the bug by moving the responsibility to
+  its refactored home, behind tests; the bug becomes that slice's acceptance
+  test. (Example: the 2026-05-31 "1970 TFMF timestamp" bug is fixed by the
+  `TimeBase` migration, not an anchor-reset patch.)
+- **Slice the refactor so each step ships a concrete, testable win on its own.**
+  No step should depend on the whole cut-over.
+- Exception (in-place legacy patch allowed): a production-down emergency, or a
+  fix far smaller than the migration with the migration already scheduled — and
+  say so explicitly when taking the exception.
+
+Corollary: when asked to "fix" a legacy-path bug, first state which refactor
+slice owns it and migrate that, rather than reaching for the patch.
+
 ## Mathematical conventions
 
 Do not change mathematical conventions casually. If a convention is inferred rather than explicit, ask for confirmation.
