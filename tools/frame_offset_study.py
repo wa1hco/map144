@@ -43,12 +43,44 @@ if str(_REPO) not in sys.path:
 
 from scipy.signal import hilbert, fftconvolve, find_peaks    # noqa: E402
 from map144_app.msk144_spd import (                          # noqa: E402
-    NSPM, FS, _SYNC_CB, _sync_phase_features,
+    NSPM, FS, _SYNC_CB, _sync_correlate, _sync_phase_features,
 )
 
 # Matched-filter kernel: time-reversed conjugate of the 42-sample MSK144 sync
 # waveform.  |fftconvolve(signal, this)| peaks at each true sync onset.
 _SYNC_MF = np.conj(_SYNC_CB[::-1]).astype(np.complex64)
+
+MAP144_BURSTS = _REPO / "MSK144" / "detections"   # 12 kHz isolated burst WAVs
+
+
+# ── VALIDATED frame-offset measurement (2026-05-31 study) ────────────────────
+# The reliable method: per-burst FREQUENCY SEARCH around 1500 Hz, then
+# FRAME-ALIGNED non-overlapping NSPM windows through the decoder's
+# _sync_correlate.  ``ish_best`` is the sync position WITHIN the frame = the
+# frame offset directly (no window-position term — that was the +18 ms slide
+# bug).  Per-frame ``xmax`` is the sync-correlation strength; STRONG frames
+# (the pings we optimise) give sub-sample-stable offsets, weak ones scatter.
+# Measured on the 11k MAP144 burst WAVs: strong (strength>=6) bursts have
+# within-burst σ ≈ 0.6 samples (0.05 ms) → ~360 distinguishable stations.
+def clean_burst_offsets(audio: np.ndarray, f_search=range(1450, 1551, 10)):
+    """(frame_offsets, strengths, best_freq) for a single isolated burst.
+
+    frame_offsets[i] / strengths[i] are the sync position-in-frame and
+    correlation strength for the i-th NSPM frame, at the best-fit carrier."""
+    z = hilbert(audio).astype(np.complex64)
+    nn = np.arange(len(z), dtype=np.float64)
+    best = None
+    for f0 in f_search:
+        zd = (z * np.exp(-2j * np.pi * f0 * nn / FS)).astype(np.complex64)
+        ish, xm = [], []
+        for k in range(0, len(zd) - NSPM, NSPM):     # FRAME-ALIGNED, no overlap
+            _xcc, xmax, o = _sync_correlate(np.ascontiguousarray(zd[k:k + NSPM]))
+            ish.append(int(o)); xm.append(float(xmax))
+        xm = np.array(xm, np.float32)
+        score = float(np.sort(xm)[-3:].mean()) if len(xm) >= 3 else 0.0
+        if best is None or score > best[0]:
+            best = (score, np.array(ish), xm, f0)
+    return (best[1], best[2], best[3]) if best else (np.array([]), np.array([]), 1500)
 
 WSJTX = Path("/home/jeff/.local/share/WSJT-X - flex")
 ALL_TXT = WSJTX / "ALL.TXT"
@@ -249,14 +281,58 @@ def run_corpus(limit: int, per: dict, coh_thresh: float):
         print(f"=> N ≈ {NSPM/(4*max(ms,1e-3)):.0f} distinguishable stations (k=4·σ_median)")
 
 
+def run_map144(limit: int):
+    """Within-station σ on MAP144's isolated, station-labelled burst WAVs —
+    the clean per-station dataset (no overlap, pre-shifted to 1500 Hz)."""
+    import glob
+    import random
+    files = sorted(glob.glob(str(MAP144_BURSTS / "*.wav")))
+    random.seed(1)
+    random.shuffle(files)
+    sig = []
+    for f in files[:limit]:
+        try:
+            w = wave.open(f)
+            if w.getframerate() != 12000:
+                continue
+            audio = np.frombuffer(w.readframes(w.getnframes()),
+                                  np.int16).astype(np.float32) / 32768.0
+        except Exception:
+            continue
+        ish, xm, _f0 = clean_burst_offsets(audio)
+        if len(ish) < 4:
+            continue
+        hi = ish[xm > float(np.median(xm)) * 1.8]
+        if len(hi) < 4:
+            continue
+        _m, std, R = _circ_stats(hi)
+        strength = float(np.sort(xm)[-3:].mean())
+        if strength >= 6 and std < 2.0 and R > 0.5:      # clean strong ping
+            sig.append(std)
+    sig = np.array(sig)
+    if len(sig):
+        ms = float(np.median(sig))
+        print(f"clean strong MAP144 bursts: n={len(sig)}  within-station σ "
+              f"median={ms:.2f} samp ({ms*1000/FS:.3f} ms)  p90={np.percentile(sig,90):.2f}")
+        print(f"=> sub-sample stable; N ≈ {NSPM/(4*max(ms,0.01)):.0f} "
+              f"distinguishable stations (k=4·σ)")
+    else:
+        print("no clean strong bursts found in sample")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--period", help="validate one period YYMMDD_HHMMSS")
     ap.add_argument("--list", type=int, metavar="N", help="list N multi-station periods")
     ap.add_argument("--corpus", type=int, metavar="N", help="aggregate over N periods")
+    ap.add_argument("--map144", type=int, metavar="N",
+                    help="within-station σ on N MAP144 burst WAVs (the clean dataset)")
     ap.add_argument("--coh", type=float, default=0.40, help="coherence threshold")
     args = ap.parse_args()
+    if args.map144:
+        run_map144(args.map144)
+        return
     per = load_periods()
     if args.period:
         run_period(args.period, per, args.coh)
