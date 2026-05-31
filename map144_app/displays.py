@@ -136,7 +136,14 @@ def _format_bandwidth_hz(bandwidth_hz):
     return f"{int(round(bw / 1e3))} kHz"
 
 
-_CAND_MAP_STRIDE_SAMPLES = 24.0   # MSK144 symbol @ 48 kHz; epoch range ≈ ±stride/2
+# Epoch-samples that span the full hue wheel.  The parabolic sub-stride epoch
+# clusters tightly (measured 2026-05-31 on 5000 live candidates: std ≈ 2.4
+# samples, 91% within ±4, full range ±12 hit by <1%), so mapping the
+# theoretical ±stride/2 = ±12 to the wheel wasted ~2/3 of the colours —
+# everything landed green→cyan→blue.  8 maps the ±4 bulk across the whole wheel
+# for strong per-station contrast; the rare ±8-12 tail aliases (acceptable).
+# Tunable: smaller → more contrast + more tail aliasing; larger → calmer.
+_CAND_MAP_EPOCH_HUE_SPAN = 8.0
 
 
 def _cand_map_size(snr_db: float) -> float:
@@ -150,7 +157,7 @@ def _cand_map_brush(epoch_samples: float, coherence):
     within-frame sync coherence (vivid = MSK144-like, faded = incoherent spur).
     ``coherence`` may be None (not computed) → a neutral mid alpha."""
     import pyqtgraph as pg
-    hue = ((float(epoch_samples) / _CAND_MAP_STRIDE_SAMPLES) + 0.5) % 1.0
+    hue = ((float(epoch_samples) / _CAND_MAP_EPOCH_HUE_SPAN) + 0.5) % 1.0
     coh = 0.5 if coherence is None else max(0.0, min(1.0, float(coherence)))
     return pg.mkBrush(pg.hsvColor(hue, 1.0, 1.0, 0.25 + 0.75 * coh))
 
