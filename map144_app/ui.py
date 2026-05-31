@@ -211,6 +211,7 @@ def setup_ui(self):
     fg_action          = QtWidgets.QAction("Fast Graph",          self)
     det_action         = QtWidgets.QAction("Tone Detection SNR",   self)
     sync_det_action    = QtWidgets.QAction("Sync Detection",       self)
+    cand_map_action    = QtWidgets.QAction("Sync Candidate Map",   self)
     iq_nb_action       = QtWidgets.QAction("Noise Blanker",  self)
     reporting_action   = QtWidgets.QAction("Reporting",            self)
     flex_action        = QtWidgets.QAction("Flex Radio",           self)
@@ -219,7 +220,8 @@ def setup_ui(self):
     rtlsdr_action      = QtWidgets.QAction("RTL-SDR",              self)
     sdrangel_action    = QtWidgets.QAction("SDRangel",             self)
     # Toggle-style View entries — checked state mirrors window visibility.
-    for act in (fg_action, det_action, sync_det_action, iq_nb_action, reporting_action,
+    for act in (fg_action, det_action, sync_det_action, cand_map_action, iq_nb_action,
+                reporting_action,
                 flex_action, usrp_action, airspy_action, rtlsdr_action, sdrangel_action):
         act.setCheckable(True)
         act.setChecked(True)
@@ -650,6 +652,27 @@ def setup_ui(self):
     sync_det_layout.addWidget(_make_time_ruler())
     sync_det_layout.addWidget(sync_detect_sliders)
 
+    # ── Sync Candidate Map window ─────────────────────────────────────────────
+    # Scatter of the live TFMF candidates: x=time-in-period, y=audio freq,
+    # size=SNR, colour hue=sample-epoch (same hue ⇒ same propagation delay ⇒
+    # same station, even across frequencies), alpha=within-frame sync coherence
+    # (vivid = MSK144-like, faded = incoherent spur).  Reads _tfmf_candidates_h.
+    self.cand_map_plot = pg.PlotWidget(
+        title="Sync Candidate Map — colour=epoch  α=coherence  size=SNR")
+    self.cand_map_plot.setLabel('left', 'Audio freq (kHz)')
+    self.cand_map_plot.setLabel('bottom', 'Time in period (s)')
+    self.cand_map_plot.setAspectLocked(False)
+    self.cand_map_plot.setXRange(0, 15.5, padding=0)
+    self.cand_map_plot.setYRange(-24.5, 24.5, padding=0)
+    self.cand_map_scatter = pg.ScatterPlotItem(size=8, pen=pg.mkPen(None), symbol='o')
+    self.cand_map_plot.addItem(self.cand_map_scatter)
+    self._cand_map_win = _PanelWindow(
+        "MapMSK144 — Sync Candidate Map", cand_map_action, self, 'cand_map_geometry')
+    self._cand_map_win.setMinimumSize(400, 250)
+    _cand_map_layout = QtWidgets.QVBoxLayout(self._cand_map_win)
+    _cand_map_layout.setContentsMargins(0, 0, 0, 0)
+    _cand_map_layout.addWidget(self.cand_map_plot)
+
     # ── Panel windows: source-specific ───────────────────────────────────────
     setup_iq_nb_window(self,      iq_nb_action)
     setup_reporting_window(self,  reporting_action)
@@ -669,6 +692,9 @@ def setup_ui(self):
     )
     sync_det_action.triggered.connect(
         lambda checked: self._sync_detect_win.show() if checked else self._sync_detect_win.hide()
+    )
+    cand_map_action.triggered.connect(
+        lambda checked: self._cand_map_win.show() if checked else self._cand_map_win.hide()
     )
     iq_nb_action.triggered.connect(
         lambda checked: self._iq_nb_win.show() if checked else self._iq_nb_win.hide()
@@ -727,16 +753,19 @@ def setup_ui(self):
     fg_visible  = _SETTINGS.value('fast_graph_visible', True,  type=bool)
     det_visible = _SETTINGS.value('detect_visible',     True,  type=bool)
     sync_det_visible = _SETTINGS.value('sync_detect_visible', True, type=bool)
+    cand_map_visible = _SETTINGS.value('cand_map_visible',    True, type=bool)
     iq_nb_visible      = _SETTINGS.value('iq_nb_visible',       True,  type=bool)
     reporting_visible  = _SETTINGS.value('reporting_visible',    True,  type=bool)
     fg_action.setChecked(fg_visible)
     det_action.setChecked(det_visible)
     sync_det_action.setChecked(sync_det_visible)
+    cand_map_action.setChecked(cand_map_visible)
     iq_nb_action.setChecked(iq_nb_visible)
     reporting_action.setChecked(reporting_visible)
     if fg_visible:         self._fast_graph_win.show()
     if det_visible:        self._detect_win.show()
     if sync_det_visible:   self._sync_detect_win.show()
+    if cand_map_visible:   self._cand_map_win.show()
     if iq_nb_visible:      self._iq_nb_win.show()
     if reporting_visible:  self._reporting_win.show()
 

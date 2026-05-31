@@ -1550,6 +1550,7 @@ def closeEvent(self, event):
         (getattr(self, '_fast_graph_win', None), 'fast_graph_geometry', 'fast_graph_visible'),
         (getattr(self, '_detect_win',     None), 'detect_geometry',     'detect_visible'),
         (getattr(self, '_sync_detect_win',None), 'sync_detect_geometry','sync_detect_visible'),
+        (getattr(self, '_cand_map_win',   None), 'cand_map_geometry',   'cand_map_visible'),
         (getattr(self, '_iq_nb_win',      None), 'iq_nb_geometry',      'iq_nb_visible'),
         (getattr(self, '_reporting_win',  None), 'reporting_geometry',  'reporting_visible'),
         (getattr(self, '_flex_win',       None), 'flex_geometry',       None),
@@ -1597,7 +1598,8 @@ def closeEvent(self, event):
     # top-level window (parent=None), quitOnLastWindowClosed will not fire
     # until every top-level window is closed.  _app_closing=True above ensures
     # their closeEvent accepts rather than ignoring the event.
-    for _attr in ('_fast_graph_win', '_detect_win', '_sync_detect_win', '_iq_nb_win',
+    for _attr in ('_fast_graph_win', '_detect_win', '_sync_detect_win', '_cand_map_win',
+                  '_iq_nb_win',
                   '_reporting_win', '_flex_win', '_usrp_win', '_airspy_win', '_rtlsdr_win',
                   '_sdrangel_win', '_screenshot_win'):
         _w = getattr(self, _attr, None)

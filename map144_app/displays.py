@@ -136,6 +136,25 @@ def _format_bandwidth_hz(bandwidth_hz):
     return f"{int(round(bw / 1e3))} kHz"
 
 
+_CAND_MAP_STRIDE_SAMPLES = 24.0   # MSK144 symbol @ 48 kHz; epoch range ≈ ±stride/2
+
+
+def _cand_map_size(snr_db: float) -> float:
+    """Scatter marker size from SNR (dB), clamped to a legible pixel range."""
+    return max(4.0, min(22.0, 4.0 + (float(snr_db) - 10.0) * 0.9))
+
+
+def _cand_map_brush(epoch_samples: float, coherence):
+    """Per-candidate brush: hue from sample-epoch (cyclic — same propagation
+    delay ⇒ same hue ⇒ same station, even across frequencies), alpha from
+    within-frame sync coherence (vivid = MSK144-like, faded = incoherent spur).
+    ``coherence`` may be None (not computed) → a neutral mid alpha."""
+    import pyqtgraph as pg
+    hue = ((float(epoch_samples) / _CAND_MAP_STRIDE_SAMPLES) + 0.5) % 1.0
+    coh = 0.5 if coherence is None else max(0.0, min(1.0, float(coherence)))
+    return pg.mkBrush(pg.hsvColor(hue, 1.0, 1.0, 0.25 + 0.75 * coh))
+
+
 def update_displays(self):
     """Update all display panels."""
     if len(self.realtime_data) == 0:
@@ -505,6 +524,28 @@ def update_displays(self):
                         _sync_plot_v.show()
             elif _sync_plot_v is not None and _sync_plot_v.isVisible():
                 _sync_plot_v.hide()
+
+    # ── Sync Candidate Map ────────────────────────────────────────────────────
+    # Scatter of the same TFMF candidates, encoded by station (sample-epoch →
+    # hue), confidence (coherence → alpha) and strength (SNR → size).  Its own
+    # window so the colour coding reads on a neutral background instead of
+    # fighting the SNR heatmap.  Reads _tfmf_candidates_h (the live accumulator).
+    _cm_win = getattr(self, '_cand_map_win', None)
+    _cm_scatter = getattr(self, 'cand_map_scatter', None)
+    if _cm_scatter is not None and (_cm_win is None or _cm_win.isVisible()):
+        _cm_cands = getattr(self, '_tfmf_candidates_h', [])
+        if _cm_cands:
+            _cm_scatter.setData(
+                x=[c.time_s for c in _cm_cands],
+                y=[c.freq_hz / 1000.0 for c in _cm_cands],
+                size=[_cand_map_size(c.snr_db) for c in _cm_cands],
+                brush=[_cand_map_brush(getattr(c, 'sample_epoch_offset_samples', 0.0),
+                                       getattr(c, 'sync_phase_coherence', None))
+                       for c in _cm_cands],
+                pen=None,
+            )
+        else:
+            _cm_scatter.setData(x=[], y=[])
 
     # Re-anchor the squared-FFT detection block so the sync-marker overlay
     # below still sees a valid `_hm_rect` and `markers` list — restore the

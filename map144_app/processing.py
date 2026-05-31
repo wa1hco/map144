@@ -698,6 +698,15 @@ def _tfmf_log_candidates(cands, period_idx: int, side: str,
                 coherences.append(None)
     else:
         coherences = [None] * len(cands)
+    # Attach onto the Candidate objects so the live display (Sync Candidate
+    # Map) reads the SAME value the JSONL log writes — the displayed
+    # candidates in _tfmf_candidates_* are these same objects.  One compute,
+    # two consumers.
+    for _c, _coh in zip(cands, coherences):
+        try:
+            _c.sync_phase_coherence = _coh
+        except Exception:
+            pass
     with _TFMF_LOG_LOCK:
         try:
             if _TFMF_LOG_FH is None:
