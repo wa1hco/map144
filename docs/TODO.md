@@ -157,19 +157,25 @@ policy"). Built on the ratified dual-clock contract (block-stream-design §3.5).
   channelize → detect → display), each consuming/producing typed records. This is
   the real cut-over (folds §13.7 option 2/3); lands stage-by-stage behind the
   existing shadow/parity gates (Phase 4 §10), not all at once.
-- R4. ⬜ **`TFMFDetectorGPU` as a block — block-only, never on the legacy path.**
-  Lift `experiments/gpu_tfmf` + `_build_tfmf_display_surface` into a real block
-  consuming device IQ + dual-clock metadata, emitting candidate records.
-  Conditional on GPU via the graph builder (capability probe → topology):
-  CPU-parity graph = `Channelizer → Detector(sq+sync)`; GPU-beat graph =
-  `TFMFDetectorGPU` (drops channelizer + sq_det — matched filter is linear, no
-  intermod, per `experiments/gpu_tfmf/README.md`). Device-resident across GPU
-  blocks; host↔device transfer only at ingress (upload IQ) / egress (download the
-  small candidate set). GPU-vs-CPU parity is a first-class shadow gate.
-  **Forward intent (beat-WSJTX phase):** TFMF/GPU eventually owns *frame
-  selection* — finding the frames worth coherent integration, and finding
-  multipath frames that can be combined (multi-Doppler). Draw the R4 block
-  boundaries so they don't foreclose that.
+- R4. 🔄 **TFMF as a block — block-only, never on the legacy path.**
+  - R4.1 ✅ **`TFMFDetectorBlock`** (commit `3459194`): consumes wideband IQ
+    Records, accumulates one period, runs `_build_tfmf_display_surface`
+    (GPU/CPU), emits `tfmf_candidate` Events with §3.5 period-anchored
+    dual-clock stamps. 4 unit tests (compute stubbed). Not yet wired into a
+    graph.
+  - R4.2 ⬜ **Graph-builder `(mode, gpu)` topology switch.** Capability probe →
+    topology: CPU-parity graph = `Channelizer → Detector(sq+sync)`; GPU-beat
+    graph = `TFMFDetectorBlock` (drops channelizer + sq_det — matched filter is
+    linear, no intermod, per `experiments/gpu_tfmf/README.md`). Wire R4.1's
+    block into the graph here.
+  - R4.3 ⬜ **Device-residency.** Keep IQ on the GPU across GPU blocks;
+    host↔device transfer only at ingress (upload IQ) / egress (download the
+    small candidate set).
+  - R4.4 ⬜ **GPU-vs-CPU parity gate** — first-class shadow test.
+  - **Forward intent (beat-WSJTX phase):** TFMF/GPU eventually owns *frame
+    selection* — finding the frames worth coherent integration, and finding
+    multipath frames that can be combined (multi-Doppler). Draw the R4 block
+    boundaries so they don't foreclose that.
 
 ## ⬜ Phase 5 — cleanup after the cut-over
 
