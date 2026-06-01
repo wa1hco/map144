@@ -198,6 +198,16 @@ class USRPSource:
             raise RuntimeError(
                 "UHD Python package not found — install with: sudo apt install python3-uhd"
             )
+        # UHD 4.6.0's bindings are compiled against NumPy 1.26 (the system
+        # package).  NumPy 2.x changed the PyArrayObject layout and segfaults in
+        # _recv_loop when uhd fills the IQ buffers.  If the venv has drifted off
+        # the requirements.txt pin (numpy<2), fail loudly here with a fix rather
+        # than crashing mid-capture some night.
+        if int(np.__version__.split('.')[0]) >= 2:
+            raise RuntimeError(
+                f"NumPy {np.__version__} breaks UHD streaming (needs <2). "
+                "Rebuild the environment with:  ./install.sh"
+            )
 
         self.center_freq_mhz        = center_freq_mhz
         self.target_rate            = target_rate

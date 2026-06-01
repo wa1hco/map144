@@ -37,9 +37,22 @@ print(f"Python {sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]}
 '
 
 # Create venv if missing.  Idempotent: re-runs reuse the existing one.
+#
+# --system-site-packages is REQUIRED for the USRP/B210 source: the UHD Python
+# bindings ship only as a system package (apt python3-uhd, in
+# /usr/lib/python3/dist-packages/uhd) and have no pip wheel.  A plain isolated
+# venv cannot see them, so map144 reports "UHD Python package not found" even
+# though it's installed.  Exposing system site-packages lets the venv import
+# uhd while pip-installed deps (numpy<2 etc.) still shadow their system copies.
 if [ ! -d "$REPO_DIR/.venv" ]; then
-    echo "Creating venv at $REPO_DIR/.venv ..."
-    "$PYTHON_CMD" -m venv "$REPO_DIR/.venv"
+    echo "Creating venv at $REPO_DIR/.venv (with --system-site-packages for UHD) ..."
+    "$PYTHON_CMD" -m venv --system-site-packages "$REPO_DIR/.venv"
+elif ! grep -q "include-system-site-packages = true" "$REPO_DIR/.venv/pyvenv.cfg" 2>/dev/null; then
+    # Existing venv predates this requirement — flip it on in place so UHD
+    # becomes visible without a full rebuild.
+    echo "Enabling system-site-packages on existing venv (for UHD) ..."
+    sed -i 's/include-system-site-packages = false/include-system-site-packages = true/' \
+        "$REPO_DIR/.venv/pyvenv.cfg"
 fi
 
 # Use the venv's python directly — avoids needing to source activate.
