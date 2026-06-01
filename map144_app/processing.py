@@ -1165,6 +1165,13 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         ch_out   = apply_channelizer(cleaned, self._ch_state, lp_taps=self._ch_taps)
         ch_out_v = None
 
+    # Live audio export to WSJT-X (read-only tap; no-op unless MAP144_WSJTX_AUDIO
+    # is set).  Feed the calling channel (row 0) every chunk so WSJT-X's soundcard
+    # stream stays gap-free and real-time-paced.
+    if getattr(self, '_wsjtx_export', None) is not None:
+        _wx = ch_out_v if (self._wsjtx_source == 'v' and ch_out_v is not None) else ch_out
+        self._wsjtx_export.feed(_wx[self._calling_ch_idx])
+
     # ── 3. Per-channel detection ──────────────────────────────────────────────
     # Post-TX settling gate — discard channelizer output and skip detection for
     # ~500 ms after TX ends so AGC transients don't cause false broadband triggers.

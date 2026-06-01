@@ -319,6 +319,21 @@ class Engine:
         self._ch_buf_v = np.zeros((N_CHANNELS, _ch_buf_cap), dtype=np.complex64)
         self._ch_buf_v_end = 0
 
+        # --- optional live audio export to WSJT-X (Phase 1 bridge) ----------
+        # Read-only tap of the calling channel (ch_out[0]); see
+        # wsjtx_audio_export.py.  Off unless MAP144_WSJTX_AUDIO is set, so normal
+        # runs are unaffected.
+        self._calling_ch_idx = 0          # ch_signed=0 = calling channel = row 0
+        self._wsjtx_source   = os.environ.get("MAP144_WSJTX_SOURCE", "h").lower()
+        self._wsjtx_export   = None
+        if os.environ.get("MAP144_WSJTX_AUDIO"):
+            try:
+                from .wsjtx_audio_export import WsjtxAudioExporter
+                self._wsjtx_export = WsjtxAudioExporter()
+            except Exception as e:                       # never break the engine
+                logging.getLogger(__name__).warning(
+                    "WSJT-X audio export disabled: %s", e)
+
         # Metric history (rolling 25th-percentile baseline) — independent per pol
         self._metric_hist_buf   = np.zeros((_METRIC_HIST_DEPTH, N_CHANNELS), dtype=np.float32)
         self._metric_hist_idx   = 0
