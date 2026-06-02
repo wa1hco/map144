@@ -319,20 +319,16 @@ class Engine:
         self._ch_buf_v = np.zeros((N_CHANNELS, _ch_buf_cap), dtype=np.complex64)
         self._ch_buf_v_end = 0
 
-        # --- optional live audio export to WSJT-X (Phase 1 bridge) ----------
-        # Read-only tap of the calling channel (ch_out[0]); see
-        # wsjtx_audio_export.py.  Off unless MAP144_WSJTX_AUDIO is set, so normal
-        # runs are unaffected.
+        # --- live audio export to WSJT-X (per-RF-port PipeWire sinks) --------
+        # Read-only tap of each RF port's calling channel (row 0).  The exporters
+        # are created by runtime._setup_wsjtx_audio_export when the B210 starts
+        # (default-on on Linux), keyed by RF-port index:
+        #     0 -> ch_out   (RX0)        sink 'map144_RF0'
+        #     1 -> ch_out_v (RX1)        sink 'map144_RF1'  (dual-channel only)
+        # Empty for sources/platforms where the bridge isn't active.  See
+        # wsjtx_audio_export.py.
         self._calling_ch_idx = 0          # ch_signed=0 = calling channel = row 0
-        self._wsjtx_source   = os.environ.get("MAP144_WSJTX_SOURCE", "h").lower()
-        self._wsjtx_export   = None
-        if os.environ.get("MAP144_WSJTX_AUDIO"):
-            try:
-                from .wsjtx_audio_export import WsjtxAudioExporter
-                self._wsjtx_export = WsjtxAudioExporter()
-            except Exception as e:                       # never break the engine
-                logging.getLogger(__name__).warning(
-                    "WSJT-X audio export disabled: %s", e)
+        self._wsjtx_exports  = {}         # {rf_port_idx: WsjtxAudioExporter}
 
         # Metric history (rolling 25th-percentile baseline) — independent per pol
         self._metric_hist_buf   = np.zeros((_METRIC_HIST_DEPTH, N_CHANNELS), dtype=np.float32)

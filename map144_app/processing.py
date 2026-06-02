@@ -1165,12 +1165,19 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         ch_out   = apply_channelizer(cleaned, self._ch_state, lp_taps=self._ch_taps)
         ch_out_v = None
 
-    # Live audio export to WSJT-X (read-only tap; no-op unless MAP144_WSJTX_AUDIO
-    # is set).  Feed the calling channel (row 0) every chunk so WSJT-X's soundcard
-    # stream stays gap-free and real-time-paced.
-    if getattr(self, '_wsjtx_export', None) is not None:
-        _wx = ch_out_v if (self._wsjtx_source == 'v' and ch_out_v is not None) else ch_out
-        self._wsjtx_export.feed(_wx[self._calling_ch_idx])
+    # Live audio export to WSJT-X (read-only tap; no-op unless the B210 bridge
+    # is active).  One PipeWire sink per RF port, fed from that port's calling
+    # channel (row 0) every chunk so each WSJT-X soundcard stream stays gap-free
+    # and real-time-paced: RF0 <- ch_out (RX0), RF1 <- ch_out_v (RX1).
+    _wx_exports = getattr(self, '_wsjtx_exports', None)
+    if _wx_exports:
+        _idx = self._calling_ch_idx
+        _exp0 = _wx_exports.get(0)
+        if _exp0 is not None:
+            _exp0.feed(ch_out[_idx])
+        _exp1 = _wx_exports.get(1)
+        if _exp1 is not None and ch_out_v is not None:
+            _exp1.feed(ch_out_v[_idx])
 
     # ── 3. Per-channel detection ──────────────────────────────────────────────
     # Post-TX settling gate — discard channelizer output and skip detection for

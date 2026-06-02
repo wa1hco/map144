@@ -540,13 +540,79 @@ def _connect_usrp_client(self):
         self.usrp_client = None
 
 
+def _setup_wsjtx_audio_export(self, dual: bool):
+    """Create the MAP144 -> WSJT-X PipeWire audio sinks for the B210 RF ports.
+
+    Default-on for the B210 on Linux: one null sink per RF port, named so
+    WSJT-X can record its monitor source:
+        map144_RF0   <- RX0 calling channel
+        map144_RF1   <- RX1 calling channel   (dual-channel only)
+    Labels are RF0/RF1 (hardware ports), NOT H/V -- the antenna/polarization on
+    each port is operator-dependent and may change.
+
+    Opt out entirely with env MAP144_WSJTX_AUDIO=0.  Non-Linux platforms are
+    skipped (the exporter shells out to pactl/paplay).  Never raises: a failed
+    sink disables that port's audio but must not block source start.
+    """
+    import os, sys
+    if getattr(self, '_wsjtx_exports', None):
+        return                                      # already built this session
+    if sys.platform != "linux":
+        return
+    if os.environ.get("MAP144_WSJTX_AUDIO", "1") == "0":
+        return                                      # explicit opt-out
+    from .wsjtx_audio_export import WsjtxAudioExporter
+    n_ports = 2 if dual else 1
+    exports = {}
+    for rf in range(n_ports):
+        # Programmatic name: dotted machine token (never shown in a GUI; matches
+        # the `flex.sliceA.tx` convention).  Description: the spaced human label
+        # WSJT-X/pavucontrol actually show -> the operator records
+        # "Monitor of <description>".  stream_name labels the paplay producer in
+        # pavucontrol's Playback tab.  RF0/RF1 = hardware ports, not H/V.
+        sink   = f"map144.RF{rf}.rx"
+        desc   = f"MAP144 RF{rf} RX -> WSJT-X"
+        stream = f"RF{rf} RX 12k->48k feed -> {sink}"
+        try:
+            exports[rf] = WsjtxAudioExporter(
+                sink_name=sink, label=f"RF{rf}",
+                description=desc, stream_name=stream)
+        except Exception as exc:                    # never break source start
+            logger.warning("[wsjtx-audio] RF%d sink '%s' disabled: %s",
+                           rf, sink, exc)
+    self._wsjtx_exports = exports
+    for rf in sorted(exports):
+        logger.info("[wsjtx-audio] RF%d ready -> in WSJT-X set "
+                    "Audio Input = 'Monitor of MAP144 RF%d RX -> WSJT-X'", rf, rf)
+
+
+def _teardown_wsjtx_audio_export(self):
+    """Close the B210 RF-port audio exporters (on source stop / switch away).
+
+    Each exporter's close() also unloads its null sink, so the bridge's
+    device disappears from WSJT-X when the B210 is no longer the active
+    source (rather than lingering as a silent monitor).
+    """
+    exports = getattr(self, '_wsjtx_exports', None)
+    if not exports:
+        return
+    for exp in exports.values():
+        try:
+            exp.close()
+        except Exception:
+            pass
+    self._wsjtx_exports = {}
+
+
 def _start_usrp_source(self) -> bool:
     if getattr(self, '_usrp_started', False):
         return True
     if getattr(self, 'usrp_client', None) is None:
         return False
     try:
-        _set_dual_pol(self, getattr(self.usrp_client, 'dual_channel', False))
+        _dual = getattr(self.usrp_client, 'dual_channel', False)
+        _set_dual_pol(self, _dual)
+        _setup_wsjtx_audio_export(self, _dual)
         self.usrp_client.start()
         self._usrp_started = True
         if hasattr(self, '_jt9_markers'):
@@ -567,6 +633,7 @@ def _stop_usrp_source(self):
         self.usrp_client.stop()
     except Exception:
         pass
+    _teardown_wsjtx_audio_export(self)
     self._usrp_started = False
 
 
@@ -1126,6 +1193,15 @@ def run_radio_source(self):
     """Run selected source (radio or WAV file) and feed processing pipeline."""
     while self.running:
         try:
+            # The WSJT-X audio bridge belongs to the B210 only.  The per-source
+            # branches below tear it down via _stop_usrp_source, but the Flex
+            # ("radio") path is push-based and has no branch here — so guard it
+            # centrally: any time we're not in usrp mode but the bridge is still
+            # up, drop it.  Otherwise it leaks (kept feeding the *new* source's
+            # audio into the B210-named sink).  Idempotent; fires once per switch.
+            if self.source_mode != "usrp" and getattr(self, '_wsjtx_exports', None):
+                _teardown_wsjtx_audio_export(self)
+
             if self.source_mode == "idle":
                 if self._radio_started:
                     _stop_radio_source(self)
