@@ -17,9 +17,13 @@
 Presents the same ``sample_queue`` / ``start()`` / ``stop()`` interface as
 ``AirspyHFSource`` and ``NesdrSmartSource``.
 
-Requires the UHD Python package (``import uhd``).  Install with:
-    sudo apt install python3-uhd uhd-host
-    sudo uhd_images_downloader
+Requires the UHD Python package (``import uhd``).  Install hints:
+    Linux:    sudo apt install python3-uhd uhd-host && sudo uhd_images_downloader
+    macOS:    brew install uhd && uhd_images_downloader
+    Windows:  conda install -c conda-forge uhd  (in a conda env; the pip
+              ``uhd`` package has no Windows wheels and Ettus' Windows
+              installer omits the Python bindings)
+              See docs/ALPHA_NOTES.md for the full Windows B210 setup.
 
 Hardware / signal chain
 -----------------------
@@ -54,13 +58,14 @@ Output: 48 kHz complex IQ, ±1.0 scale, timestamps as picoseconds
 
 Prerequisites
 -------------
-    sudo apt install python3-uhd uhd-host
-    sudo uhd_images_downloader
+See the module docstring above for per-OS UHD install hints, and
+docs/ALPHA_NOTES.md for the full Windows B210 walkthrough.
 """
 
 import logging
 import os
 import queue
+import sys
 import threading
 import time
 
@@ -235,18 +240,38 @@ class USRPSource:
                  device_args: str = "",
                  dual_channel: bool = False):
         if not _UHD_AVAILABLE:
-            raise RuntimeError(
-                "UHD Python package not found — install with: sudo apt install python3-uhd"
-            )
+            if sys.platform == 'win32':
+                hint = (
+                    "the UHD Python package is not pip-installable on Windows "
+                    "(no PyPI wheels; Ettus' Windows installer omits the "
+                    "bindings).  Easiest path is a conda env:\n"
+                    "    1. Install Miniconda from "
+                    "https://docs.conda.io/projects/miniconda/\n"
+                    "    2. conda create -n map144 python=3.11\n"
+                    "    3. conda activate map144\n"
+                    "    4. conda install -c conda-forge uhd\n"
+                    "    5. pip install -r requirements.txt\n"
+                    "    6. uhd_images_downloader\n"
+                    "See docs/ALPHA_NOTES.md for the full Windows B210 setup.\n"
+                    "If you have no B210 hardware on this PC, ignore this "
+                    "message and use a different source (Flex / AirSpy)."
+                )
+            elif sys.platform == 'darwin':
+                hint = "install with:  brew install uhd && uhd_images_downloader"
+            else:
+                hint = ("install with:  sudo apt install python3-uhd uhd-host "
+                        "&& sudo uhd_images_downloader")
+            raise RuntimeError(f"UHD Python package not found — {hint}")
         # UHD 4.6.0's bindings are compiled against NumPy 1.26 (the system
         # package).  NumPy 2.x changed the PyArrayObject layout and segfaults in
         # _recv_loop when uhd fills the IQ buffers.  If the venv has drifted off
         # the requirements.txt pin (numpy<2), fail loudly here with a fix rather
         # than crashing mid-capture some night.
         if int(np.__version__.split('.')[0]) >= 2:
+            rebuild = '.\\install.ps1' if sys.platform == 'win32' else './install.sh'
             raise RuntimeError(
                 f"NumPy {np.__version__} breaks UHD streaming (needs <2). "
-                "Rebuild the environment with:  ./install.sh"
+                f"Rebuild the environment with:  {rebuild}"
             )
 
         self.center_freq_mhz        = center_freq_mhz

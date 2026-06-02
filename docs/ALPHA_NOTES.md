@@ -34,9 +34,69 @@ to conserve CPU.
 
 ## Prerequisites
 
-- **Python 3.10 or newer** (3.14 verified working as of 2026-05-18).  Windows: install from [python.org](https://www.python.org/downloads/) — *not* the Microsoft Store version (that's a stub that opens the Store on first use).  Linux: your distro's `python3` package is fine on Ubuntu 22.04 / 24.04 and equivalent.
-- **WSJT-X** — provides the `jt9` decoder.  Install from [wsjt.sourceforge.io](https://wsjt.sourceforge.io/) on either OS.  MAP144 auto-discovers `jt9` in the standard install locations; you do **not** need to add it to PATH.
+### All platforms
+
+- **Python 3.10 or newer** (3.14 verified working as of 2026-05-18).
+- **WSJT-X** — provides the `jt9` decoder.  Install from [wsjt.sourceforge.io](https://wsjt.sourceforge.io/).  MAP144 auto-discovers `jt9` in the standard install locations; you do **not** need to add it to PATH.  If you have a non-standard install, set the `MAP144_JT9` environment variable to the full path of `jt9` / `jt9.exe`.
 - **Git** — to clone the repository.
+
+### Windows-specific setup
+
+1. **Install Python from [python.org](https://www.python.org/downloads/)** — *not* the Microsoft Store version (that's a stub that opens the Store on first use).  During install, tick "Add python.exe to PATH".  Verify with `python --version` in a new PowerShell window.
+2. **Install Git** from [git-scm.com](https://git-scm.com/download/win).  Default options are fine.
+3. **Install WSJT-X** from [wsjt.sourceforge.io](https://wsjt.sourceforge.io/).  MAP144 will auto-find `jt9.exe` at `C:\WSJT\wsjtx\bin\jt9.exe`, `C:\Program Files\WSJT-X\bin\jt9.exe`, or the standard Program Files (x86) path.
+4. **Avoid OneDrive-synced install locations** (e.g. `C:\Users\<you>\OneDrive\Documents\…`).  MAP144 writes WAV captures and JSONL logs continuously; OneDrive sync churn against that volume causes lag.  Recommended location: `C:\map144`.
+5. **PowerShell execution policy** — `install.ps1` and `run.bat` are designed to avoid this concern (they invoke `.venv\Scripts\python.exe` directly, so no `Activate.ps1` step is needed).  No execution-policy change required.
+
+### Linux-specific setup
+
+Your distro's `python3` package is fine on Ubuntu 22.04 / 24.04 and equivalent.  WSJT-X comes from the distro package (`sudo apt install wsjtx`) or upstream.
+
+### Radio-specific setup
+
+MAP144 supports several SDRs.  The pip dependencies in `requirements.txt` cover **FlexRadio** (works out of the box once installed below) and **NESDR / RTL-SDR** (Linux only; uses `librtlsdr`).  Other radios need extra setup:
+
+- **FlexRadio 6000 series** — no extra setup; runs on Windows or Linux.  This is the best-tested path.
+- **AirSpy HF+** — needs `libairspyhf`.  Linux: `sudo apt install libairspyhf1`.  Windows: download the AirSpy Windows driver from [airspy.com](https://airspy.com/download/) and ensure `airspyhf.dll` is on PATH.
+- **RTL-SDR / NESDR Smart** — Linux only.  `sudo apt install librtlsdr2`.
+- **USRP B210** — needs the UHD library and Python bindings.
+    - *Linux:* `sudo apt install python3-uhd uhd-host && sudo uhd_images_downloader`
+    - *macOS:* `brew install uhd && uhd_images_downloader`
+    - *Windows:* the UHD Python bindings are **not** pip-installable on Windows.  Full setup (verified end-to-end 2026-06-02 on Win11 with a B210 attached):
+
+      **One-time install:**
+
+      1. **Install the Ettus UHD Windows binary** — provides the WinUSB driver Windows needs to see the B210, plus the FX3/FPGA firmware images (~100 MB).  Grab `uhd_4.10.0.0-release_Win64_VS2022.exe` from <https://files.ettus.com/binaries/uhd/latest_release/Windows11/VS2022/> (VS2022 is the safest pick — its C++ runtime ships with Windows 11; VS2026 may need a newer VC++ redist).  Default install location is `C:\Program Files\UHD\`.
+
+      2. **Plug in the B210** (USB 3.0 port).  In Device Manager, look under "USRPs" (or "Universal Serial Bus devices") for an "Ettus" entry with no yellow ⚠.  Verify with `& "C:\Program Files\UHD\bin\uhd_find_devices.exe"` — should print a B210 entry.
+
+      3. **Install Miniconda** from <https://docs.conda.io/projects/miniconda/>.  During install: "Install for Just Me", do not add to PATH, do not register as system Python.  Use "Anaconda Prompt (Miniconda3)" from the Start menu for the next steps.
+
+      4. **Create the conda env and install UHD + map144 deps** (in Anaconda Prompt):
+         ```
+         conda create -n map144 python=3.11 -y
+         conda activate map144
+         conda install -c conda-forge uhd -y
+         cd C:\Users\<you>\Documents\map144
+         pip install -r requirements.txt
+         ```
+         (Pin numpy is `<2` for UHD compatibility; pip/conda respect that.)
+
+      5. **Smoke test** the Python bindings:
+         ```
+         python -c "import uhd; print(uhd.__version__)"
+         ```
+         Should print `4.10.0.0-release` (matching the Ettus install).
+
+      **Launching map144 with the B210:** double-click `run-b210.bat`, or from the Anaconda Prompt:
+      ```
+      set UHD_IMAGES_DIR=C:\Program Files\UHD\share\uhd\images
+      conda activate map144
+      python map144.py
+      ```
+      The `UHD_IMAGES_DIR` step is required because conda's UHD looks in its own env directory for the FX3 firmware, but the images live in the Ettus install directory.  `run-b210.bat` sets this automatically.
+
+      **For Flex-only runs**, the pip `.venv` + `run.bat` path still works — the conda env is only needed when you want the B210.
 
 ## Install
 
@@ -45,7 +105,7 @@ to conserve CPU.
 - **Linux / macOS:** `~/map144` (in your home directory)
 - **Windows:** `C:\map144` (top-level on the system drive)
 
-You can install elsewhere if you prefer — the install script doesn't care about location.  On Windows, **avoid OneDrive-synced paths** (e.g. `C:\Users\<you>\OneDrive\Documents\…`): MAP144 writes WAV captures and JSONL logs continuously, and OneDrive sync churn against that volume causes lag.
+You can install elsewhere if you prefer — the install script doesn't care about location.  (Windows OneDrive-path warning is covered in the prerequisites above.)
 
 ### Fresh install
 
