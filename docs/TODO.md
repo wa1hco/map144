@@ -6,9 +6,12 @@ numbers are stable IDs referenced from
 under `~/.claude/projects/-home-jeff-ham-map144/memory/` — do **not**
 renumber to close gaps (e.g. the missing `#19`).
 
-Last updated: 2026-05-30 (#43 WAV-open paint-segfault diagnosed + filed).
-Earlier: 2026-05-07 (Phase 3 #5–#9a landed; metric enrichment
-landed-uncommitted; ML / clustering / classifier items added as #29–#39).
+Last updated: 2026-06-02 (#43 Phase 1: documented use-after-free mechanism
+REFUTED — paused for catch-in-the-wild; #44 WSJT-X per-RF-port audio bridge
+landed; #43 also gained a live-path repro from the power-outage recovery).
+Earlier: 2026-05-30 (#43 WAV-open paint-segfault diagnosed + filed);
+2026-05-07 (Phase 3 #5–#9a landed; metric enrichment landed-uncommitted;
+ML / clustering / classifier items added as #29–#39).
 
 ---
 
@@ -534,6 +537,17 @@ See `project_ml_qso_classifier_plan` memory for the full plan; see
     teardown (`FlexDAXIQ.stop()` after a failed `start()` is a no-op —
     all native handles still `None`, `client.py:275-281`).
 
+    **2026-06-01 — live-path repro (corrects the "5 live repros ran
+    clean" note above):** the post-power-outage B210 recovery process
+    segfaulted in the *same* paint path — faulthandler traceback
+    `pyqtgraph try_make_qimage → ImageItem.render → paint → paintEvent →
+    map144.py:241 main` — while running the **live B210 source**, not
+    WAV-open. So the period-boundary spectrogram reassignment in
+    `process_iq_data` exposes the use-after-free on the **live path too**;
+    WAV-open is a frequent trigger, not a precondition. This raises the
+    priority of the in-place / snapshot fix over the WAV-only framing.
+    (Captured in the session recovery log; 6th repro overall.)
+
     **Precondition that exposed it 2026-05-30:** power outage left the
     Flex powered off; startup auto-restores the last source mode
     (`ui.py:798`), `'radio'` → auto-select Flex → fails "No FlexRadio
@@ -541,12 +555,62 @@ See `project_ml_qso_classifier_plan` memory for the full plan; see
     into the WAV-paint path. Normally (Flex on) the restored source
     streams Flex and the WAV path isn't entered at startup.
 
-    **Fix direction:** make the period-boundary spectrogram updates
-    in-place like `_reset_wav_timeline` already does (reuse the same
-    buffer objects; double-buffer with two pre-allocated arrays and
-    fill, never reassign), or have the GUI `setImage` copy / hold a
-    snapshot ref under a lock. Repro harness + native-frame catcher in
-    `scratch/repro_segfault.py` / `scratch/catch_segfault.sh`.
+    **Fix direction (SUPERSEDED — see Phase 1 below):** make the
+    period-boundary spectrogram updates in-place like `_reset_wav_timeline`
+    already does, or have the GUI `setImage` copy / hold a snapshot ref.
+
+    **Phase 1 (2026-06-02) — mechanism REFUTED; paused, catch-in-the-wild.**
+    Instrumented `pyqtgraph.ImageItem.setImage`/`paint`
+    (`scratch/paint_probe.py`). Finding (verified): **every** data-bearing
+    `setImage` hands pyqtgraph an array that OWNS its data (`base is None`,
+    a fresh `np.repeat`/`fftshift` copy) on the **MainThread** — never a
+    VIEW into a worker buffer. So the worker reassigning `spectrogram_data`
+    frees nothing pyqtgraph paints from: **the use-after-free-on-reassign
+    story cannot occur, and the in-place fix above would NOT cure it.** Do
+    not apply it blind. NaN/inf-into-`makeARGB` hypothesis also tested —
+    not present in the images that fired. Real cause still unknown (needs
+    the native C frame; the bug is rare). **Strategy:** catch it in
+    production — run the real app under gdb via
+    `scratch/catch_segfault_probe.sh` (self-tagging probe). On the next
+    natural crash: native frame → `scratch/gdb_segfault_probe.log`, culprit
+    image → `scratch/last_paint.txt`, setImage history →
+    `scratch/paint_probe.log`. Offscreen Qt does paint but doesn't repro;
+    `Xvfb` not installed → can't auto-hunt headless.
+
+44. ✅ **WSJT-X audio bridge — per-RF-port PipeWire sinks, B210 default-on,
+    lifecycle tracks source** (2026-06-01, commits `5d34eca` + earlier
+    `a883214`). One null-sink per B210 RF port (`map144.RF0.rx` /
+    `map144.RF1.rx`), created by default on Linux when the B210 starts
+    (opt out `MAP144_WSJTX_AUDIO=0`); RF0/RF1 = hardware ports, not H/V.
+    Read-only tap of each port's calling channel; PipeWire owns the
+    12→48 k resample + clock-drift absorption. Naming: dotted machine
+    name (GUI-invisible) + human `device.description` "MAP144 RFn RX ->
+    WSJT-X" (WSJT-X Input = its monitor) + `paplay --stream-name` labels
+    the producer in pavucontrol. Lifecycle: torn down whenever the B210
+    is no longer the active source (incl. the push-based Flex path via a
+    central guard in `run_radio_source`); each sink unloaded on close (no
+    `object.linger`) so a dead bridge disappears instead of going silently
+    mute. See `project_wsjtx_audio_bridge` memory; 9 tests in
+    `tests/test_wsjtx_audio_export_setup.py`.
+
+45. ⬜ **Cross-platform WSJT-X audio bridge (Windows/macOS via PortAudio).**
+    The #44 bridge is Linux-only: only two steps are OS-specific — creating
+    the virtual sink (`pactl`) and playing into it (`paplay`). Everything
+    else (PCM gen, DC→1500 Hz upconvert, auto-level, drop-queue, per-port
+    routing in `WsjtxAudioExporter`) is portable numpy. Plan: abstract a
+    `Transport` in `wsjtx_audio_export.py` —
+    - Linux: keep the auto-created null-sink + paplay (zero user setup).
+    - Windows/macOS: `PortAudioTransport(device_name=...)` via `sounddevice`,
+      writing PCM to a user-installed virtual cable. `feed()` and the DSP stay
+      byte-for-byte identical.
+    User-side prerequisites (can't create audio devices without a kernel
+    driver): **Windows = VB-CABLE** (VB-Audio; free single cable, or VB-CABLE
+    A+B / VoiceMeeter for two ports → RF0=Cable A, RF1=Cable B); **macOS =
+    BlackHole**. Add a device-name config setting (no auto-discovery off
+    Linux). Bounded effort: transport plug-in + config; the hard part (the
+    audio) is done. Deferred — surfaced 2026-06-02 while shifting MAP144
+    testing to Windows (the program runs there already, just without this
+    feature). See `project_wsjtx_audio_bridge` memory.
 
 ---
 
