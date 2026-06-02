@@ -524,9 +524,12 @@ def setup_iq_nb_window(self, view_action):
     nb_vbox.addLayout(nb_factor_row)
 
     # V-channel K slider — independent from H for polarisation-specific
-    # tuning.  Shown always, useful only when dual-pol is active; the
-    # backend silently ignores it in single-pol mode.
-    nb_factor_v_row = QtWidgets.QHBoxLayout()
+    # tuning.  Only meaningful in dual-pol, so the whole row is hidden in
+    # single-pol mode, kept in sync with the V plots (which also hide) by the
+    # update loop below.  A visible-but-inert slider misled the operator.
+    nb_factor_v_widget = QtWidgets.QWidget()
+    nb_factor_v_row = QtWidgets.QHBoxLayout(nb_factor_v_widget)
+    nb_factor_v_row.setContentsMargins(0, 0, 0, 0)
     nb_factor_v_row.addWidget(QtWidgets.QLabel("K V:"))
     self.nb_factor_v_label = QtWidgets.QLabel(
         f"{getattr(self, 'nb_factor_v', self.nb_factor):.1f}")
@@ -541,7 +544,10 @@ def setup_iq_nb_window(self, view_action):
     nb_sl_v.setTickInterval(10)
     nb_sl_v.valueChanged.connect(self.on_nb_factor_v_changed)
     nb_factor_v_row.addWidget(nb_sl_v, stretch=1)
-    nb_vbox.addLayout(nb_factor_v_row)
+    self._nb_factor_v_row = nb_factor_v_widget   # toggled with the V plots
+    nb_vbox.addWidget(nb_factor_v_widget)
+    if not getattr(self, 'dual_pol', False):
+        nb_factor_v_widget.hide()
 
     nb_status_row = QtWidgets.QHBoxLayout()
     nb_status_row.addWidget(QtWidgets.QLabel("Blanked:"))
@@ -1575,6 +1581,13 @@ def _update_iq_nb_window(self):
             nb_v.show()
         elif not _dual and nb_v.isVisible():
             nb_v.hide()
+    # K V slider row follows the same dual-pol rule as the V plots above.
+    kv_row = getattr(self, '_nb_factor_v_row', None)
+    if kv_row is not None:
+        if _dual and kv_row.isHidden():
+            kv_row.show()
+        elif not _dual and not kv_row.isHidden():
+            kv_row.hide()
 
     # IQ magnitude plot — update at 5 Hz (every other 10 Hz tick)
     if hasattr(self, 'td_curve') and self._noise_floor_ctr % 2 == 0:
