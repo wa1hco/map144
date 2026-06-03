@@ -6,9 +6,11 @@ numbers are stable IDs referenced from
 under `~/.claude/projects/-home-jeff-ham-map144/memory/` — do **not**
 renumber to close gaps (e.g. the missing `#19`).
 
-Last updated: 2026-06-02 (#43 Phase 1: documented use-after-free mechanism
-REFUTED — paused for catch-in-the-wild; #44 WSJT-X per-RF-port audio bridge
-landed; #43 also gained a live-path repro from the power-outage recovery).
+Last updated: 2026-06-02 (#25a objective envelope-morphology metrics added —
+ping/flutter/fade, the principled replacement for the subjective buckets;
+#43 Phase 1: documented use-after-free mechanism REFUTED, paused for
+catch-in-the-wild; #44 WSJT-X per-RF-port audio bridge landed; #43 also
+gained a live-path repro from the power-outage recovery).
 Earlier: 2026-05-30 (#43 WAV-open paint-segfault diagnosed + filed);
 2026-05-07 (Phase 3 #5–#9a landed; metric enrichment landed-uncommitted;
 ML / clustering / classifier items added as #29–#39).
@@ -236,6 +238,53 @@ policy"). Built on the ratified dual-clock contract (block-stream-design §3.5).
     characterise the 99 % no-decode population. `compare_decoders`
     integration still pending. See `project_signal_categories` and
     `project_launch_pattern_findings` memories.
+
+    **25a. ⬜ Objective envelope-morphology metrics (operator 2026-06-02 — the
+    principled replacement for the subjective geometry buckets above).** The
+    TRUE_PING/WEAK_FADING/STRONG_LOCAL labels are subjective and not tied to
+    P(decode).  Replace them with measurements of the per-period amplitude
+    *envelope* `E(t)` at the detected `fc` (per channel), which directly encode
+    the propagation mode.  Three morphologies and their measurable features:
+
+      1. **Ping** — single rise/peak/fall hump.  `rise_time_s`, `fall_time_s`,
+         `peak_width_s` (FWHM), `peak_count` (=1), rise/fall asymmetry (classic
+         MS ping = fast rise, slower exponential decay as the trail diffuses).
+         Short duration (~0.05–2 s).
+      2. **Flutter** — sustained above noise with roughly sinusoidal / Rayleigh
+         amplitude variation.  Defining feature: envelope-modulation rate in the
+         **0.5–3 Hz** band (FFT of `E(t)`) -> `flutter_rate_hz`, `flutter_depth_db`
+         (peak-to-trough).  Long duration.  (Aircraft scatter / moving-reflector
+         multipath Doppler.)  **Flutter is NOT mode-unique:** a strong *local*
+         beamed at you flutters from short-path multipath too (e.g. W1NB FN43,
+         56 km, +24 dB — grid-adjacent to FN42, definitely not a ping), so
+         flutter must be read jointly with range to separate local-multipath
+         (tens of km) from aircraft/tropo (~hundreds of km).  Argues for joint
+         range x morphology clustering over morphology-only labels.
+      3. **Fading** — long-duration fade-in/peak/fade-out over seconds, possibly
+         several humps per 15 s.  `env_duration_s`, `peak_count` (1–few), dominant
+         modulation **< 0.5 Hz** (slow), broad `peak_width_s`.  Long duration =>
+         unlikely a real ping.  (Tropo / Es slow fading.)
+
+    Shared envelope features (per period, per candidate): `env_duration_s` (time
+    above noise / fraction of 15 s), `peak_count` (prominence-thresholded local
+    maxima), `peak_snr_db`, per-peak rise/fall/width, `env_mod_rate_hz` +
+    `env_mod_depth_db` (envelope-modulation spectrum), Rayleigh-fit of the
+    amplitude distribution (fading vs deterministic).  Discriminators collapse to
+    **duration x peak_count x peak-shape x modulation-rate-band** (ping =
+    transient, flutter = 0.5–3 Hz, fade = < 0.5 Hz).  Compute from the per-period
+    detection-metric time series (sq/sync vs t) or the period IQ at `fc`; the
+    TFMF period surface already carries most of it.  These are objective,
+    P(decode)-relevant features that let the **cluster analysis (#34 HDBSCAN)
+    define the categories** instead of hand-labels — feeds the ML track (#33–#37).
+
+    **Operator research question (dedicated analysis, needs #26 range):** tag each
+    decode with morphology (ping / flutter / fade) AND range (great-circle from
+    `tx_grid`), then compare the **range distribution and count of ping-like vs
+    faded signals** — *do meteor pings reach farther than tropo / aircraft-scatter
+    (sustained/fading) signals?*  Physical prior: MS trails at ~100 km favour
+    ~500–2000 km single-hop, while tropo/Es and aircraft scatter have different
+    range envelopes, so the range x morphology joint distribution should separate
+    them.
 26. ⬜ Enrich `decodes.jsonl` with parsed `tx_grid` + great-circle distance
     (<200 km LOCAL, 200–800 WEAK, 800–2200 PING, >2200 long-haul)
 27. ✅ Per-launch metric enrichment in `launches.jsonl` — 11 fields
