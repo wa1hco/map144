@@ -16,12 +16,21 @@ Save PNGs and exit without GUI:
 
 import argparse
 import json
+import os
 import re
 import signal
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+import warnings
+# The .venv is created with --system-site-packages (required to reach the
+# system-installed UHD for the B210), so matplotlib's `mpl_toolkits` namespace
+# package resolves to the system copy, which mismatches the venv's matplotlib
+# and can't provide Axes3D.  We render no 3D plots, so silence that specific,
+# harmless import warning before matplotlib loads it.
+warnings.filterwarnings("ignore", message="Unable to import Axes3D")
 
 import matplotlib.dates as mdates
 import matplotlib.ticker as mticker
@@ -34,7 +43,53 @@ from PyQt5 import QtCore, QtWidgets
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-WSJTX_ALL       = Path.home() / ".local/share/WSJT-X - flex/ALL.TXT"
+# WSJT-X writes to a per-rig data dir: '<base>/WSJT-X' (default config) or
+# '<base>/WSJT-X - <rigname>' when launched with --rig-name.  The base dir is
+# OS-dependent.  find_wsjtx_all() locates the *active* rig automatically (the
+# most-recently-written ALL.TXT) so the comparison works regardless of which
+# rig name is in use, on Linux/macOS/Windows.
+_WSJTX_OVERRIDE = None      # set by --wsjtx-all / MAP144_WSJTX_ALL (pins the path)
+
+
+def find_wsjtx_all() -> Path:
+    """Return the active WSJT-X ALL.TXT, regardless of --rig-name.
+
+    Resolution order:
+      1. explicit override (--wsjtx-all or env MAP144_WSJTX_ALL),
+      2. the most-recently-modified ALL.TXT across every 'WSJT-X[ - rig]' dir
+         in the OS-standard data location(s) — i.e. the rig in use right now,
+      3. the legacy Linux default path (so callers always get a Path).
+    """
+    if _WSJTX_OVERRIDE is not None:
+        return _WSJTX_OVERRIDE
+    env = os.environ.get("MAP144_WSJTX_ALL")
+    if env:
+        return Path(env).expanduser()
+    home = Path.home()
+    bases = [
+        home / ".local/share",                 # Linux
+        home / "Library/Application Support",   # macOS
+    ]
+    appdata = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if appdata:
+        bases.append(Path(appdata))            # Windows
+    candidates: list[Path] = []
+    for base in bases:
+        try:
+            if not base.is_dir():
+                continue
+            for d in base.glob("WSJT-X*"):     # 'WSJT-X' and 'WSJT-X - <rig>'
+                f = d / "ALL.TXT"
+                if f.is_file():
+                    candidates.append(f)
+        except OSError:
+            continue
+    if candidates:
+        return max(candidates, key=lambda f: f.stat().st_mtime)
+    return home / ".local/share/WSJT-X/ALL.TXT"
+
+
+WSJTX_ALL       = find_wsjtx_all()
 MAP144_LOG      = Path(__file__).parent / "MSK144/detections/decodes.jsonl"
 MAP144_LAUNCHES = Path(__file__).parent / "MSK144/detections/launches.jsonl"
 
@@ -48,8 +103,18 @@ def period_start(ts: datetime) -> datetime:
 
 # ── Parsers ───────────────────────────────────────────────────────────────────
 
-def parse_wsjtx(path: Path):
-    """Parse WSJT-X ALL.TXT MSK144 lines into list of dicts."""
+def parse_wsjtx(path: Path, on_progress=None, date_str=None):
+    """Parse WSJT-X ALL.TXT MSK144 lines into list of dicts.
+
+    ``date_str`` (YYYYMMDD) restricts to that UTC day via a fast ``YYMMDD``
+    prefix check *before* the regex — ALL.TXT lines start 'YYMMDD_HHMMSS', so
+    this skips other days cheaply and keeps a multi-hundred-MB active rig file
+    fast (the file accumulates indefinitely).
+    """
+    results = []
+    if path is None or not Path(path).is_file():
+        return results            # no WSJT-X data for this rig — empty, not a crash
+    yymmdd = date_str[2:8] if (date_str and len(date_str) == 8) else None
     pat = re.compile(
         r'^(\d{6}_\d{6})\s+'
         r'([\d.]+)\s+Rx\s+MSK144\s+'
@@ -58,9 +123,14 @@ def parse_wsjtx(path: Path):
         r'(\d+)\s+'
         r'(.+)$'
     )
-    results = []
     with open(path, errors='replace') as f:
-        for line in f:
+        for _i, line in enumerate(f):
+            # Pump the GUI event loop every 100k lines (no-op when on_progress is
+            # None) — the active rig's ALL.TXT can be hundreds of MB.
+            if on_progress is not None and _i and _i % 100_000 == 0:
+                on_progress(_i)
+            if yymmdd is not None and not line.startswith(yymmdd):
+                continue          # different UTC day — skip before the regex
             line = line.strip()
             m = pat.match(line)
             if not m:
@@ -158,7 +228,7 @@ def normalise_msg(msg: str) -> str:
     return ' '.join(msg.upper().split())
 
 
-def parse_launches(path: Path, date_str: str | None = None) -> list[dict]:
+def parse_launches(path: Path, date_str: str | None = None, on_progress=None) -> list[dict]:
     """Parse ``launches.jsonl`` into a list of decode-attempt dicts.
 
     ``date_str`` is an optional ``YYYYMMDD`` prefix.  If supplied, lines
@@ -184,7 +254,12 @@ def parse_launches(path: Path, date_str: str | None = None) -> list[dict]:
         except Exception:
             line_prefix = None
     with open(path) as f:
-        for line in f:
+        for _i, line in enumerate(f):
+            # Pump the GUI event loop every 100k lines (no-op when on_progress is
+            # None) so the window-manager "Not responding" prompt doesn't fire
+            # while scanning a multi-GB launches.jsonl on the main thread.
+            if on_progress is not None and _i and _i % 100_000 == 0:
+                on_progress(_i)
             line = line.strip()
             if not line:
                 continue
@@ -1365,6 +1440,7 @@ def _make_launch_pattern_fig(
     date_label: str = '',
     max_points: int = 50_000,
     pan_offset_khz: float = 1.5,
+    on_progress=None,
 ) -> Figure:
     """Frequency-vs-time scatter of every launch in ``launches_path``,
     color-coded by ``analyze_launches.classify`` pattern label.
@@ -1401,6 +1477,7 @@ def _make_launch_pattern_fig(
         since=since,
         calling_khz=calling_khz,
         max_pan_offset_khz=pan_offset_khz,
+        on_progress=on_progress,
     )
     # ``until`` filter: load_launches only supports ``since``; trim post-load.
     if until is not None and len(data["ts_epoch"]) > 0:
@@ -1793,8 +1870,17 @@ class CompareGUI(QtWidgets.QMainWindow):
 
     def _do_run(self):
         # ── Load data ─────────────────────────────────────────────────────────
-        self._set_status("Step 1/8: Loading WSJT-X ALL.TXT…")
-        wsjtx_all  = parse_wsjtx(WSJTX_ALL)
+        # Re-discover the active WSJT-X rig dir each run so we track whichever
+        # rig name is currently in use (no hardcoded rig).
+        wsjtx_path = find_wsjtx_all()
+        _rig = wsjtx_path.parent.name        # e.g. 'WSJT-X' or 'WSJT-X - flex'
+        self._set_status(f"Step 1/8: WSJT-X ALL.TXT — {_rig}…")
+        wsjtx_all  = parse_wsjtx(
+            wsjtx_path,
+            date_str=self._date_edit.text().strip() or None,
+            on_progress=lambda n: self._set_status(
+                f"Step 1/8: scanning {_rig}/ALL.TXT…  {n:,} lines"),
+        )
         self._set_status(f"Step 2/8: Loading MAP144 decodes.jsonl…  "
                          f"({len(wsjtx_all)} WSJT-X)")
         map144_all = parse_map144(MAP144_LOG)
@@ -1834,6 +1920,8 @@ class CompareGUI(QtWidgets.QMainWindow):
             launches = parse_launches(
                 MAP144_LAUNCHES,
                 date_str=date_str if date_str else None,
+                on_progress=lambda n: self._set_status(
+                    f"Step 3/8: scanning launches.jsonl…  {n:,} lines"),
             )
 
         # ── Match ─────────────────────────────────────────────────────────────
@@ -1949,6 +2037,8 @@ class CompareGUI(QtWidgets.QMainWindow):
             MAP144_LAUNCHES, calling_khz=50260.0,
             since=launch_since, until=launch_until,
             date_label=date_label,
+            on_progress=lambda n: self._set_status(
+                f"Step 8/8: launch-pattern — scanning launches.jsonl…  {n:,} lines"),
         )
 
         # Close old figures to release memory
@@ -2303,6 +2393,7 @@ class CompareGUI(QtWidgets.QMainWindow):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    global WSJTX_ALL, _WSJTX_OVERRIDE
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--date',   default=None, help='UTC date YYYYMMDD')
@@ -2316,6 +2407,10 @@ def main():
     ap.add_argument('--utc',    default=None, metavar='HH:MM-HH:MM')
     ap.add_argument('--launches', metavar='FILE', default=str(MAP144_LAUNCHES))
     ap.add_argument('--no-launches', action='store_true')
+    ap.add_argument('--wsjtx-all', metavar='PATH', default=None,
+                    help='Override the WSJT-X ALL.TXT path.  Default: auto-detect '
+                         "the active rig (most-recently-written ALL.TXT across all "
+                         "'WSJT-X[ - <rig>]' data dirs, any OS).")
     ap.add_argument('--my-grid', default='FN42EV',
                     help="Operator's Maidenhead grid (4 or 6 char) for "
                          "great-circle range column and the local-vs-distant "
@@ -2324,10 +2419,13 @@ def main():
                     help='High-density callsign within this range = STRONG_LOCAL; '
                          'beyond = CONT_PROP (default 300)')
     args = ap.parse_args()
+    if args.wsjtx_all:
+        _WSJTX_OVERRIDE = Path(args.wsjtx_all).expanduser()
+    WSJTX_ALL = find_wsjtx_all()
 
     if args.no_gui:
         # ── Headless CLI path ─────────────────────────────────────────────────
-        wsjtx_all  = parse_wsjtx(WSJTX_ALL)
+        wsjtx_all  = parse_wsjtx(WSJTX_ALL, date_str=args.date)
         map144_all = parse_map144(MAP144_LOG)
         map144_all = [d for d in map144_all if not is_test_message(d['message'])]
 
