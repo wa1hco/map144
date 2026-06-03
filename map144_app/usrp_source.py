@@ -73,10 +73,22 @@ logger = logging.getLogger(__name__)
 # Probe for UHD Python package at import time — fail gracefully
 # ---------------------------------------------------------------------------
 
-# Suppress UHD's INFO-level startup chatter ("Asking for clock rate", etc.)
-# unless the caller has already set UHD_LOG_LEVEL in the environment.
-# Override with UHD_LOG_LEVEL=info (or lower) to re-enable those messages.
-os.environ.setdefault('UHD_LOG_LEVEL', 'warning')
+# UHD logging.  Keep the CONSOLE quiet — UHD's INFO chatter ("Asking for clock
+# rate", register loopback, …) is noise — but route a full info-level log to a
+# per-process FILE so MAP144 can surface the *meaningful* lines (the two-phase
+# firmware/FPGA load, USB mode, and USB/transfer errors) to the GUI + its own
+# log, without the chatter.  Tailed in USRPSource._drain_uhd_log().  Every var
+# is setdefault, so an explicit operator UHD_LOG_* env always wins.
+os.environ.setdefault('UHD_LOG_LEVEL',         'info')      # allow info into the sinks
+os.environ.setdefault('UHD_LOG_CONSOLE_LEVEL', 'warning')   # …but keep the console quiet
+from pathlib import Path as _Path
+_uhd_log_dir = _Path(__file__).resolve().parent.parent / 'MSK144' / 'logs'
+try:
+    _uhd_log_dir.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
+os.environ.setdefault('UHD_LOG_FILE',       str(_uhd_log_dir / f'uhd_{os.getpid()}.log'))
+os.environ.setdefault('UHD_LOG_FILE_LEVEL', 'info')
 
 try:
     import uhd as _uhd
@@ -84,6 +96,34 @@ try:
 except ImportError:
     _uhd = None
     _UHD_AVAILABLE = False
+
+# Stage 3 — a tiny SUBPROCESS (its own GIL) that heartbeats the console while
+# UHD's make() holds the main process's GIL through the firmware/FPGA load, and
+# tails the UHD log so the literal load lines stream live if UHD flushes them.
+# ASCII-only (passed via `python -c`).  argv: log_path, start_byte_pos, t0.
+_STARTUP_TICKER_SRC = r'''
+import sys, os, time
+path, pos, t0 = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+KEEP = ("firmware","fpga","operating over usb","detected device",
+        "error","libusb","no device")
+last = 0.0
+while time.time() - t0 < 180.0:          # safety cap; parent kills us first
+    try:
+        if path and os.path.exists(path):
+            with open(path, errors="replace") as f:
+                f.seek(pos); chunk = f.read(); pos = f.tell()
+            for ln in chunk.splitlines():
+                if any(k in ln.lower() for k in KEEP):
+                    print("[usrp]   . " + ln.split(",", 5)[-1].strip(), flush=True)
+    except OSError:
+        pass
+    now = time.time()
+    if now - last >= 3.0:
+        last = now
+        print("[usrp] still opening B210... %.0fs (firmware/FPGA over USB; please wait)"
+              % (now - t0), flush=True)
+    time.sleep(0.4)
+'''
 
 # ---------------------------------------------------------------------------
 # Packet compatible with VitaPacket interface expected by runtime.py
@@ -230,11 +270,57 @@ class USRPSource:
         self.ch0_rms     = None  # rolling RMS amplitude for display (ch0)
         self.ch1_rms     = None  # rolling RMS amplitude for display (ch1)
         self.recv_count  = 0    # total recv() calls that returned n > 0 (monotonic)
+        # Startup observability — surfaced live in the GUI receiver label + the
+        # console heartbeat so the operator isn't staring at a black box during
+        # the firmware/FPGA load (make) or a slow USB stream start.
+        self.startup_phase = 'idle'   # idle|opening|configuring|waiting_iq|streaming
+        self.startup_t0    = 0.0      # wall time the current start() began
+        self._startup_active = False  # gates the console startup-watcher thread
+        # Stage 2 — tail UHD's own log file for the literal firmware/FPGA/USB lines.
+        self.uhd_log_path   = os.environ.get('UHD_LOG_FILE')
+        self._uhd_log_pos   = 0       # read cursor (bytes) into uhd_log_path
+        self.startup_detail = ''      # latest meaningful UHD log line (GUI + heartbeat)
+        self._startup_proc  = None    # Stage-3 live-console subprocess (GIL-free)
 
     # ── Public API ────────────────────────────────────────────────────────
 
     def start(self):
-        self._usrp = _uhd.usrp.MultiUSRP(self.device_args)
+        # 'opening' covers the UHD make() — firmware + FPGA two-phase load (can be
+        # several minutes over a marginal USB link); the GUI shows the elapsed.
+        self.startup_phase = 'opening'
+        self.startup_t0    = time.time()
+        self.startup_detail = ''
+        try:   # start the UHD-log cursor at EOF so we read only THIS open's lines
+            self._uhd_log_pos = (os.path.getsize(self.uhd_log_path)
+                                 if self.uhd_log_path and os.path.exists(self.uhd_log_path)
+                                 else 0)
+        except OSError:
+            self._uhd_log_pos = 0
+        # Console heartbeat in its own thread so it prints DURING the blocking
+        # make()/stream-setup (the recv-loop heartbeat can't — it doesn't run
+        # until the stream is up).  Covers the firmware/FPGA load + slow USB.
+        self._startup_active = True
+        threading.Thread(target=self._startup_watcher, daemon=True,
+                         name='usrp-startup').start()
+        # UHD's MultiUSRP() holds the GIL through the firmware+FPGA load, so the
+        # in-process watcher/GUI freeze DURING it.  A GIL-free subprocess gives a
+        # live console heartbeat (and streams the UHD load lines if UHD flushes).
+        print("[usrp] opening B210 - loading firmware/FPGA; on a marginal USB "
+              "link this can take 30-60 s and the UI may freeze.  Please wait...",
+              flush=True)
+        self._spawn_startup_ticker()
+        try:
+            self._usrp = _uhd.usrp.MultiUSRP(self.device_args)
+        finally:
+            self._kill_startup_ticker()
+        # Skip the make-phase lines the ticker already streamed so the in-process
+        # watcher doesn't re-print them.
+        try:
+            if self.uhd_log_path and os.path.exists(self.uhd_log_path):
+                self._uhd_log_pos = os.path.getsize(self.uhd_log_path)
+        except OSError:
+            pass
+        self.startup_phase = 'configuring'   # make() done; now rate/tune/stream setup
 
         channels = [0, 1] if self.dual_channel else [0]
 
@@ -315,6 +401,9 @@ class USRPSource:
         else:
             self._nco_table = None
             self._nco_step = 0.0
+        # Stream command issued; the device may take a while to actually deliver
+        # IQ over a marginal USB link.  'waiting_iq' until the first samples land.
+        self.startup_phase = 'waiting_iq'
         self._running = True
         self._thread = threading.Thread(target=self._recv_loop, daemon=True,
                                         name='usrp-recv')
@@ -333,6 +422,9 @@ class USRPSource:
 
     def stop(self):
         self._running = False
+        self._startup_active = False
+        self._kill_startup_ticker()
+        self.startup_phase = 'idle'
         if self._streamer is not None:
             try:
                 stream_cmd = _uhd.types.StreamCMD(_uhd.types.StreamMode.stop_cont)
@@ -385,6 +477,82 @@ class USRPSource:
                 float((getattr(self, phase_attr) + self._nco_step * ns) % (2.0 * np.pi)))
         return out
 
+    def _spawn_startup_ticker(self):
+        """Launch the Stage-3 GIL-free console ticker for the duration of make()."""
+        if not self.uhd_log_path:
+            return
+        import subprocess
+        import sys as _sys
+        try:
+            self._startup_proc = subprocess.Popen(
+                [_sys.executable, '-c', _STARTUP_TICKER_SRC,
+                 self.uhd_log_path, str(self._uhd_log_pos), str(self.startup_t0)])
+        except Exception:
+            self._startup_proc = None
+
+    def _kill_startup_ticker(self):
+        p, self._startup_proc = getattr(self, '_startup_proc', None), None
+        if p is not None and p.poll() is None:
+            try:
+                p.terminate(); p.wait(timeout=1.0)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+    _UHD_KEEP = ('firmware', 'fpga', 'operating over usb', 'detected device',
+                 'error', 'libusb', 'no device', 'overflow', 'timeout')
+
+    def _drain_uhd_log(self):
+        """Read new UHD_LOG_FILE lines since the last drain and surface the
+        meaningful ones (firmware/FPGA two-phase load, USB mode, transfer errors)
+        to the Python log + startup_detail.  Filters UHD's per-call chatter."""
+        p = self.uhd_log_path
+        if not p:
+            return
+        try:
+            with open(p, 'r', errors='replace') as f:
+                f.seek(self._uhd_log_pos)
+                chunk = f.read()
+                self._uhd_log_pos = f.tell()
+        except OSError:
+            return
+        for line in chunk.splitlines():
+            line = line.strip()
+            if line and any(k in line.lower() for k in self._UHD_KEEP):
+                logger.info("[uhd] %s", line)
+                # UHD's FILE log is CSV: ts,thread,file:line,level,component,msg
+                # — the message is the field after the 5th comma (keeps commas).
+                self.startup_detail = line.split(',', 5)[-1].strip()[:64]
+
+    def _startup_watcher(self):
+        """Console heartbeat during startup, in its own thread so it prints while
+        the blocking make()/stream-setup runs, and tails UHD's own log for the
+        literal firmware/FPGA/USB lines.  Exits once streaming, on stop, or after
+        a safety cap so a failed start() can't loop forever."""
+        _names = {'opening':     'opening device (firmware/FPGA)',
+                  'configuring': 'configuring',
+                  'waiting_iq':  'waiting for IQ'}
+        _last = 0.0
+        while self._startup_active:
+            self._drain_uhd_log()
+            ph = self.startup_phase
+            if ph in ('streaming', 'idle'):
+                break
+            _now = time.time()
+            el = _now - self.startup_t0
+            if el > 300.0:                 # safety: never loop forever
+                break
+            if _now - _last >= 5.0:
+                _last = _now
+                hint = ("  — USB link may be marginal (check hub/power)"
+                        if el > 20.0 else "")
+                _det = f"  · {self.startup_detail}" if self.startup_detail else ""
+                print(f"[usrp] {_names.get(ph, ph)}… {el:.0f}s{_det}{hint}", flush=True)
+            time.sleep(0.5)
+        self._drain_uhd_log()   # final drain to catch the last lines (e.g. errors)
+
     def _recv_loop(self):
         # For a timed start (dual_channel), sleep until the commanded time arrives
         # before calling recv().  UHD over USB pads with zeros until the time_spec
@@ -409,6 +577,7 @@ class USRPSource:
                 n = self._streamer.recv(recv_bufs, metadata, timeout=1.0)
             except Exception as exc:
                 logger.warning("[usrp] recv error: %s", exc)
+                self._drain_uhd_log()   # surface UHD's USB/transfer detail
                 time.sleep(0.1)
                 continue
 
@@ -422,6 +591,12 @@ class USRPSource:
             if n <= 0:
                 continue
 
+            if self.recv_count == 0:
+                # First IQ — startup done; stop the watcher heartbeat.
+                self.startup_phase   = 'streaming'
+                self._startup_active = False
+                print(f"[usrp] streaming — first IQ after "
+                      f"{time.time() - self.startup_t0:.0f}s", flush=True)
             self.recv_count += 1
             ts_int  = metadata.time_spec.get_full_secs()
             ts_frac = int(metadata.time_spec.get_frac_secs() * 1e12)

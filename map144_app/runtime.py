@@ -622,6 +622,8 @@ def _start_usrp_source(self) -> bool:
     except Exception as exc:
         logger.error("[usrp] start error: %s", exc)
         import traceback; traceback.print_exc()
+        if getattr(self, 'usrp_client', None) is not None:
+            self.usrp_client._startup_active = False   # stop the startup watcher
         self.usrp_client = None   # prevent retry spam
         return False
 

@@ -162,6 +162,33 @@ def _cand_map_brush(epoch_samples: float, coherence):
     return pg.mkBrush(pg.hsvColor(hue, 1.0, 1.0, 0.25 + 0.75 * coh))
 
 
+def _usrp_startup_status(self):
+    """B210 startup status line for the receiver label, or None once streaming
+    (so the normal flow status takes over).  Driven by USRPSource.startup_phase
+    so the operator sees the firmware/FPGA load and slow-USB stream-start with an
+    elapsed counter + a USB/power hint, instead of a multi-minute black box."""
+    if getattr(self, 'source_mode', None) != 'usrp':
+        return None
+    uc = getattr(self, 'usrp_client', None)
+    if uc is None:
+        return None
+    phase = getattr(uc, 'startup_phase', 'idle')
+    if phase in ('idle', 'streaming'):
+        return None
+    import time as _t
+    el = _t.time() - getattr(uc, 'startup_t0', _t.time())
+    _names = {'opening':     'opening device (firmware/FPGA)',
+              'configuring': 'configuring',
+              'waiting_iq':  'waiting for IQ'}
+    msg = f"USRP B210 — {_names.get(phase, phase)} {el:.0f}s"
+    detail = getattr(uc, 'startup_detail', '')   # latest UHD log line (Stage 2)
+    if detail:
+        msg += f"  · {detail}"
+    if (phase == 'waiting_iq' and el > 20.0) or (phase == 'opening' and el > 30.0):
+        msg += "   ⚠ USB link slow — check hub/power"
+    return msg
+
+
 def update_displays(self):
     """Update all display panels."""
     if len(self.realtime_data) == 0:
@@ -733,7 +760,9 @@ def update_displays(self):
                 _rc = getattr(self, 'radio_client', None)
                 _tx_str = '  ** TX **' if (_rc is not None and getattr(_rc, 'transmitting', False)) else ''
 
-                _recv_lbl.setText(f"{_base}{_pkt_str}{_nb_str}{_tx_str}")
+                _recv_lbl.setText(
+                    _usrp_startup_status(self)
+                    or f"{_base}{_pkt_str}{_nb_str}{_tx_str}")
     else:
         _recv_lbl = getattr(self, '_receiver_label', None)
         if _recv_lbl is not None:
@@ -745,7 +774,9 @@ def update_displays(self):
                     'radio': 'Flex Radio', 'usrp': 'USRP B210',
                     'airspy': 'Airspy HF+', 'rtlsdr': 'RTL-SDR',
                 }
-                _recv_lbl.setText(f"{_src_names.get(_src, _src)}  waiting…")
+                _recv_lbl.setText(
+                    _usrp_startup_status(self)
+                    or f"{_src_names.get(_src, _src)}  waiting…")
 
     # ── Source windows (IQ/NB + per-radio panels) ────────────────────────────
     from .source_windows import update_source_windows
