@@ -661,6 +661,86 @@ See `project_ml_qso_classifier_plan` memory for the full plan; see
     testing to Windows (the program runs there already, just without this
     feature). See `project_wsjtx_audio_bridge` memory.
 
+## 🔄 External spot correlation & propagation geometry (added 2026-06-03)
+
+External reception-report feeds give MAP144 something it cannot get from its
+own antenna: **independent witnesses** of what was on the air. Used two ways
+(see `project_signal_categories` and the geometry thesis below):
+the *presence oracle* (Role A — was there anything to hear on 2 m overnight,
+to separate "deaf hardware / high NF" from "empty band"), and the *independent
+mode label* (Role B — a spot's simultaneous multi-receiver footprint
+corroborates the #25a envelope-morphology guess: MS = brief/narrow/idiosyncratic
+footprint, Es/tropo = broad simultaneous regional footprint, aircraft = narrow
+moving footprint). Capture raw now, join offline later — consume the shared
+feeds exactly once.
+
+46. ✅ **PSKReporter MQTT spot logger** (landed 2026-06-03, `tools/pskr_logger.py`).
+    Passive subscriber to the live feed (`mqtt.pskreporter.info:1883`, hosted by
+    Tom M0LTE, data from N1DQ). Topic `pskr/filter/v2/{band}/{mode}/#`; defaults
+    to 2 m + 6 m MSK144. Appends raw spot JSON (+ `_rx` local epoch, `_topic`) to
+    `MSK144/detections/pskr_spots.jsonl`; heartbeat to `MSK144/logs/pskr_logger.out`.
+    paho-mqtt 1.x/2.x compatible, reconnect-with-backoff, clean session. There is
+    **no authentication** on PSKReporter (the HTTP retrieve API is capped at last
+    100 records / ≤6 h / 1 query per 5 min — MQTT is the uncapped research path).
+    Each spot carries `sc/sl` (tx call/grid), `rc/rl` (rx call/grid), `f`, `rp`
+    (SNR), `t_tx` (15-s-normalised tx start), `b`, `sa/ra` (DXCC), `sq` (dedup).
+    **Pending — the offline join** to `decodes.jsonl` on
+    `(2nd-callsign-from-message, 15-s period)` ↔ `(sc, t_tx)` (tx = 2nd call, per
+    `project_msk144_callsign_order_tx_is_second`). PSKReporter supplies the grids
+    MAP144 messages usually omit (`RR73`/report messages carry no locator), so it
+    also feeds #26 range and #28 grid fallback.
+
+47. ⬜ **DX-cluster spot logger** — second external spot source (Telnet to a
+    cluster node, or an aggregator feed). Different population from PSKReporter:
+    human-logged DX/skeds and 2 m MS announcements rather than auto-decode
+    reports, so it can reveal *intended* activity (skeds) that produced no decode
+    anywhere. Same capture-first design: append raw to a JSONL, normalise to a
+    common spot schema with the PSKReporter records for the geometry engine (#48).
+    Bounded: a Telnet client + line parser + the shared spot schema.
+
+48. ⬜ **Propagation-geometry correlation engine** (operator research thesis,
+    2026-06-03). Depends on a grid for every callsign (#28 QRZ/GridTracker — the
+    operator has QRZ auth) and great-circle math (#26). Stages:
+
+    a. **Reflection-point estimate per spot/path.** For Es, the reflection
+       (ground) point is well-approximated by the **great-circle midpoint** of the
+       TX↔RX path (single hop, ~100 km E-layer). **Meteor scatter is similar but
+       not identical:** the useful reflection obeys specular geometry (the trail
+       must be tangent to the prolate ellipsoid with TX/RX as foci), so the
+       hot-spots sit at ~85–110 km altitude and are typically **offset to either
+       side of the path midpoint**, not exactly on it. Start with the midpoint as
+       a first-order estimate; refine to the offset specular hot-spots later.
+       *(Physics note, not yet verified in code — confirm the hot-spot offset
+       model before relying on it quantitatively.)*
+
+    b. **Path-pair correlation — did one meteor enable two paths?** Search the
+       spot stream for pairs of near-simultaneous spots (same 15-s period, or
+       tighter) whose estimated reflection points coincide in space (and the trail
+       geometry is mutually consistent). A coincidence is evidence a single
+       ionised trail served both paths. Sparse for MS (few simultaneous spots),
+       so this is a rare-event search — but a confirmed common-trail pair is a
+       strong, citable result.
+
+    c. **Predicted-decodable-station map.** Given an estimated trail/cloud
+       position and the on-air station set (from the spot feeds), compute which
+       stations *should* have been workable from FN42 via that reflector
+       (specular geometry + range). Turns "MAP144 decoded nothing" into a
+       falsifiable prediction: "trail at X should have made stations A, B
+       decodable here" → did MAP144 see them?
+
+    d. **Nearby-station NF correlation (the gold-standard deafness test).** A
+       PSKReporter *receiver* `rl` within tens of km of FN42 shares MAP144's
+       illumination geometry, so its overnight 2 m decode list ≈ what MAP144's
+       antenna was exposed to. Neighbour logs N stations, MAP144 logs 0 →
+       isolates NF / antenna, not propagation. Whether such a NE-US 2 m MSK144
+       witness exists is itself empirical — the #46 capture will show it.
+
+    The single-receiver caveat that motivates all of this: a PSKReporter spot is
+    `sc heard by rc`; for **MS the path is bistatic and trail-specific**, so
+    "someone in the NE heard W1XYZ" does *not* mean W1XYZ was workable from FN42.
+    Presence is necessary, not sufficient — the geometry engine is what turns raw
+    presence into a per-path workability estimate.
+
 ---
 
 ## Sequencing — what blocks what
