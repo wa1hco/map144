@@ -110,7 +110,10 @@ def setup_band_map_window(self, view_action):
 
     # ── plot ──────────────────────────────────────────────────────────────
     plot = pg.PlotWidget(background="w")    # light mode (CLAUDE.md GUI preference)
-    plot.setAspectLocked(False)            # equirect already aspect-corrects X
+    # Plot in REAL lon/lat (so axis labels read true degrees) and lock the view
+    # aspect to cos(lat0) in _band_map_redraw, so 1° lon renders as cos(lat0) of
+    # 1° lat — geography is preserved in any window shape (no manual 4:1).
+    plot.setAspectLocked(True, ratio=1.0)
     plot.showGrid(x=False, y=False)
     plot.getViewBox().setMouseEnabled(x=True, y=True)
     plot.setLabel("bottom", "")
@@ -129,7 +132,8 @@ def setup_band_map_window(self, view_action):
     win._bm_base_lon, win._bm_base_lat = geo.load_basemap(_BASEMAP_PATH)
     win._bm_basemap = plot.plot([], [], pen=pg.mkPen("#8a96a6", width=1),
                                 connect="finite")
-    win._bm_base_drawn_lat0 = None
+    win._bm_base_drawn = False
+    win._bm_aspect_k = None
 
     win._bm_graticule = plot.plot([], [], pen=pg.mkPen("#dde2e8", width=1),
                                   connect="finite")
@@ -240,22 +244,27 @@ def _band_map_redraw(win, now):
     win._bm_lat0 = lat0
     k = math.cos(math.radians(lat0))
 
-    # ── coastline / border basemap (reproject only when lat0 changes) ─────
-    if win._bm_base_lon.size and lat0 != win._bm_base_drawn_lat0:
-        win._bm_basemap.setData(win._bm_base_lon * k, win._bm_base_lat)
-        win._bm_base_drawn_lat0 = lat0
+    # lock the view aspect to cos(lat0): 1° lon shown as cos(lat0) of 1° lat
+    if k != win._bm_aspect_k:
+        win._bm_plot.setAspectLocked(True, ratio=k)
+        win._bm_aspect_k = k
 
-    # ── graticule (lat/lon lines every 10°, reprojected) ──────────────────
+    # ── coastline / border basemap (real lon/lat — drawn once) ────────────
+    if win._bm_base_lon.size and not win._bm_base_drawn:
+        win._bm_basemap.setData(win._bm_base_lon, win._bm_base_lat)
+        win._bm_base_drawn = True
+
+    # ── graticule (lat/lon lines every 10°) ───────────────────────────────
     gx, gy = [], []
     lo0 = int(math.floor(lon_min / 10.0) * 10)
     lo1 = int(math.ceil(lon_max / 10.0) * 10)
     la0 = int(math.floor(lat_min / 10.0) * 10)
     la1 = int(math.ceil(lat_max / 10.0) * 10)
     for lon in range(lo0, lo1 + 1, 10):
-        gx += [lon * k, lon * k, math.nan]
+        gx += [lon, lon, math.nan]
         gy += [la0, la1, math.nan]
     for lat in range(la0, la1 + 1, 10):
-        gx += [lo0 * k, lo1 * k, math.nan]
+        gx += [lo0, lo1, math.nan]
         gy += [lat, lat, math.nan]
     win._bm_graticule.setData(gx, gy)
 
@@ -268,30 +277,31 @@ def _band_map_redraw(win, now):
         tla, tlo = s.tx_latlon()
         rla, rlo = s.rx_latlon()
         arc = geo.great_circle_points(tla, tlo, rla, rlo, n=24)
-        ax = [p[1] * k for p in arc]
-        ay = [p[0] for p in arc]
+        ax = [p[1] for p in arc]               # real longitude
+        ay = [p[0] for p in arc]               # real latitude
         mla, mlo = geo.great_circle_midpoint(tla, tlo, rla, rlo)
         if id(s) in hi_ids:
             hi_x += ax + [math.nan]
             hi_y += ay + [math.nan]
-            mid_hi_pts.append({"pos": (mlo * k, mla)})
+            mid_hi_pts.append({"pos": (mlo, mla)})
         else:
             age = now - (s.t or now)
             b = 0 if age < 120 else (1 if age < 420 else 2)
             band_x[b] += ax + [math.nan]
             band_y[b] += ay + [math.nan]
-            mid_pts.append({"pos": (mlo * k, mla)})
+            mid_pts.append({"pos": (mlo, mla)})
 
     for i in range(3):
         win._bm_arcs[i].setData(band_x[i], band_y[i])
     win._bm_arc_hi.setData(hi_x, hi_y)
     win._bm_mid.setData(mid_pts)
     win._bm_mid_hi.setData(mid_hi_pts)
-    win._bm_home.setData([{"pos": (home_ll[1] * k, home_ll[0])}])
+    win._bm_home.setData([{"pos": (home_ll[1], home_ll[0])}])
 
     # ── apply frame + status ──────────────────────────────────────────────
-    win._bm_plot.setXRange(lon_min * k, lon_max * k, padding=0)
-    win._bm_plot.setYRange(lat_min, lat_max, padding=0)
+    # aspect is locked, so this contains the frame and letterboxes the rest
+    win._bm_plot.setRange(xRange=(lon_min, lon_max), yRange=(lat_min, lat_max),
+                          padding=0)
     rng = (f"≤{int(win._bm_range_km.value())}km"
            if win._bm_inrange.isChecked() else "all")
     win._bm_status.setText(
