@@ -241,12 +241,13 @@ def load_adif_grids(globs):
     """Build call(upper) -> grid from WSJT-X/LoTW ADIF logs (worked stations).
 
     `globs` is a list of glob patterns; each matched file is parsed per <eor>
-    record for <CALL>/<GRIDSQUARE>/<QSO_DATE>.  The grid from the **most recent**
-    QSO wins (ties broken toward the more precise / longer grid) — so a permanent
-    move, or a callsign reassigned to a new holder in a different grid, self-
-    corrects once the newer QSO is logged, instead of being pinned to an old
-    (possibly Silent-Key) location.  Still only a *best guess*; live sources
-    override it.  Local, instant, network-free.  Bad files are skipped.
+    record for <CALL>/<GRIDSQUARE>/<QSO_DATE>.  Returns call -> (grid, date_int):
+    the grid from the **most recent** QSO wins (ties broken toward the more
+    precise / longer grid) — so a permanent move, or a callsign reassigned to a
+    new holder in a different grid, self-corrects once the newer QSO is logged,
+    instead of being pinned to an old (possibly Silent-Key) location.  The date
+    lets the caller trust a recent grid but treat an old one as a best guess.
+    Local, instant, network-free.  Bad files are skipped.
     """
     best = {}  # call -> (qso_date_int, grid)
     for pattern in globs:
@@ -269,7 +270,7 @@ def load_adif_grids(globs):
                 if (prev is None or date > prev[0]
                         or (date == prev[0] and len(grid) > len(prev[1]))):
                     best[call] = (date, grid)
-    return {call: dg[1] for call, dg in best.items()}
+    return {call: (dg[1], dg[0]) for call, dg in best.items()}  # call -> (grid, date)
 
 
 class SpotStore:

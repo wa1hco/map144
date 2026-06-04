@@ -118,8 +118,8 @@ def test_load_adif_grids(tmp_path):
         "<CALL:4>W8KF <GRIDSQUARE:6>EN81sg <eor>\n"  # longer grid wins
     )
     idx = spot_bus.load_adif_grids([str(p)])
-    assert idx["K8LEE"] == "EM79ng"
-    assert idx["W8KF"] == "EN81sg"      # 6-char beat the earlier 4-char
+    assert idx["K8LEE"][0] == "EM79ng"
+    assert idx["W8KF"][0] == "EN81sg"   # 6-char beat the earlier 4-char
     assert "NOGRD" not in idx
 
 
@@ -134,7 +134,8 @@ def test_load_adif_grids_most_recent_wins(tmp_path):
         "<CALL:4>W1AW <GRIDSQUARE:6>FN31pr <QSO_DATE:8>20100101 <eor>\n"
         "<CALL:4>W1AW <GRIDSQUARE:4>EM12 <QSO_DATE:8>20250101 <eor>\n"
     )
-    assert spot_bus.load_adif_grids([str(p)])["W1AW"] == "EM12"
+    got = spot_bus.load_adif_grids([str(p)])["W1AW"]
+    assert got == ("EM12", 20250101)      # most recent grid + its date
 
 
 # --- tailer ----------------------------------------------------------------

@@ -26,6 +26,7 @@ from __future__ import annotations
 import math
 import os
 import time
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pyqtgraph as pg
@@ -58,6 +59,10 @@ _BASEMAP_PATH = os.environ.get(
     "MAP144_BASEMAP", "/usr/share/gridtracker/data/shapes.json")
 
 _MAX_AGE_S = 900.0          # 15-minute trailing window
+_RECENT_DAYS = 730          # ADIF grid newer than this is trusted; older = guess
+# Suffixes that mean the operator is on the move, so their logged home grid is
+# never trustworthy (vs /P portable, which the operator said recent logs can use).
+_MOBILE_SUFFIXES = {"M", "MM", "R", "AM"}
 _FRAME_DAMP_S = 20.0        # re-fit the frame at most this often
 _REFRAME_MARGIN = 1.5       # also re-fit if activity drifts this far (deg) outside
 
@@ -201,9 +206,16 @@ def setup_band_map_window(self, view_action):
     win._bm_map144_tailer = JsonlTailer(
         _DECODES_PATH,
         lambda r: normalize_map144(r, win._bm_my_call, win._bm_home_grid))
-    # static call->grid: ADIF logs (worked stations) + QRZ cache, network-free
-    win._bm_static_grids = load_adif_grids(_ADIF_GLOBS)
-    win._bm_static_grids.update(load_qrz_cache_grids(_QRZ_CACHE_PATH))
+    # static call->grid: ADIF logs (worked stations) + QRZ cache, network-free.
+    # Split out which are "recent" enough to trust as confident vs best-guess.
+    _adif = load_adif_grids(_ADIF_GLOBS)              # call -> (grid, date)
+    _cutoff = int((datetime.now(timezone.utc)
+                   - timedelta(days=_RECENT_DAYS)).strftime("%Y%m%d"))
+    win._bm_static_grids = {c: gd[0] for c, gd in _adif.items()}
+    win._bm_static_recent = {c for c, gd in _adif.items() if gd[1] >= _cutoff}
+    _qrz = load_qrz_cache_grids(_QRZ_CACHE_PATH)      # current registration
+    win._bm_static_grids.update(_qrz)
+    win._bm_static_recent.update(_qrz.keys())         # treat QRZ as current
     win._bm_store = SpotStore(max_age_s=_MAX_AGE_S)
     win._bm_last_frame_t = 0.0
     win._bm_frame = None                   # (lon_min, lon_max, lat_min, lat_max)
@@ -234,6 +246,11 @@ def _band_map_tick(win):
             win._bm_status.setText(f"redraw error: {e}")
         except Exception:
             pass
+
+
+def _is_mobile(call):
+    """True for /M /MM /R /AM — operator on the move, home grid untrustworthy."""
+    return "/" in call and call.rsplit("/", 1)[-1] in _MOBILE_SUFFIXES
 
 
 def _within_range(spot, home_ll, max_km):
@@ -268,11 +285,14 @@ def _band_map_redraw(win, now):
                 if g:
                     s.tx_grid = g
                     s.grid_src = "live"            # current -> confident
-                elif "/" not in call:
+                elif not _is_mobile(call):         # mobile/rover: never use home grid
                     g = win._bm_static_grids.get(call)
                     if g:
                         s.tx_grid = g
-                        s.grid_src = "static"      # home/historical -> best guess
+                        # recent log / current registration -> trust; old -> guess
+                        s.grid_src = ("static_recent"
+                                      if call in win._bm_static_recent
+                                      else "static_old")
             if s.resolvable():
                 n_mine_located += 1
 
@@ -334,6 +354,24 @@ def _band_map_redraw(win, now):
     # graticule is a fixed global grid drawn once in setup — it covers any view,
     # so it doesn't fight manual pan/zoom when Auto-frame is off.
 
+    # canonical position per callsign: use the most precise grid seen for a
+    # call, so a station reported at mixed precision (EN71 vs EN71lf) doesn't
+    # plot at several nearby points.
+    canon_grid = {}
+    for s in spots:
+        for c, gr in ((s.tx_call, s.tx_grid), (s.rx_call, s.rx_grid)):
+            if c and gr:
+                cu = c.upper()
+                if cu not in canon_grid or len(gr) > len(canon_grid[cu]):
+                    canon_grid[cu] = gr
+
+    def _ll(call, grid):
+        gr = canon_grid.get(call.upper(), grid) if call else grid
+        try:
+            return geo.grid_to_latlon(gr) if gr else None
+        except (ValueError, TypeError):
+            return None
+
     # ── arcs + midpoints ──────────────────────────────────────────────────
     band_x = [[], [], []]
     band_y = [[], [], []]
@@ -343,14 +381,18 @@ def _band_map_redraw(win, now):
     mine_bx, mine_by, mine_bpts = [], [], []   # best-guess (static home grid)
     n_guess = 0
     for s in drawable:
-        tla, tlo = s.tx_latlon()
-        rla, rlo = s.rx_latlon()
+        tll = _ll(s.tx_call, s.tx_grid)
+        rll = _ll(s.rx_call, s.rx_grid)
+        if tll is None or rll is None:
+            continue
+        tla, tlo = tll
+        rla, rlo = rll
         arc = geo.great_circle_points(tla, tlo, rla, rlo, n=24)
         ax = [p[1] for p in arc]               # real longitude
         ay = [p[0] for p in arc]               # real latitude
         mla, mlo = geo.great_circle_midpoint(tla, tlo, rla, rlo)
         if s.source == "map144":               # your own decode -> green, DX marked
-            if s.grid_src == "static":         # possibly-stale home grid
+            if s.grid_src == "static_old":     # stale home grid -> best guess
                 n_guess += 1
                 mine_bx += ax + [math.nan]
                 mine_by += ay + [math.nan]
