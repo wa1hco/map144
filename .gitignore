@@ -113,3 +113,6 @@ fortran_bp_test/mf_test
 # (~/.claude/CLAUDE.md), tools default to writing here; nothing in scratch/
 # should be relied on by other tools.  See scratch/README.md.
 scratch/
+
+# Band Map basemap data (drop GridTracker shapes.json here; not redistributed)
+map144_app/data/

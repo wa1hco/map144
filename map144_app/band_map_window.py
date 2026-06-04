@@ -89,11 +89,13 @@ _PSKR_PATH = os.path.join(_DET_DIR, "pskr_spots.jsonl")
 _DECODES_PATH = os.path.join(_DET_DIR, "decodes.jsonl")
 _QRZ_CACHE_PATH = os.path.join(_DET_DIR, "qrz_grid_cache.json")
 
-# Coastline / state-border basemap, loaded at runtime from GridTracker's data
-# (GPL, already installed) — not copied into the repo.  Override with
-# MAP144_BASEMAP; else the first existing OS-default candidate; else graticule.
+# Coastline / state-border basemap GeoJSON.  Resolution order: MAP144_BASEMAP env
+# > repo-local map144_app/data/shapes.json (drop the file here for zero-config on
+# any box — gitignored) > first existing OS-default GridTracker location > else
+# graticule-only.  GridTracker need NOT be installed; only the data file matters.
+_REPO_BASEMAP = os.path.join(_PROJ_ROOT, "map144_app", "data", "shapes.json")
 _BASEMAP_PATH = os.environ.get("MAP144_BASEMAP") or next(
-    (p for p in _basemap_default_candidates() if os.path.exists(p)),
+    (p for p in [_REPO_BASEMAP] + _basemap_default_candidates() if os.path.exists(p)),
     _basemap_default_candidates()[0])
 
 _MAX_AGE_S = 900.0          # 15-minute trailing window
