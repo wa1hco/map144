@@ -234,13 +234,22 @@ def _band_map_redraw(win, now):
 
     # locate MAP144 decodes whose message carried no grid, using PSKReporter's
     # richer data (sl/rl) + the QRZ cache — so your own decodes can be placed
-    idx = grid_index(store.spots(), extra=win._bm_static_grids)
+    # Grid resolution priority for grid-less decodes: message grid (already on
+    # the Spot) > LIVE grid (current window, PSKReporter sl/rl) > static
+    # ADIF/QRZ home grid.  Static is HISTORICAL, so it is used only for calls
+    # with no '/' — any suffix (/P /M /MM) or prefix (DL/, /4) means the station
+    # is NOT at its logged grid, so trust only live/self-reported sources and
+    # leave it unplaced rather than mislocate it.
+    live_idx = grid_index(store.spots())
     n_mine = n_mine_located = 0
     for s in store.spots():
         if s.source == "map144":
             n_mine += 1
             if not s.tx_grid and s.tx_call:
-                g = idx.get(s.tx_call.upper())
+                call = s.tx_call.upper()
+                g = live_idx.get(call)
+                if not g and "/" not in call:
+                    g = win._bm_static_grids.get(call)
                 if g:
                     s.tx_grid = g
             if s.resolvable():

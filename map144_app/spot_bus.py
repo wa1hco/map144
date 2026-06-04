@@ -231,17 +231,21 @@ def load_qrz_cache_grids(path):
 _ADIF_CALL_RE = re.compile(r"<call:\d+(?::[^>]*)?>\s*([A-Z0-9/]+)", re.IGNORECASE)
 _ADIF_GRID_RE = re.compile(
     r"<gridsquare:\d+(?::[^>]*)?>\s*([A-R]{2}\d{2}(?:[a-x]{2})?)", re.IGNORECASE)
+_ADIF_DATE_RE = re.compile(r"<qso_date:\d+(?::[^>]*)?>\s*(\d{8})", re.IGNORECASE)
 
 
 def load_adif_grids(globs):
     """Build call(upper) -> grid from WSJT-X/LoTW ADIF logs (worked stations).
 
     `globs` is a list of glob patterns; each matched file is parsed per <eor>
-    record for <CALL>/<GRIDSQUARE>.  A more precise (longer) grid wins.  This is
-    a local, instant, network-free grid source — far richer than the QRZ cache
-    for stations you've worked.  Missing/garbled files are skipped.
+    record for <CALL>/<GRIDSQUARE>/<QSO_DATE>.  The grid from the **most recent**
+    QSO wins (ties broken toward the more precise / longer grid) — so a permanent
+    move, or a callsign reassigned to a new holder in a different grid, self-
+    corrects once the newer QSO is logged, instead of being pinned to an old
+    (possibly Silent-Key) location.  Still only a *best guess*; live sources
+    override it.  Local, instant, network-free.  Bad files are skipped.
     """
-    idx = {}
+    best = {}  # call -> (qso_date_int, grid)
     for pattern in globs:
         for path in glob.glob(os.path.expanduser(pattern)):
             try:
@@ -256,9 +260,13 @@ def load_adif_grids(globs):
                     continue
                 call = m.group(1).upper()
                 grid = g.group(1)
-                if call not in idx or len(grid) > len(idx[call]):
-                    idx[call] = grid
-    return idx
+                d = _ADIF_DATE_RE.search(rec)
+                date = int(d.group(1)) if d else 0
+                prev = best.get(call)
+                if (prev is None or date > prev[0]
+                        or (date == prev[0] and len(grid) > len(prev[1]))):
+                    best[call] = (date, grid)
+    return {call: dg[1] for call, dg in best.items()}
 
 
 class SpotStore:

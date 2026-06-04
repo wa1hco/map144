@@ -127,6 +127,16 @@ def test_load_adif_grids_missing(tmp_path):
     assert spot_bus.load_adif_grids([str(tmp_path / "none*.adi")]) == {}
 
 
+def test_load_adif_grids_most_recent_wins(tmp_path):
+    # reused call / permanent move: newer QSO date wins over an older 6-char grid
+    p = tmp_path / "log.adi"
+    p.write_text(
+        "<CALL:4>W1AW <GRIDSQUARE:6>FN31pr <QSO_DATE:8>20100101 <eor>\n"
+        "<CALL:4>W1AW <GRIDSQUARE:4>EM12 <QSO_DATE:8>20250101 <eor>\n"
+    )
+    assert spot_bus.load_adif_grids([str(p)])["W1AW"] == "EM12"
+
+
 # --- tailer ----------------------------------------------------------------
 def _append(path, *raws):
     with open(path, "a") as f:
