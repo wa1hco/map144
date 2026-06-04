@@ -1,6 +1,8 @@
 """Unit tests for map144_app/spot_bus.py — normalization, tailing, aging store."""
 import json
 
+import pytest
+
 from map144_app import spot_bus
 
 
@@ -29,6 +31,81 @@ def test_resolvable_and_latlon():
     assert s.tx_latlon() is not None
     s2 = spot_bus.normalize_pskr(_raw(sl=""))
     assert not s2.resolvable()
+
+
+# --- MAP144 message + decode normalization --------------------------------
+def test_parse_message_from_is_second():
+    assert spot_bus.parse_msk144_message("ND0B N0AN RR73") == ("N0AN", None)
+
+
+def test_parse_message_grid_when_present():
+    assert spot_bus.parse_msk144_message("CQ N0AN EN42") == ("N0AN", "EN42")
+    assert spot_bus.parse_msk144_message("WA1HCO K8XX FN20") == ("K8XX", "FN20")
+
+
+def test_parse_message_report_is_not_grid():
+    # -01 / R-05 / RRR / 73 are reports, not grids
+    assert spot_bus.parse_msk144_message("WA1HCO K8XX -01") == ("K8XX", None)
+
+
+def test_parse_message_synthetic_dropped():
+    assert spot_bus.parse_msk144_message("AP00113N03") == (None, None)
+
+
+def test_parse_message_unusable():
+    assert spot_bus.parse_msk144_message("") == (None, None)
+    assert spot_bus.parse_msk144_message("CQ") == (None, None)
+
+
+def test_parse_ts_with_and_without_fraction():
+    t1 = spot_bus._parse_map144_ts("2026-06-02_14:28:43.5")
+    t2 = spot_bus._parse_map144_ts("2026-06-02_14:28:43")
+    assert t1 == pytest.approx(t2 + 0.5)
+    assert spot_bus._parse_map144_ts("garbage") is None
+
+
+def test_normalize_map144_decode():
+    raw = {"message": "WA1HCO K8XX FN20", "timestamp": "2026-06-02_14:28:43.5",
+           "radio_khz": 50260, "jt9_snr_db": 3, "theta_deg": 45}
+    s = spot_bus.normalize_map144(raw, "WA1HCO", "FN42")
+    assert s.source == "map144"
+    assert s.tx_call == "K8XX" and s.tx_grid == "FN20"
+    assert s.rx_call == "WA1HCO" and s.rx_grid == "FN42"
+    assert s.freq_hz == 50260000 and s.snr_db == 3
+
+
+def test_normalize_map144_error_row_dropped():
+    assert spot_bus.normalize_map144(
+        {"message": "", "outcome": "error"}, "WA1HCO", "FN42") is None
+
+
+def test_jsonl_tailer_drops_none(tmp_path):
+    p = str(tmp_path / "decodes.jsonl")
+    with open(p, "w") as f:
+        f.write(json.dumps({"message": "", "outcome": "error"}) + "\n")
+        f.write(json.dumps({"message": "ND0B N0AN RR73",
+                            "timestamp": "2026-06-02_14:28:43"}) + "\n")
+    t = spot_bus.JsonlTailer(p, lambda r: spot_bus.normalize_map144(r, "WA1HCO", "FN42"))
+    got = t.poll()
+    assert len(got) == 1 and got[0].tx_call == "N0AN"
+
+
+# --- grid index ------------------------------------------------------------
+def test_grid_index_harvest_and_extra():
+    spots = [spot_bus.normalize_pskr(_raw(sc="W9XX", sl="EN63bl",
+                                          rc="N4SIX", rl="FM04lv"))]
+    idx = spot_bus.grid_index(spots, extra={"k8xx": "FN20"})
+    assert idx["W9XX"] == "EN63bl"
+    assert idx["N4SIX"] == "FM04lv"
+    assert idx["K8XX"] == "FN20"
+
+
+def test_load_qrz_cache_grids(tmp_path):
+    p = tmp_path / "qrz.json"
+    p.write_text(json.dumps({"W9XX": {"grid": "EN63bl"},
+                             "NOPE": {"grid": None}}))
+    grids = spot_bus.load_qrz_cache_grids(str(p))
+    assert grids == {"W9XX": "EN63bl"}
 
 
 # --- tailer ----------------------------------------------------------------

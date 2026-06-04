@@ -8,8 +8,8 @@
 
 One common record (:class:`Spot`) that all sources collapse to, so the map (and
 later the #48 geometry engine) consume a single schema regardless of origin.
-Sources for v1: PSKReporter (tail of ``pskr_spots.jsonl``).  MAP144-live and
-WSJT-X ``ALL.TXT`` tailers land in step 2 — they emit the same :class:`Spot`.
+Sources: PSKReporter (tail of ``pskr_spots.jsonl``) and MAP144's own decodes
+(tail of ``decodes.jsonl``).  WSJT-X ``ALL.TXT`` lands next — same :class:`Spot`.
 
 Layering: this module is data only (file I/O + normalization + an aging
 in-memory store).  No Qt, no projection, no drawing — the panel does that.  The
@@ -19,9 +19,22 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from . import geo
+
+# Maidenhead grid token (4 or 6 char) vs a report/other token.
+_GRID_RE = re.compile(r"^[A-R]{2}[0-9]{2}([a-x]{2})?$", re.IGNORECASE)
+# MSK144 acknowledgment / report tokens that *look* like grids or numbers but
+# encode no location.  'RR73' is the sign-off (also a valid-looking square);
+# reports are 73 / -01 / R-05 / +00 / 599.
+_NONGRID_TOKENS = {"RR73", "RRR", "RR", "R", "73"}
+_REPORT_RE = re.compile(r"^R?[+-]?\d+$")
+# Synthetic simulator messages (generate_msk144 encoding) — never plot these.
+# See feedback_filter_test_signals_from_realdata_stats memory.
+_TESTMSG_RE = re.compile(r"^A[PN]\d{2}\d{3}[PN]\d{2}$")
 
 
 @dataclass
@@ -77,16 +90,75 @@ def normalize_pskr(raw: dict) -> Spot:
     )
 
 
-class PskrTailer:
-    """Incremental, byte-offset tail of the PSKReporter JSONL capture file.
+def parse_msk144_message(message):
+    """Extract (tx_call, tx_grid) from an MSK144 message.
+
+    MSK144 messages are '<TO> <FROM> <report/grid>'; the FROM (2nd token) is the
+    transmitter (see msk144_callsign_order_tx_is_second memory).  Returns
+    (None, None) for empty/unusable/synthetic-test messages so they're dropped.
+    """
+    msg = (message or "").strip()
+    if not msg or _TESTMSG_RE.match(msg.replace(" ", "")):
+        return None, None
+    toks = msg.split()
+    if len(toks) < 2:
+        return None, None
+    tx = toks[1]
+    grid = None
+    for tok in toks[2:]:                    # a grid token = location; reports aren't
+        if tok.upper() in _NONGRID_TOKENS or _REPORT_RE.match(tok):
+            continue
+        if _GRID_RE.match(tok):
+            grid = tok[:4].upper() + tok[4:].lower()
+            break
+    return tx, grid
+
+
+def _parse_map144_ts(ts):
+    """MAP144 'YYYY-MM-DD_HH:MM:SS(.f)' (UTC) -> epoch seconds, or None."""
+    ts = (ts or "").strip()
+    for fmt in ("%Y-%m-%d_%H:%M:%S.%f", "%Y-%m-%d_%H:%M:%S"):
+        try:
+            return datetime.strptime(ts, fmt).replace(
+                tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def normalize_map144(raw, my_call, my_grid):
+    """Map a MAP144 decode record to a Spot (rx = home).  None if unusable."""
+    tx, tx_grid = parse_msk144_message(raw.get("message"))
+    if tx is None:
+        return None
+    khz = raw.get("radio_khz")
+    snr = raw.get("jt9_snr_db")
+    if snr is None:
+        snr = raw.get("est_snr_db")
+    return Spot(
+        source="map144",
+        t=_parse_map144_ts(raw.get("timestamp")),
+        freq_hz=(khz * 1000.0 if khz else None),
+        mode="MSK144",
+        tx_call=tx,
+        tx_grid=tx_grid,
+        rx_call=my_call or None,
+        rx_grid=_clean_grid(my_grid),
+        snr_db=snr,
+    )
+
+
+class JsonlTailer:
+    """Incremental, byte-offset tail of a JSONL file, normalized via `normalize`.
 
     Only complete (newline-terminated) lines are consumed, so a half-written
-    final line from the logger is never parsed.  Truncation / rotation (size <
-    last offset) resets to the start.
-    """
+    final line from the producer is never parsed.  Truncation / rotation (size <
+    last offset) resets to the start.  `normalize(raw)` may return None to drop a
+    record (e.g. a MAP144 error row or synthetic-test decode)."""
 
-    def __init__(self, path: str):
+    def __init__(self, path, normalize):
         self.path = path
+        self._normalize = normalize
         self._offset = 0
 
     def poll(self) -> list:
@@ -115,8 +187,44 @@ class PskrTailer:
                 raw = json.loads(line)
             except ValueError:
                 continue
-            out.append(normalize_pskr(raw))
+            spot = self._normalize(raw)
+            if spot is not None:
+                out.append(spot)
         return out
+
+
+class PskrTailer(JsonlTailer):
+    """PSKReporter capture tailer (normalize_pskr)."""
+
+    def __init__(self, path):
+        super().__init__(path, normalize_pskr)
+
+
+def grid_index(spots, extra=None):
+    """call (upper) -> grid, harvested from spots that carry both endpoints'
+    grids, plus an optional `extra` dict (e.g. the QRZ cache).  Used to locate
+    MAP144 decodes whose message had no grid, from PSKReporter's richer data."""
+    idx = {}
+    for call, grid in (extra or {}).items():
+        if call and grid:
+            idx[call.upper()] = grid
+    for s in spots:
+        if s.tx_call and s.tx_grid:
+            idx.setdefault(s.tx_call.upper(), s.tx_grid)
+        if s.rx_call and s.rx_grid:
+            idx.setdefault(s.rx_call.upper(), s.rx_grid)
+    return idx
+
+
+def load_qrz_cache_grids(path):
+    """Read-only call->grid from the qrz_lookup cache file (no network)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return {k.upper(): v["grid"] for k, v in d.items()
+            if isinstance(v, dict) and v.get("grid")}
 
 
 class SpotStore:

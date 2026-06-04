@@ -32,10 +32,16 @@ import pyqtgraph as pg
 from PyQt5 import QtCore, QtWidgets
 
 from . import geo
-from .spot_bus import PskrTailer, SpotStore
+from .spot_bus import (
+    JsonlTailer, PskrTailer, SpotStore, grid_index, load_qrz_cache_grids,
+    normalize_map144,
+)
 
 _PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_PSKR_PATH = os.path.join(_PROJ_ROOT, "MSK144", "detections", "pskr_spots.jsonl")
+_DET_DIR = os.path.join(_PROJ_ROOT, "MSK144", "detections")
+_PSKR_PATH = os.path.join(_DET_DIR, "pskr_spots.jsonl")
+_DECODES_PATH = os.path.join(_DET_DIR, "decodes.jsonl")
+_QRZ_CACHE_PATH = os.path.join(_DET_DIR, "qrz_grid_cache.json")
 
 # Coastline / state-border basemap.  Loaded at runtime from GridTracker's data
 # (US states + Canadian provinces, GPL, already installed) — not copied into the
@@ -78,6 +84,7 @@ def setup_band_map_window(self, view_action):
         home_ll = geo.grid_to_latlon("FN42")
     win._bm_home_ll = home_ll
     win._bm_home_grid = home_grid
+    win._bm_my_call = str(_SETTINGS.value("reporting_mycall", "") or "").strip()
 
     # ── controls ──────────────────────────────────────────────────────────
     ctl = QtWidgets.QHBoxLayout()
@@ -85,6 +92,8 @@ def setup_band_map_window(self, view_action):
     win._bm_autoframe.setChecked(True)
     win._bm_highlight = QtWidgets.QCheckBox("Highlight simultaneous")
     win._bm_highlight.setChecked(True)
+    win._bm_mine = QtWidgets.QCheckBox("My decodes")   # MAP144's own, in green
+    win._bm_mine.setChecked(True)
     # in-range filter: 2 m/6 m single-hop MS/tropo tops out ~2300 km, so spots
     # with neither endpoint near home aren't workable from here — hide them so
     # the frame stays on relevant activity instead of spanning an ocean.
@@ -102,6 +111,7 @@ def setup_band_map_window(self, view_action):
     win._bm_status = QtWidgets.QLabel("starting…")
     ctl.addWidget(win._bm_autoframe)
     ctl.addWidget(win._bm_highlight)
+    ctl.addWidget(win._bm_mine)
     ctl.addWidget(win._bm_inrange)
     ctl.addWidget(win._bm_range_km)
     ctl.addStretch(1)
@@ -150,6 +160,12 @@ def setup_band_map_window(self, view_action):
     win._bm_mid_hi = pg.ScatterPlotItem(size=7, brush=pg.mkBrush("#ff9000"),
                                         pen=pg.mkPen("#a04000", width=1))
     plot.addItem(win._bm_mid_hi)
+    # MAP144's own decodes — green, above the PSKReporter layer
+    win._bm_mine_arcs = plot.plot([], [], pen=pg.mkPen("#108a2e", width=2.4),
+                                  connect="finite")
+    win._bm_mine_pts = pg.ScatterPlotItem(size=7, brush=pg.mkBrush("#108a2e"),
+                                          pen=pg.mkPen("#0a5018", width=1))
+    plot.addItem(win._bm_mine_pts)
     win._bm_home = pg.ScatterPlotItem(
         size=15, symbol="star", brush=pg.mkBrush("#e00000"),
         pen=pg.mkPen("#600000", width=1))
@@ -157,6 +173,10 @@ def setup_band_map_window(self, view_action):
 
     # ── data plumbing ─────────────────────────────────────────────────────
     win._bm_tailer = PskrTailer(_PSKR_PATH)
+    win._bm_map144_tailer = JsonlTailer(
+        _DECODES_PATH,
+        lambda r: normalize_map144(r, win._bm_my_call, win._bm_home_grid))
+    win._bm_qrz_grids = load_qrz_cache_grids(_QRZ_CACHE_PATH)
     win._bm_store = SpotStore(max_age_s=_MAX_AGE_S)
     win._bm_last_frame_t = 0.0
     win._bm_frame = None                   # (lon_min, lon_max, lat_min, lat_max)
@@ -177,6 +197,7 @@ def _band_map_tick(win):
     try:
         now = time.time()
         win._bm_store.add(win._bm_tailer.poll())
+        win._bm_store.add(win._bm_map144_tailer.poll())
         win._bm_store.prune(now)
         if not win.isVisible():
             return
@@ -201,9 +222,25 @@ def _band_map_redraw(win, now):
     store = win._bm_store
     home_ll = win._bm_home_ll
 
-    # in-range filter: derive the whole visible set (drawable, endpoints,
-    # co-paths) from one consistently-filtered spot list
+    # locate MAP144 decodes whose message carried no grid, using PSKReporter's
+    # richer data (sl/rl) + the QRZ cache — so your own decodes can be placed
+    idx = grid_index(store.spots(), extra=win._bm_qrz_grids)
+    n_mine = n_mine_located = 0
+    for s in store.spots():
+        if s.source == "map144":
+            n_mine += 1
+            if not s.tx_grid and s.tx_call:
+                g = idx.get(s.tx_call.upper())
+                if g:
+                    s.tx_grid = g
+            if s.resolvable():
+                n_mine_located += 1
+
+    # build the visible set; "My decodes" off hides the MAP144 layer entirely
     spots = store.spots()
+    if not win._bm_mine.isChecked():
+        spots = [s for s in spots if s.source != "map144"]
+    # in-range filter (MAP144 decodes have rx=home -> always pass)
     if win._bm_inrange.isChecked():
         max_km = float(win._bm_range_km.value())
         spots = [s for s in spots if _within_range(s, home_ll, max_km)]
@@ -273,6 +310,7 @@ def _band_map_redraw(win, now):
     band_y = [[], [], []]
     hi_x, hi_y = [], []
     mid_pts, mid_hi_pts = [], []
+    mine_x, mine_y, mine_pts = [], [], []
     for s in drawable:
         tla, tlo = s.tx_latlon()
         rla, rlo = s.rx_latlon()
@@ -280,7 +318,11 @@ def _band_map_redraw(win, now):
         ax = [p[1] for p in arc]               # real longitude
         ay = [p[0] for p in arc]               # real latitude
         mla, mlo = geo.great_circle_midpoint(tla, tlo, rla, rlo)
-        if id(s) in hi_ids:
+        if s.source == "map144":               # your own decode -> green, DX marked
+            mine_x += ax + [math.nan]
+            mine_y += ay + [math.nan]
+            mine_pts.append({"pos": (tlo, tla)})
+        elif id(s) in hi_ids:
             hi_x += ax + [math.nan]
             hi_y += ay + [math.nan]
             mid_hi_pts.append({"pos": (mlo, mla)})
@@ -296,6 +338,8 @@ def _band_map_redraw(win, now):
     win._bm_arc_hi.setData(hi_x, hi_y)
     win._bm_mid.setData(mid_pts)
     win._bm_mid_hi.setData(mid_hi_pts)
+    win._bm_mine_arcs.setData(mine_x, mine_y)
+    win._bm_mine_pts.setData(mine_pts)
     win._bm_home.setData([{"pos": (home_ll[1], home_ll[0])}])
 
     # ── apply frame + status ──────────────────────────────────────────────
@@ -304,6 +348,7 @@ def _band_map_redraw(win, now):
                           padding=0)
     rng = (f"≤{int(win._bm_range_km.value())}km"
            if win._bm_inrange.isChecked() else "all")
+    mine_txt = f"mine {n_mine_located}/{n_mine}" if n_mine else "mine 0"
     win._bm_status.setText(
-        f"{len(drawable)} paths · {n_groups} simultaneous · {rng} · "
+        f"{len(drawable)} paths · {mine_txt} · {n_groups} simultaneous · {rng} · "
         f"{win._bm_home_grid} · {len(store.spots())} spots/{int(_MAX_AGE_S/60)}m")
