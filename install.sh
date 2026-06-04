@@ -64,6 +64,32 @@ echo "Upgrading pip ..."
 echo "Installing requirements ..."
 "$VENV_PY" -m pip install -r requirements.txt
 
+# ── Optional GPU extras (CuPy → TFMF GPU path) ────────────────────────────
+# Kept out of requirements.txt so GPU-less station boxes aren't burdened, but
+# tracked here so a GPU box restores CuPy on every rebuild instead of silently
+# losing it (the old "had cupy, rebuilt, lost it" trap).
+#   explicit:  ./install.sh --gpu   or   MAP144_GPU=1 ./install.sh   (0 disables)
+#   auto:      an NVIDIA display GPU is present (lspci)
+if [ -n "${MAP144_GPU:-}" ]; then
+    WANT_GPU="$MAP144_GPU"
+else
+    WANT_GPU=0
+    for arg in "$@"; do [ "$arg" = "--gpu" ] && WANT_GPU=1; done
+    if [ "$WANT_GPU" = "0" ] && command -v lspci >/dev/null 2>&1 \
+       && lspci 2>/dev/null | grep -iE 'vga|3d|display' | grep -qi nvidia; then
+        WANT_GPU=1
+        echo "NVIDIA GPU detected — installing GPU extras (set MAP144_GPU=0 to skip)."
+    fi
+fi
+if [ "$WANT_GPU" = "1" ]; then
+    echo "Installing GPU extras (requirements-gpu.txt) ..."
+    "$VENV_PY" -m pip install -r requirements-gpu.txt || {
+        echo "WARNING: GPU extras failed to install.  CuPy needs a healthy NVIDIA" >&2
+        echo "         driver; after a driver update you must reboot so the kernel" >&2
+        echo "         module matches.  MAP144 will use the CPU fallback meanwhile." >&2
+    }
+fi
+
 # Verify jt9 discovery.  Don't hard-fail — the operator can install
 # WSJT-X afterwards or set MAP144_JT9; surfacing a warning is enough.
 echo "Verifying jt9 discovery ..."

@@ -1,0 +1,21 @@
+# Optional GPU extras for MAP144 — NOT installed by default.
+#
+# CuPy powers the TFMF GPU path (the Sync Detection / Sync Candidate Map
+# surface): ~10 ms on a modest GPU vs ~4-7 s on the CPU fallback.  Kept out of
+# requirements.txt so the GPU-less station boxes aren't burdened; install.sh
+# pulls this in only with `--gpu`, `MAP144_GPU=1`, or when it auto-detects an
+# NVIDIA display GPU via lspci.
+#
+# Needs a healthy NVIDIA driver (the wheel bundles its own CUDA runtime, so no
+# separate CUDA toolkit is required).  After a driver update, reboot so the
+# loaded kernel module matches the userspace library or CuPy import will fail.
+#
+# cupy-cuda12x covers the CUDA 12.x series.  If a very new GPU (e.g. Blackwell)
+# rejects this build's arch, switch to cupy-cuda13x.
+#
+# PIN < 14 ON PURPOSE: CuPy 14.x requires numpy>=2.0, but MAP144 must stay on
+# numpy<2 because UHD/python3-uhd (B210) is compiled against numpy 1.26.4 and
+# segfaults under numpy 2.x (see requirements.txt + project_b210_uhd_numpy2_venv
+# _drift).  CuPy 13.x (numpy<2.6,>=1.22) is the last line that coexists with the
+# numpy<2 pin.  Do NOT unpin without a UHD rebuild against numpy 2.
+cupy-cuda12x>=13,<14
