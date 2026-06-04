@@ -85,9 +85,25 @@ def setup_band_map_window(self, view_action):
     win._bm_autoframe.setChecked(True)
     win._bm_highlight = QtWidgets.QCheckBox("Highlight simultaneous")
     win._bm_highlight.setChecked(True)
+    # in-range filter: 2 m/6 m single-hop MS/tropo tops out ~2300 km, so spots
+    # with neither endpoint near home aren't workable from here — hide them so
+    # the frame stays on relevant activity instead of spanning an ocean.
+    win._bm_inrange = QtWidgets.QCheckBox("In range ≤")
+    win._bm_inrange.setChecked(_SETTINGS.value("band_map_inrange", True, type=bool))
+    win._bm_range_km = QtWidgets.QSpinBox()
+    win._bm_range_km.setRange(250, 20000)
+    win._bm_range_km.setSingleStep(250)
+    win._bm_range_km.setSuffix(" km")
+    win._bm_range_km.setValue(int(_SETTINGS.value("band_map_range_km", 2500, type=int)))
+    win._bm_inrange.stateChanged.connect(
+        lambda _v: _SETTINGS.setValue("band_map_inrange", win._bm_inrange.isChecked()))
+    win._bm_range_km.valueChanged.connect(
+        lambda v: _SETTINGS.setValue("band_map_range_km", int(v)))
     win._bm_status = QtWidgets.QLabel("starting…")
     ctl.addWidget(win._bm_autoframe)
     ctl.addWidget(win._bm_highlight)
+    ctl.addWidget(win._bm_inrange)
+    ctl.addWidget(win._bm_range_km)
     ctl.addStretch(1)
     ctl.addWidget(win._bm_status)
     layout.addLayout(ctl)
@@ -168,24 +184,43 @@ def _band_map_tick(win):
             pass
 
 
+def _within_range(spot, home_ll, max_km):
+    """True if either endpoint is within max_km of home (unresolvable -> out)."""
+    for p in (spot.tx_latlon(), spot.rx_latlon()):
+        if p is not None and geo.haversine_km(
+                home_ll[0], home_ll[1], p[0], p[1]) <= max_km:
+            return True
+    return False
+
+
 def _band_map_redraw(win, now):
     store = win._bm_store
     home_ll = win._bm_home_ll
-    drawable = store.drawable()
+
+    # in-range filter: derive the whole visible set (drawable, endpoints,
+    # co-paths) from one consistently-filtered spot list
+    spots = store.spots()
+    if win._bm_inrange.isChecked():
+        max_km = float(win._bm_range_km.value())
+        spots = [s for s in spots if _within_range(s, home_ll, max_km)]
+    drawable = [s for s in spots if s.resolvable()]
 
     # which spots are part of a same-second co-path group?
     hi_ids = set()
     n_groups = 0
     if win._bm_highlight.isChecked():
-        groups = store.copath_groups(window_s=1.0)
+        wrapped = [{"tx_call": s.tx_call, "rx_call": s.rx_call, "t": s.t, "_spot": s}
+                   for s in spots]
+        groups = geo.cluster_copaths(wrapped, window_s=1.0)
         n_groups = len(groups)
         for g in groups:
-            for s in g:
-                hi_ids.add(id(s))
+            for w in g:
+                hi_ids.add(id(w["_spot"]))
 
     # ── auto-frame (damped) ───────────────────────────────────────────────
     if win._bm_autoframe.isChecked():
-        endpoints = store.endpoints_latlon()
+        endpoints = [p for s in spots
+                     for p in (s.tx_latlon(), s.rx_latlon()) if p is not None]
         target = geo.auto_frame(endpoints, home_ll)
         need = win._bm_frame is None or (now - win._bm_last_frame_t) > _FRAME_DAMP_S
         if not need and endpoints:
@@ -257,6 +292,8 @@ def _band_map_redraw(win, now):
     # ── apply frame + status ──────────────────────────────────────────────
     win._bm_plot.setXRange(lon_min * k, lon_max * k, padding=0)
     win._bm_plot.setYRange(lat_min, lat_max, padding=0)
+    rng = (f"≤{int(win._bm_range_km.value())}km"
+           if win._bm_inrange.isChecked() else "all")
     win._bm_status.setText(
-        f"{len(drawable)} paths · {n_groups} simultaneous · "
+        f"{len(drawable)} paths · {n_groups} simultaneous · {rng} · "
         f"{win._bm_home_grid} · {len(store.spots())} spots/{int(_MAX_AGE_S/60)}m")
