@@ -132,6 +132,7 @@ def setup_band_map_window(self, view_action):
     # aspect to cos(lat0) in _band_map_redraw, so 1° lon renders as cos(lat0) of
     # 1° lat — geography is preserved in any window shape (no manual 4:1).
     plot.setAspectLocked(True, ratio=1.0)
+    plot.getViewBox().disableAutoRange()   # only our setRange moves the view
     plot.showGrid(x=False, y=False)
     plot.getViewBox().setMouseEnabled(x=True, y=True)
     plot.setLabel("bottom", "")
@@ -155,6 +156,14 @@ def setup_band_map_window(self, view_action):
 
     win._bm_graticule = plot.plot([], [], pen=pg.mkPen("#dde2e8", width=1),
                                   connect="finite")
+    _gx, _gy = [], []                      # fixed global 10° grid, drawn once
+    for _lon in range(-180, 181, 10):
+        _gx += [_lon, _lon, math.nan]
+        _gy += [-80, 80, math.nan]
+    for _lat in range(-80, 81, 10):
+        _gx += [-180, 180, math.nan]
+        _gy += [_lat, _lat, math.nan]
+    win._bm_graticule.setData(_gx, _gy)
     # three age bands on a light background: fresh = strong/dark -> old = faint
     win._bm_arcs = [
         plot.plot([], [], pen=pg.mkPen(c, width=w), connect="finite")
@@ -322,19 +331,8 @@ def _band_map_redraw(win, now):
         win._bm_basemap.setData(win._bm_base_lon, win._bm_base_lat)
         win._bm_base_drawn = True
 
-    # ── graticule (lat/lon lines every 10°) ───────────────────────────────
-    gx, gy = [], []
-    lo0 = int(math.floor(lon_min / 10.0) * 10)
-    lo1 = int(math.ceil(lon_max / 10.0) * 10)
-    la0 = int(math.floor(lat_min / 10.0) * 10)
-    la1 = int(math.ceil(lat_max / 10.0) * 10)
-    for lon in range(lo0, lo1 + 1, 10):
-        gx += [lon, lon, math.nan]
-        gy += [la0, la1, math.nan]
-    for lat in range(la0, la1 + 1, 10):
-        gx += [lo0, lo1, math.nan]
-        gy += [lat, lat, math.nan]
-    win._bm_graticule.setData(gx, gy)
+    # graticule is a fixed global grid drawn once in setup — it covers any view,
+    # so it doesn't fight manual pan/zoom when Auto-frame is off.
 
     # ── arcs + midpoints ──────────────────────────────────────────────────
     band_x = [[], [], []]
@@ -384,9 +382,12 @@ def _band_map_redraw(win, now):
     win._bm_home.setData([{"pos": (home_ll[1], home_ll[0])}])
 
     # ── apply frame + status ──────────────────────────────────────────────
-    # aspect is locked, so this contains the frame and letterboxes the rest
-    win._bm_plot.setRange(xRange=(lon_min, lon_max), yRange=(lat_min, lat_max),
-                          padding=0)
+    # Only drive the view while Auto-frame is on; when off, leave the viewport
+    # entirely to the user's mouse (otherwise this 1 Hz setRange snatches the
+    # zoom/pan back every tick).  Aspect stays locked either way.
+    if win._bm_autoframe.isChecked():
+        win._bm_plot.setRange(xRange=(lon_min, lon_max),
+                              yRange=(lat_min, lat_max), padding=0)
     rng = (f"≤{int(win._bm_range_km.value())}km"
            if win._bm_inrange.isChecked() else "all")
     mine_txt = (f"mine {n_mine_located}/{n_mine}"
