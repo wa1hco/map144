@@ -1631,6 +1631,7 @@ def closeEvent(self, event):
         (getattr(self, '_cand_map_win',   None), 'cand_map_geometry',   'cand_map_visible'),
         (getattr(self, '_iq_nb_win',      None), 'iq_nb_geometry',      'iq_nb_visible'),
         (getattr(self, '_reporting_win',  None), 'reporting_geometry',  'reporting_visible'),
+        (getattr(self, '_band_map_win',   None), 'band_map_geometry',   'band_map_visible'),
         (getattr(self, '_flex_win',       None), 'flex_geometry',       None),
         (getattr(self, '_usrp_win',       None), 'usrp_geometry',       None),
         (getattr(self, '_airspy_win',     None), 'airspy_geometry',     None),
@@ -1642,6 +1643,10 @@ def closeEvent(self, event):
             _SETTINGS.setValue(geo_key, win.saveGeometry())
             if vis_key is not None:
                 _SETTINGS.setValue(vis_key, win.isVisible())
+
+    # Flush settings to disk now, BEFORE source teardown — so window states
+    # survive even if a teardown step hangs and the user has to kill the process.
+    _SETTINGS.sync()
 
     print("Shutting down...")
     self.running = False
@@ -1678,11 +1683,24 @@ def closeEvent(self, event):
     # their closeEvent accepts rather than ignoring the event.
     for _attr in ('_fast_graph_win', '_detect_win', '_sync_detect_win', '_cand_map_win',
                   '_iq_nb_win',
-                  '_reporting_win', '_flex_win', '_usrp_win', '_airspy_win', '_rtlsdr_win',
+                  '_reporting_win', '_band_map_win',
+                  '_flex_win', '_usrp_win', '_airspy_win', '_rtlsdr_win',
                   '_sdrangel_win', '_screenshot_win'):
         _w = getattr(self, _attr, None)
         if _w is not None:
             _w.close()
+
+    # Safety net so a future top-level panel can't silently re-introduce the
+    # "open window blocks quitOnLastWindowClosed -> shutdown hangs" bug: close
+    # any remaining visible _PanelWindow that wasn't in the list above.
+    try:
+        from PyQt5 import QtWidgets as _QtW
+        from .ui import _PanelWindow as _PW
+        for _w in _QtW.QApplication.topLevelWidgets():
+            if isinstance(_w, _PW) and _w.isVisible():
+                _w.close()
+    except Exception:
+        pass
 
     # Close any open analysis windows (saves their settings automatically via closeEvent).
     for _w in list(getattr(self, '_analysis_windows', [])):
