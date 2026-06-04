@@ -138,6 +138,7 @@ def setup_ui(self):
     )
     from .reporting_window import setup_reporting_window
     from .screenshot_window import setup_screenshot_window
+    from .band_map_window import setup_band_map_window
 
     self.setWindowTitle(f'map144 v{__version__}  —  {self.center_freq_mhz:.3f} MHz')
     self.setGeometry(50, 50, 420, 800)
@@ -214,6 +215,7 @@ def setup_ui(self):
     cand_map_action    = QtWidgets.QAction("Sync Candidate Map",   self)
     iq_nb_action       = QtWidgets.QAction("Noise Blanker",  self)
     reporting_action   = QtWidgets.QAction("Reporting",            self)
+    band_map_action    = QtWidgets.QAction("Band Map",            self)
     flex_action        = QtWidgets.QAction("Flex Radio",           self)
     usrp_action        = QtWidgets.QAction("USRP B210",            self)
     airspy_action      = QtWidgets.QAction("Airspy HF+",           self)
@@ -221,7 +223,7 @@ def setup_ui(self):
     sdrangel_action    = QtWidgets.QAction("SDRangel",             self)
     # Toggle-style View entries — checked state mirrors window visibility.
     for act in (fg_action, det_action, sync_det_action, cand_map_action, iq_nb_action,
-                reporting_action,
+                reporting_action, band_map_action,
                 flex_action, usrp_action, airspy_action, rtlsdr_action, sdrangel_action):
         act.setCheckable(True)
         act.setChecked(True)
@@ -676,6 +678,7 @@ def setup_ui(self):
     # ── Panel windows: source-specific ───────────────────────────────────────
     setup_iq_nb_window(self,      iq_nb_action)
     setup_reporting_window(self,  reporting_action)
+    setup_band_map_window(self,   band_map_action)
     setup_flex_window(self,       flex_action)
     setup_usrp_window(self,       usrp_action)
     setup_airspy_window(self,     airspy_action)
@@ -701,6 +704,9 @@ def setup_ui(self):
     )
     reporting_action.triggered.connect(
         lambda checked: self._reporting_win.show() if checked else self._reporting_win.hide()
+    )
+    band_map_action.triggered.connect(
+        lambda checked: self._band_map_win.show() if checked else self._band_map_win.hide()
     )
     # Action-style: open a fresh AnalysisWindow on each click.
     analysis_action.triggered.connect(
@@ -733,6 +739,7 @@ def setup_ui(self):
         (self._sync_detect_win,'sync_detect_geometry',QtCore.QRect(480, 1075,850, 350)),
         (self._iq_nb_win,      'iq_nb_geometry',      QtCore.QRect(50,  870, 380, 420)),
         (self._reporting_win,  'reporting_geometry',  QtCore.QRect(820, 870, 380, 500)),
+        (self._band_map_win,   'band_map_geometry',   QtCore.QRect(820, 100, 780, 560)),
         (self._flex_win,       'flex_geometry',       QtCore.QRect(450, 870, 360, 500)),
         (self._usrp_win,       'usrp_geometry',       QtCore.QRect(450, 870, 360, 440)),
         (self._airspy_win,     'airspy_geometry',     QtCore.QRect(450, 870, 360, 340)),
@@ -756,18 +763,22 @@ def setup_ui(self):
     cand_map_visible = _SETTINGS.value('cand_map_visible',    True, type=bool)
     iq_nb_visible      = _SETTINGS.value('iq_nb_visible',       True,  type=bool)
     reporting_visible  = _SETTINGS.value('reporting_visible',    True,  type=bool)
+    band_map_visible   = _SETTINGS.value('band_map_visible',     False, type=bool)
     fg_action.setChecked(fg_visible)
     det_action.setChecked(det_visible)
     sync_det_action.setChecked(sync_det_visible)
     cand_map_action.setChecked(cand_map_visible)
     iq_nb_action.setChecked(iq_nb_visible)
     reporting_action.setChecked(reporting_visible)
+    band_map_action.setChecked(band_map_visible)
     if fg_visible:         self._fast_graph_win.show()
     if det_visible:        self._detect_win.show()
     if sync_det_visible:   self._sync_detect_win.show()
     if cand_map_visible:   self._cand_map_win.show()
     if iq_nb_visible:      self._iq_nb_win.show()
     if reporting_visible:  self._reporting_win.show()
+    if band_map_visible:   self._band_map_win.show()
+    else:                  self._band_map_win.hide()
 
     # Radio windows start hidden
     for win in (self._flex_win, self._usrp_win, self._airspy_win, self._rtlsdr_win, self._sdrangel_win):
