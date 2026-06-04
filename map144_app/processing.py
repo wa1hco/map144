@@ -1279,7 +1279,17 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         if self.timebase.should_mark_period(_tb_now):
             self.timebase.mark_period_start(sample=self._iq_abs_sample, wall=_tb_now)
 
+    # The TFMF surface + peak-pick is display-only and is the CPU fallback of a
+    # GPU path (~10 ms GPU vs ~4-7 s CPU), so skip it when no consumer is on
+    # screen — same guideline the Fast Graph follows (_fg_visible).  Both the
+    # Sync Detection window (the SNR heatmap) and the Sync Candidate Map window
+    # (the candidate scatter) consume it, so run if EITHER is visible.  No
+    # consuming window present (headless/tests) → treat as wanted.
+    _tfmf_wins = [w for w in (getattr(self, '_sync_detect_win', None),
+                              getattr(self, '_cand_map_win', None)) if w is not None]
+    _tfmf_wanted = (not _tfmf_wins) or any(w.isVisible() for w in _tfmf_wins)
     if (self._iq_t0_wall is not None
+            and _tfmf_wanted
             and not self._tfmf_worker_busy
             and (_loop_wall - self._tfmf_last_dispatch_time
                  >= _TFMF_REDISPLAY_INTERVAL_S)):
