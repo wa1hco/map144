@@ -180,9 +180,16 @@ class WsjtxAudioExporter:
                 continue
             if pcm is None:
                 break
+            # Snapshot: close() runs on the main thread at shutdown and sets
+            # self._proc = None; without the local ref a non-None pcm pulled
+            # just before that nulling would hit None.stdin (AttributeError,
+            # uncaught) and crash this daemon thread during teardown.
+            proc = self._proc
+            if proc is None:
+                break
             try:
-                self._proc.stdin.write(pcm)
-            except (BrokenPipeError, ValueError, OSError):
+                proc.stdin.write(pcm)
+            except (BrokenPipeError, ValueError, OSError, AttributeError):
                 log.warning("WsjtxAudioExporter: audio player closed; stopping export")
                 self._proc = None
                 break
