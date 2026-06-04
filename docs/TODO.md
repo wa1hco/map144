@@ -741,6 +741,50 @@ feeds exactly once.
     Presence is necessary, not sufficient — the geometry engine is what turns raw
     presence into a per-path workability estimate.
 
+    **Meteor-geometry refinement (2026-06-04, from the live run + WSJT-X azdist).**
+    The "reflection point = great-circle midpoint" model is wrong. MS reflects off
+    an extended ionized **trail** (a line ~10–25 km at ~85–115 km alt), specular
+    in the Fresnel sense (trail tangent to the TX/RX ellipsoid) for underdense,
+    diffuse for overdense. Antenna pointing *selects* off-path hot spots, so the
+    reflection is **off the direct path and only roughly locatable** (diffuse,
+    not a point). WSJT-X `azdist.f90` already encodes this: it returns **Hot A/B**
+    azimuths = direct `Az ± daz` (`daztab` offset ~8–21°, distance-dependent), and
+    `HotABetter` flips by **time of day** (`tmid`, breakpoint at dawn) and
+    hemisphere — the terminator-drift effect, in code. **Upgrade path for the
+    blob:** shoot a Hot-A ray from each endpoint, intersect → off-path common
+    volume, *no antenna logs needed* (heading derived from grids + time). Keep the
+    blob diffuse regardless — Hot-A is a statistical bias, not a locator. See
+    `project_band_map` and `project_meteor_geometry` memories.
+
+49. ✅ **Band Map panel** (landed 2026-06-04). View-menu toggle window; geographic
+    NA map (pyqtgraph, light mode, real lon/lat + cos(lat0) aspect lock; basemap
+    loaded at runtime from GridTracker `shapes.json`). Layers: **PSKReporter**
+    (blue, age-faded, midpoint ticks) + **MAP144 live decodes** (green, from
+    `decodes.jsonl`, near-instant) + **same-second co-path "meteors"** (one diffuse
+    colour-coded blob per group; arcs colour-coded so meteors are separable).
+    Auto-frame (damped, outlier-robust, home-in) with in-range filter (default
+    2500 km). Grid resolution: message > live (PSKReporter) > static
+    (ADIF/QRZ home), with recency + `/M`·`/R` rules and canonical position per
+    call. Pure-layered: `geo.py` (math) ← `spot_bus.py` (ingest) ← panel (Qt). 49
+    geo/spot_bus tests. Files: `map144_app/{geo,spot_bus,band_map_window}.py`.
+    See `project_band_map` memory.
+
+    Band-Map backlog:
+    - **49a ⬜ ALL.TXT grid source + WSJT-X decode layer.** `ALL.TXT` (730 MB)
+      carries `CQ <call> <grid>` for everyone *heard* (not just worked) and is
+      self-updating — richer than the ADIF log. Tail it incrementally (cached
+      index, not full re-read) for grid fill AND as a decode layer (multi-instance
+      WSJT-X). Operator: "new info makes it into all.txt, available next time."
+    - **49b ⬜ Hot-A off-path blob biasing** (see #48 refinement above) — port
+      `azdist` daz/HotABetter to nudge the blob off-path; keep it diffuse.
+    - **49c ⬜ Dateline split** — `AK` Aleutians wrap ±180° → one stray line in a
+      whole-world view; split rings at the dateline.
+    - **49d ⬜ Terminator-drift time-lapse** — activity longitude vs UTC should
+      show the dawn band as a diagonal streak (operator prediction, in the data).
+    - **49e ⬜ QRZ cache pre-warmer** (optional) — walk `decodes.jsonl`, look up
+      calls via `tools/qrz_lookup.py`, fill `qrz_grid_cache.json` for never-worked
+      stations the ADIF index misses.
+
 ---
 
 ## Sequencing — what blocks what
