@@ -50,6 +50,7 @@ class Spot:
     rx_call: str | None
     rx_grid: str | None
     snr_db: float | None
+    grid_src: str | None = None   # how tx_grid was set: net/msg/live/static
 
     def tx_latlon(self):
         return _safe_latlon(self.tx_grid)
@@ -88,6 +89,7 @@ def normalize_pskr(raw: dict) -> Spot:
         rx_call=raw.get("rc"),
         rx_grid=_clean_grid(raw.get("rl")),
         snr_db=raw.get("rp"),
+        grid_src="net" if _clean_grid(raw.get("sl")) else None,
     )
 
 
@@ -146,6 +148,7 @@ def normalize_map144(raw, my_call, my_grid):
         rx_call=my_call or None,
         rx_grid=_clean_grid(my_grid),
         snr_db=snr,
+        grid_src="msg" if tx_grid else None,
     )
 
 

@@ -168,12 +168,20 @@ def setup_band_map_window(self, view_action):
     win._bm_mid_hi = pg.ScatterPlotItem(size=7, brush=pg.mkBrush("#ff9000"),
                                         pen=pg.mkPen("#a04000", width=1))
     plot.addItem(win._bm_mid_hi)
-    # MAP144's own decodes — green, above the PSKReporter layer
+    # MAP144's own decodes — green, above the PSKReporter layer.  Confident
+    # (message/live grid) = solid + filled; best-guess (static home grid) =
+    # dashed + hollow, so a possibly-stale location doesn't look authoritative.
     win._bm_mine_arcs = plot.plot([], [], pen=pg.mkPen("#108a2e", width=2.4),
                                   connect="finite")
     win._bm_mine_pts = pg.ScatterPlotItem(size=7, brush=pg.mkBrush("#108a2e"),
                                           pen=pg.mkPen("#0a5018", width=1))
     plot.addItem(win._bm_mine_pts)
+    win._bm_mine_arcs_bg = plot.plot(
+        [], [], pen=pg.mkPen("#86b896", width=1.6, style=QtCore.Qt.DashLine),
+        connect="finite")
+    win._bm_mine_pts_bg = pg.ScatterPlotItem(   # hollow = best guess
+        size=8, brush=None, pen=pg.mkPen("#108a2e", width=1.3))
+    plot.addItem(win._bm_mine_pts_bg)
     win._bm_home = pg.ScatterPlotItem(
         size=15, symbol="star", brush=pg.mkBrush("#e00000"),
         pen=pg.mkPen("#600000", width=1))
@@ -248,10 +256,14 @@ def _band_map_redraw(win, now):
             if not s.tx_grid and s.tx_call:
                 call = s.tx_call.upper()
                 g = live_idx.get(call)
-                if not g and "/" not in call:
-                    g = win._bm_static_grids.get(call)
                 if g:
                     s.tx_grid = g
+                    s.grid_src = "live"            # current -> confident
+                elif "/" not in call:
+                    g = win._bm_static_grids.get(call)
+                    if g:
+                        s.tx_grid = g
+                        s.grid_src = "static"      # home/historical -> best guess
             if s.resolvable():
                 n_mine_located += 1
 
@@ -330,6 +342,8 @@ def _band_map_redraw(win, now):
     hi_x, hi_y = [], []
     mid_pts, mid_hi_pts = [], []
     mine_x, mine_y, mine_pts = [], [], []
+    mine_bx, mine_by, mine_bpts = [], [], []   # best-guess (static home grid)
+    n_guess = 0
     for s in drawable:
         tla, tlo = s.tx_latlon()
         rla, rlo = s.rx_latlon()
@@ -338,6 +352,12 @@ def _band_map_redraw(win, now):
         ay = [p[0] for p in arc]               # real latitude
         mla, mlo = geo.great_circle_midpoint(tla, tlo, rla, rlo)
         if s.source == "map144":               # your own decode -> green, DX marked
+            if s.grid_src == "static":         # possibly-stale home grid
+                n_guess += 1
+                mine_bx += ax + [math.nan]
+                mine_by += ay + [math.nan]
+                mine_bpts.append({"pos": (tlo, tla)})
+                continue
             mine_x += ax + [math.nan]
             mine_y += ay + [math.nan]
             mine_pts.append({"pos": (tlo, tla)})
@@ -359,6 +379,8 @@ def _band_map_redraw(win, now):
     win._bm_mid_hi.setData(mid_hi_pts)
     win._bm_mine_arcs.setData(mine_x, mine_y)
     win._bm_mine_pts.setData(mine_pts)
+    win._bm_mine_arcs_bg.setData(mine_bx, mine_by)
+    win._bm_mine_pts_bg.setData(mine_bpts)
     win._bm_home.setData([{"pos": (home_ll[1], home_ll[0])}])
 
     # ── apply frame + status ──────────────────────────────────────────────
@@ -367,7 +389,8 @@ def _band_map_redraw(win, now):
                           padding=0)
     rng = (f"≤{int(win._bm_range_km.value())}km"
            if win._bm_inrange.isChecked() else "all")
-    mine_txt = f"mine {n_mine_located}/{n_mine}" if n_mine else "mine 0"
+    mine_txt = (f"mine {n_mine_located}/{n_mine}"
+                + (f" ({n_guess} guess)" if n_guess else "")) if n_mine else "mine 0"
     win._bm_status.setText(
         f"{len(drawable)} paths · {mine_txt} · {n_groups} simultaneous · {rng} · "
         f"{win._bm_home_grid} · {len(store.spots())} spots/{int(_MAX_AGE_S/60)}m")
