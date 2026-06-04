@@ -63,6 +63,13 @@ _RECENT_DAYS = 730          # ADIF grid newer than this is trusted; older = gues
 # Suffixes that mean the operator is on the move, so their logged home grid is
 # never trustworthy (vs /P portable, which the operator said recent logs can use).
 _MOBILE_SUFFIXES = {"M", "MM", "R", "AM"}
+# Distinct colours cycled per same-second co-path group ("meteor"), so adjacent
+# ping-events are separable.  One diffuse blob per group marks its (fuzzy) common
+# reflection volume — NOT a precise point (the trail is an extended line; see the
+# #48 notes), so it is drawn translucent/large on purpose.
+_COPATH_COLORS = ["#e6194B", "#3cb44b", "#f58231", "#4363d8", "#911eb4",
+                  "#008080", "#e6beff", "#9A6324", "#800000", "#808000",
+                  "#000075", "#f032e6"]
 _FRAME_DAMP_S = 20.0        # re-fit the frame at most this often
 _REFRAME_MARGIN = 1.5       # also re-fit if activity drifts this far (deg) outside
 
@@ -174,14 +181,19 @@ def setup_band_map_window(self, view_action):
         plot.plot([], [], pen=pg.mkPen(c, width=w), connect="finite")
         for c, w in (("#0a48a8", 2.0), ("#5b86c4", 1.6), ("#a9c0de", 1.2))
     ]
-    win._bm_arc_hi = plot.plot([], [], pen=pg.mkPen("#e8500a", width=2.6),
-                               connect="finite")
     win._bm_mid = pg.ScatterPlotItem(size=4, brush=pg.mkBrush("#c00000"),
                                      pen=None)
     plot.addItem(win._bm_mid)
-    win._bm_mid_hi = pg.ScatterPlotItem(size=7, brush=pg.mkBrush("#ff9000"),
-                                        pen=pg.mkPen("#a04000", width=1))
-    plot.addItem(win._bm_mid_hi)
+    # same-second co-path ("meteor") arcs, one PlotDataItem per palette colour;
+    # groups cycle through the palette so adjacent meteors are separable.
+    win._bm_copath_arcs = [
+        plot.plot([], [], pen=pg.mkPen(c, width=1.8), connect="finite")
+        for c in _COPATH_COLORS
+    ]
+    # one diffuse blob per meteor at its (fuzzy) common volume — large + trans-
+    # lucent on purpose; per-point colour matches that meteor's arcs.
+    win._bm_meteor = pg.ScatterPlotItem(size=24, pen=None, pxMode=True)
+    plot.addItem(win._bm_meteor)
     # MAP144's own decodes — green, above the PSKReporter layer.  Confident
     # (message/live grid) = solid + filled; best-guess (static home grid) =
     # dashed + hollow, so a possibly-stale location doesn't look authoritative.
@@ -200,6 +212,26 @@ def setup_band_map_window(self, view_action):
         size=15, symbol="star", brush=pg.mkBrush("#e00000"),
         pen=pg.mkPen("#600000", width=1))
     plot.addItem(win._bm_home)
+
+    # ── legend (anchored bottom-right — usually ocean at default scale) ────
+    legend = pg.LegendItem(offset=(-8, -8), labelTextSize="8pt",
+                           labelTextColor="#222",
+                           brush=pg.mkBrush(255, 255, 255, 210),
+                           pen=pg.mkPen("#9aa6b4"))
+    legend.setParentItem(plot.getViewBox())
+    legend.addItem(pg.ScatterPlotItem(symbol="star", size=11,
+                   brush=pg.mkBrush("#e00000"), pen=pg.mkPen("#600000")),
+                   "home (you)")
+    legend.addItem(pg.PlotDataItem(pen=pg.mkPen("#108a2e", width=2.4)),
+                   "my decode")
+    legend.addItem(pg.PlotDataItem(pen=pg.mkPen("#86b896", width=1.6,
+                   style=QtCore.Qt.DashLine)), "my decode (grid guess)")
+    legend.addItem(pg.PlotDataItem(pen=pg.mkPen("#0a48a8", width=2)),
+                   "network spot")
+    legend.addItem(pg.ScatterPlotItem(symbol="o", size=12, pen=None,
+                   brush=pg.mkBrush(230, 25, 75, 120)),
+                   "meteor (same-second)")
+    win._bm_legend = legend
 
     # ── data plumbing ─────────────────────────────────────────────────────
     win._bm_tailer = PskrTailer(_PSKR_PATH)
@@ -306,17 +338,17 @@ def _band_map_redraw(win, now):
         spots = [s for s in spots if _within_range(s, home_ll, max_km)]
     drawable = [s for s in spots if s.resolvable()]
 
-    # which spots are part of a same-second co-path group?
-    hi_ids = set()
+    # which spots are part of a same-second co-path group, and which group?
+    group_of = {}        # id(spot) -> group index ("meteor" id)
     n_groups = 0
     if win._bm_highlight.isChecked():
         wrapped = [{"tx_call": s.tx_call, "rx_call": s.rx_call, "t": s.t, "_spot": s}
                    for s in spots]
         groups = geo.cluster_copaths(wrapped, window_s=1.0)
         n_groups = len(groups)
-        for g in groups:
+        for gi, g in enumerate(groups):
             for w in g:
-                hi_ids.add(id(w["_spot"]))
+                group_of[id(w["_spot"])] = gi
 
     # ── auto-frame (damped) ───────────────────────────────────────────────
     if win._bm_autoframe.isChecked():
@@ -373,10 +405,13 @@ def _band_map_redraw(win, now):
             return None
 
     # ── arcs + midpoints ──────────────────────────────────────────────────
+    npal = len(_COPATH_COLORS)
     band_x = [[], [], []]
     band_y = [[], [], []]
-    hi_x, hi_y = [], []
-    mid_pts, mid_hi_pts = [], []
+    copath_x = [[] for _ in range(npal)]   # co-path arcs bucketed by palette colour
+    copath_y = [[] for _ in range(npal)]
+    grp_mid = {}                            # group index -> [sum_lon, sum_lat, n]
+    mid_pts = []
     mine_x, mine_y, mine_pts = [], [], []
     mine_bx, mine_by, mine_bpts = [], [], []   # best-guess (static home grid)
     n_guess = 0
@@ -391,6 +426,7 @@ def _band_map_redraw(win, now):
         ax = [p[1] for p in arc]               # real longitude
         ay = [p[0] for p in arc]               # real latitude
         mla, mlo = geo.great_circle_midpoint(tla, tlo, rla, rlo)
+        gi = group_of.get(id(s))
         if s.source == "map144":               # your own decode -> green, DX marked
             if s.grid_src == "static_old":     # stale home grid -> best guess
                 n_guess += 1
@@ -401,10 +437,14 @@ def _band_map_redraw(win, now):
             mine_x += ax + [math.nan]
             mine_y += ay + [math.nan]
             mine_pts.append({"pos": (tlo, tla)})
-        elif id(s) in hi_ids:
-            hi_x += ax + [math.nan]
-            hi_y += ay + [math.nan]
-            mid_hi_pts.append({"pos": (mlo, mla)})
+        elif gi is not None:                   # co-path member -> colour by meteor
+            ci = gi % npal
+            copath_x[ci] += ax + [math.nan]
+            copath_y[ci] += ay + [math.nan]
+            acc = grp_mid.setdefault(gi, [0.0, 0.0, 0])
+            acc[0] += mlo
+            acc[1] += mla
+            acc[2] += 1
         else:
             age = now - (s.t or now)
             b = 0 if age < 120 else (1 if age < 420 else 2)
@@ -412,11 +452,21 @@ def _band_map_redraw(win, now):
             band_y[b] += ay + [math.nan]
             mid_pts.append({"pos": (mlo, mla)})
 
+    # one diffuse blob per meteor, at the centroid of its path midpoints (a
+    # rough common-volume estimate — kept large/translucent, see #48 notes)
+    meteor_pts = []
+    for gi, (slon, slat, n) in grp_mid.items():
+        if n:
+            r, g, b = pg.colorTuple(pg.mkColor(_COPATH_COLORS[gi % npal]))[:3]
+            meteor_pts.append({"pos": (slon / n, slat / n),
+                               "brush": pg.mkBrush(r, g, b, 110)})
+
     for i in range(3):
         win._bm_arcs[i].setData(band_x[i], band_y[i])
-    win._bm_arc_hi.setData(hi_x, hi_y)
+    for i in range(npal):
+        win._bm_copath_arcs[i].setData(copath_x[i], copath_y[i])
+    win._bm_meteor.setData(meteor_pts)
     win._bm_mid.setData(mid_pts)
-    win._bm_mid_hi.setData(mid_hi_pts)
     win._bm_mine_arcs.setData(mine_x, mine_y)
     win._bm_mine_pts.setData(mine_pts)
     win._bm_mine_arcs_bg.setData(mine_bx, mine_by)
