@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -38,13 +39,49 @@ from .spot_bus import (
     load_qrz_cache_grids, normalize_map144,
 )
 
-# Local call->grid sources (no network): WSJT-X / JTDX logs + GridTracker's
-# LoTW ADIF.  Override with MAP144_ADIF_GLOBS (':'-separated glob patterns).
-_ADIF_GLOBS = os.environ.get("MAP144_ADIF_GLOBS", ":".join([
-    "~/.local/share/WSJT-X*/wsjtx_log.adi",
-    "~/.local/share/JTDX*/wsjtx_log.adi",
-    "~/.config/GridTracker2/Ginternal/LoTW_QSL.adif",
-])).split(":")
+
+def _adif_default_globs():
+    """OS-aware WSJT-X / JTDX log + GridTracker LoTW ADIF glob patterns."""
+    home = os.path.expanduser("~")
+    if sys.platform == "win32":
+        lad = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
+        apd = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
+        return [os.path.join(lad, "WSJT-X*", "wsjtx_log.adi"),
+                os.path.join(lad, "JTDX*", "wsjtx_log.adi"),
+                os.path.join(apd, "GridTracker2", "Ginternal", "LoTW_QSL.adif")]
+    if sys.platform == "darwin":
+        sup = os.path.join(home, "Library", "Application Support")
+        return [os.path.join(sup, "WSJT-X*", "wsjtx_log.adi"),
+                os.path.join(sup, "JTDX*", "wsjtx_log.adi"),
+                os.path.join(home, ".config", "GridTracker2", "Ginternal",
+                             "LoTW_QSL.adif")]
+    return ["~/.local/share/WSJT-X*/wsjtx_log.adi",
+            "~/.local/share/JTDX*/wsjtx_log.adi",
+            "~/.config/GridTracker2/Ginternal/LoTW_QSL.adif"]
+
+
+def _basemap_default_candidates():
+    """OS-aware GridTracker shapes.json candidate paths (first existing wins)."""
+    home = os.path.expanduser("~")
+    if sys.platform == "win32":
+        lad = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        sub = ("resources", "app", "data", "shapes.json")
+        return [os.path.join(lad, "Programs", "GridTracker2", *sub),
+                os.path.join(pf, "GridTracker2", *sub),
+                os.path.join(pf, "GridTracker", *sub)]
+    if sys.platform == "darwin":
+        sub = ("Contents", "Resources", "app", "data", "shapes.json")
+        return [os.path.join("/Applications", "GridTracker2.app", *sub),
+                os.path.join("/Applications", "GridTracker.app", *sub)]
+    return ["/usr/share/gridtracker/data/shapes.json",
+            "/opt/GridTracker2/resources/app/data/shapes.json"]
+
+
+# Local call->grid sources (no network).  Override with MAP144_ADIF_GLOBS
+# (os.pathsep-separated, so ';' on Windows where paths contain a drive ':').
+_env_adif = os.environ.get("MAP144_ADIF_GLOBS")
+_ADIF_GLOBS = (_env_adif.split(os.pathsep) if _env_adif else _adif_default_globs())
 
 _PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DET_DIR = os.path.join(_PROJ_ROOT, "MSK144", "detections")
@@ -52,11 +89,12 @@ _PSKR_PATH = os.path.join(_DET_DIR, "pskr_spots.jsonl")
 _DECODES_PATH = os.path.join(_DET_DIR, "decodes.jsonl")
 _QRZ_CACHE_PATH = os.path.join(_DET_DIR, "qrz_grid_cache.json")
 
-# Coastline / state-border basemap.  Loaded at runtime from GridTracker's data
-# (US states + Canadian provinces, GPL, already installed) — not copied into the
-# repo.  Override with MAP144_BASEMAP; if absent the map falls back to graticule.
-_BASEMAP_PATH = os.environ.get(
-    "MAP144_BASEMAP", "/usr/share/gridtracker/data/shapes.json")
+# Coastline / state-border basemap, loaded at runtime from GridTracker's data
+# (GPL, already installed) — not copied into the repo.  Override with
+# MAP144_BASEMAP; else the first existing OS-default candidate; else graticule.
+_BASEMAP_PATH = os.environ.get("MAP144_BASEMAP") or next(
+    (p for p in _basemap_default_candidates() if os.path.exists(p)),
+    _basemap_default_candidates()[0])
 
 _MAX_AGE_S = 900.0          # 15-minute trailing window
 _RECENT_DAYS = 730          # ADIF grid newer than this is trusted; older = guess
