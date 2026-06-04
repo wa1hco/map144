@@ -108,6 +108,25 @@ def test_load_qrz_cache_grids(tmp_path):
     assert grids == {"W9XX": "EN63bl"}
 
 
+def test_load_adif_grids(tmp_path):
+    p = tmp_path / "log.adi"
+    p.write_text(
+        "header stuff <eoh>\n"
+        "<CALL:4>W8KF <GRIDSQUARE:4>EN81 <MODE:5>MSK144 <eor>\n"
+        "<call:5>K8LEE <gridsquare:6>EM79ng <eor>\n"
+        "<CALL:5>NOGRD <MODE:3>FT8 <eor>\n"          # no grid -> skipped
+        "<CALL:4>W8KF <GRIDSQUARE:6>EN81sg <eor>\n"  # longer grid wins
+    )
+    idx = spot_bus.load_adif_grids([str(p)])
+    assert idx["K8LEE"] == "EM79ng"
+    assert idx["W8KF"] == "EN81sg"      # 6-char beat the earlier 4-char
+    assert "NOGRD" not in idx
+
+
+def test_load_adif_grids_missing(tmp_path):
+    assert spot_bus.load_adif_grids([str(tmp_path / "none*.adi")]) == {}
+
+
 # --- tailer ----------------------------------------------------------------
 def _append(path, *raws):
     with open(path, "a") as f:

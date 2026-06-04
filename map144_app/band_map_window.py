@@ -33,9 +33,17 @@ from PyQt5 import QtCore, QtWidgets
 
 from . import geo
 from .spot_bus import (
-    JsonlTailer, PskrTailer, SpotStore, grid_index, load_qrz_cache_grids,
-    normalize_map144,
+    JsonlTailer, PskrTailer, SpotStore, grid_index, load_adif_grids,
+    load_qrz_cache_grids, normalize_map144,
 )
+
+# Local call->grid sources (no network): WSJT-X / JTDX logs + GridTracker's
+# LoTW ADIF.  Override with MAP144_ADIF_GLOBS (':'-separated glob patterns).
+_ADIF_GLOBS = os.environ.get("MAP144_ADIF_GLOBS", ":".join([
+    "~/.local/share/WSJT-X*/wsjtx_log.adi",
+    "~/.local/share/JTDX*/wsjtx_log.adi",
+    "~/.config/GridTracker2/Ginternal/LoTW_QSL.adif",
+])).split(":")
 
 _PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DET_DIR = os.path.join(_PROJ_ROOT, "MSK144", "detections")
@@ -176,7 +184,9 @@ def setup_band_map_window(self, view_action):
     win._bm_map144_tailer = JsonlTailer(
         _DECODES_PATH,
         lambda r: normalize_map144(r, win._bm_my_call, win._bm_home_grid))
-    win._bm_qrz_grids = load_qrz_cache_grids(_QRZ_CACHE_PATH)
+    # static call->grid: ADIF logs (worked stations) + QRZ cache, network-free
+    win._bm_static_grids = load_adif_grids(_ADIF_GLOBS)
+    win._bm_static_grids.update(load_qrz_cache_grids(_QRZ_CACHE_PATH))
     win._bm_store = SpotStore(max_age_s=_MAX_AGE_S)
     win._bm_last_frame_t = 0.0
     win._bm_frame = None                   # (lon_min, lon_max, lat_min, lat_max)
@@ -224,7 +234,7 @@ def _band_map_redraw(win, now):
 
     # locate MAP144 decodes whose message carried no grid, using PSKReporter's
     # richer data (sl/rl) + the QRZ cache — so your own decodes can be placed
-    idx = grid_index(store.spots(), extra=win._bm_qrz_grids)
+    idx = grid_index(store.spots(), extra=win._bm_static_grids)
     n_mine = n_mine_located = 0
     for s in store.spots():
         if s.source == "map144":

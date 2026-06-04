@@ -17,6 +17,7 @@ geometry lives in :mod:`map144_app.geo`.
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import re
@@ -225,6 +226,39 @@ def load_qrz_cache_grids(path):
         return {}
     return {k.upper(): v["grid"] for k, v in d.items()
             if isinstance(v, dict) and v.get("grid")}
+
+
+_ADIF_CALL_RE = re.compile(r"<call:\d+(?::[^>]*)?>\s*([A-Z0-9/]+)", re.IGNORECASE)
+_ADIF_GRID_RE = re.compile(
+    r"<gridsquare:\d+(?::[^>]*)?>\s*([A-R]{2}\d{2}(?:[a-x]{2})?)", re.IGNORECASE)
+
+
+def load_adif_grids(globs):
+    """Build call(upper) -> grid from WSJT-X/LoTW ADIF logs (worked stations).
+
+    `globs` is a list of glob patterns; each matched file is parsed per <eor>
+    record for <CALL>/<GRIDSQUARE>.  A more precise (longer) grid wins.  This is
+    a local, instant, network-free grid source — far richer than the QRZ cache
+    for stations you've worked.  Missing/garbled files are skipped.
+    """
+    idx = {}
+    for pattern in globs:
+        for path in glob.glob(os.path.expanduser(pattern)):
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            for rec in re.split(r"<eor>", data, flags=re.IGNORECASE):
+                m = _ADIF_CALL_RE.search(rec)
+                g = _ADIF_GRID_RE.search(rec)
+                if not (m and g):
+                    continue
+                call = m.group(1).upper()
+                grid = g.group(1)
+                if call not in idx or len(grid) > len(idx[call]):
+                    idx[call] = grid
+    return idx
 
 
 class SpotStore:
