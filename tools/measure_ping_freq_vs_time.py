@@ -129,15 +129,30 @@ def sync_corr_freq_track(
     for i in range(n_steps):
         start = i * step_n
         frame = baseband[start:start + frame_n]
-        # Apply each candidate shift and pick the one with the highest
-        # sync-correlation peak magnitude.
-        best_f, best_m = 0.0, -1.0
+        # Apply each candidate shift and record the sync-correlation peak
+        # magnitude per-frequency so we can optionally refine with a
+        # sub-bin parabolic interpolation (reduces apparent quantisation).
+        mags = np.empty(len(freqs), dtype=np.float32)
         for k in range(len(freqs)):
             shifted = (frame * phasors[:, k]).astype(np.complex64)
             _, xmax, _ = _sync_correlate(shifted)
-            if xmax > best_m:
-                best_m = xmax
-                best_f = float(freqs[k])
+            mags[k] = xmax
+
+        # pick the discrete maximum
+        kbest = int(np.argmax(mags))
+        best_m = float(mags[kbest])
+        best_f = float(freqs[kbest])
+
+        # Parabolic interpolation using the neighbors (if available) to get
+        # a sub-bin frequency offset: offset in bins = 0.5*(m[-1]-m[+1]) /
+        # (m[-1] - 2*m0 + m[+1]).  Guard against flat denominator.
+        if 0 < kbest < len(freqs) - 1:
+            m_l = float(mags[kbest - 1]); m0 = float(mags[kbest]); m_r = float(mags[kbest + 1])
+            denom = (m_l - 2.0 * m0 + m_r)
+            if abs(denom) > 1e-12:
+                offset_bins = 0.5 * (m_l - m_r) / denom
+                best_f = float(freqs[kbest] + offset_bins * (freqs[1] - freqs[0]))
+
         t_arr[i] = (start + frame_n / 2) / sr
         f_arr[i] = best_f
         m_arr[i] = best_m

@@ -511,10 +511,11 @@ def _tile_html(row: dict, thumb_url: str, src_label: str,
         + '</div>'
     )
 
+    img_title = f'{period} — {wav_path}'
     return (
         '<div class="tile">'
-        f'<a href="file://{html.escape(str(wav_path))}" title="{html.escape(str(wav_path))}">'
-        f'<div class="imgwrap"><img src="{html.escape(thumb_url)}" loading="lazy">'
+        f'<a href="file://{html.escape(str(wav_path))}" title="{html.escape(img_title)}">'
+        f'<div class="imgwrap"><img src="{html.escape(thumb_url)}" loading="lazy" title="{html.escape(img_title)}">'
         f'<span class="src">{html.escape(src_label)}</span></div>'
         '</a>'
         f'{hdr}{subhdr}'
