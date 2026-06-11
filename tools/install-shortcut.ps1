@@ -23,7 +23,7 @@ param(
     # Launcher the shortcut points at.  Default: run-b210.bat one level up from
     # this script (i.e. the root of the install/repo this script ships in).
     [string]$Launcher = (Join-Path (Split-Path -Parent $PSScriptRoot) 'run-b210.bat'),
-    [string]$Name = 'map144-b210',
+    [string]$Name = 'map144',
     [switch]$CurrentUserOnly
 )
 
@@ -52,7 +52,21 @@ $folderKey = if ($CurrentUserOnly) { 'Programs' } else { 'CommonPrograms' }
 $programs  = [Environment]::GetFolderPath($folderKey)
 $lnkPath   = Join-Path $programs "$Name.lnk"
 
-$ws  = New-Object -ComObject WScript.Shell
+$ws = New-Object -ComObject WScript.Shell
+
+# Clean up any other shortcut in this folder that points at the same launcher
+# (e.g. a previously-named map144-b210.lnk), so a rename leaves one canonical entry.
+Get-ChildItem -LiteralPath $programs -Filter '*.lnk' -ErrorAction SilentlyContinue | ForEach-Object {
+    if ($_.FullName -ne $lnkPath) {
+        try {
+            if ($ws.CreateShortcut($_.FullName).TargetPath -eq $Launcher) {
+                Remove-Item -LiteralPath $_.FullName -Force
+                Write-Host "  removed old shortcut: $($_.Name)" -ForegroundColor DarkYellow
+            }
+        } catch { }
+    }
+}
+
 $lnk = $ws.CreateShortcut($lnkPath)
 $lnk.TargetPath       = $Launcher
 $lnk.WorkingDirectory = $workDir
@@ -70,5 +84,5 @@ Write-Host "Created Start Menu shortcut ($scope):" -ForegroundColor Green
 Write-Host "  $lnkPath"
 Write-Host "  -> $Launcher"
 Write-Host ""
-Write-Host "Type `"$Name`" (or `"map144`") in the Windows search bar to launch." -ForegroundColor Cyan
+Write-Host "Type `"$Name`" in the Windows search bar to launch." -ForegroundColor Cyan
 Write-Host "(Search may take a few seconds to index the new shortcut.)"

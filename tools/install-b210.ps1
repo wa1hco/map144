@@ -221,6 +221,36 @@ if (-not $SkipSmokeTest) {
     Write-Ok "uhd $uhdVer importable from env"
 }
 
+# -- 10.7 Start Menu shortcut (all users) -------------------------------------
+# Created here in the installer's already-elevated context, so no extra UAC.
+# Named "map144" (no -b210 suffix) so it launches by typing map144 in search.
+Write-Step "Start Menu shortcut"
+try {
+    $programs = [Environment]::GetFolderPath('CommonPrograms')
+    $lnkPath  = Join-Path $programs 'map144.lnk'
+    $target   = Join-Path $InstallPath 'run-b210.bat'
+
+    $wsh = New-Object -ComObject WScript.Shell
+    # Remove any stale shortcut here that points at this install's launcher
+    # (e.g. an older map144-b210.lnk), so we end up with one canonical entry.
+    Get-ChildItem -LiteralPath $programs -Filter '*.lnk' -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.FullName -ne $lnkPath) {
+            try { if ($wsh.CreateShortcut($_.FullName).TargetPath -eq $target) { Remove-Item -LiteralPath $_.FullName -Force } } catch { }
+        }
+    }
+    $sc = $wsh.CreateShortcut($lnkPath)
+    $sc.TargetPath       = $target
+    $sc.WorkingDirectory = $InstallPath
+    $sc.Description       = 'Launch MAP144 (USRP B210)'
+    $sc.WindowStyle      = 1
+    $ico = Join-Path $InstallPath 'map144_app\data\map144.ico'
+    if (Test-Path -LiteralPath $ico) { $sc.IconLocation = $ico }
+    $sc.Save()
+    Write-Ok "Created '$lnkPath' (type 'map144' in Start search to launch)"
+} catch {
+    Write-Warn2 "Could not create Start Menu shortcut: $($_.Exception.Message)"
+}
+
 # -- 11. Done -----------------------------------------------------------------
 Write-Host ""
 Write-Host "===============================================================" -ForegroundColor Green
@@ -228,7 +258,8 @@ Write-Host "  READY" -ForegroundColor Green
 Write-Host "===============================================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "Launch MAP144 with the B210:" -ForegroundColor Cyan
-Write-Host "  $InstallPath\run-b210.bat" -ForegroundColor White
+Write-Host "  - Type 'map144' in the Windows search bar, or" -ForegroundColor White
+Write-Host "  - Run $InstallPath\run-b210.bat" -ForegroundColor White
 Write-Host ""
 Write-Host "Install log:  $Script:LogFile"
 Write-Host ""
