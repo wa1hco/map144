@@ -15,10 +15,12 @@ REM --- Pick a Python env ------------------------------------------------------
 set "ENV_PY="
 if exist "%~dp0env\python.exe" (
     set "ENV_PY=%~dp0env\python.exe"
+    set "ENV_DIR=%~dp0env"
     goto :env_found
 )
 if exist "%USERPROFILE%\miniconda3\envs\map144\python.exe" (
     set "ENV_PY=%USERPROFILE%\miniconda3\envs\map144\python.exe"
+    set "ENV_DIR=%USERPROFILE%\miniconda3\envs\map144"
     goto :env_found
 )
 echo ERROR: no B210-capable Python env found. 1>&2
@@ -29,6 +31,13 @@ echo   Install via tools\install-b210.ps1 or follow docs\ALPHA_NOTES.md. 1>&2
 exit /b 1
 
 :env_found
+
+REM --- Put the env's DLL dirs on PATH (what 'conda activate' does) --------------
+REM Running python.exe directly does NOT add these, so MKL/OpenBLAS and other
+REM delay-loaded native DLLs in Library\bin are not found -> numpy/scipy LAPACK
+REM (e.g. the audio-BPF filtfilt) crashes the process with 0xC06D007F
+REM (ERROR_MOD_NOT_FOUND).  Prepend the same dirs conda activation would.
+set "PATH=%ENV_DIR%;%ENV_DIR%\Library\mingw-w64\bin;%ENV_DIR%\Library\usr\bin;%ENV_DIR%\Library\bin;%ENV_DIR%\Scripts;%ENV_DIR%\bin;%PATH%"
 
 REM --- Locate Ettus UHD images dir --------------------------------------------
 set "UHD_IMAGES_DIR="
