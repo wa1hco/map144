@@ -62,41 +62,87 @@ MAP144 supports several SDRs.  The pip dependencies in `requirements.txt` cover 
 - **USRP B210** — needs the UHD library and Python bindings.
     - *Linux:* `sudo apt install python3-uhd uhd-host && sudo uhd_images_downloader`
     - *macOS:* `brew install uhd && uhd_images_downloader`
-    - *Windows:* the UHD Python bindings are **not** pip-installable on Windows.  Full setup (verified end-to-end 2026-06-02 on Win11 with a B210 attached):
+    - *Windows:* **use the B210 install kit** — see "USRP B210 install kit (Windows)" below.  Manual recipe lives at the end of this file as a fallback.
 
-      **One-time install:**
+      For Flex-only runs the pip `.venv` + `run.bat` path is fine — the B210 kit is only needed when you want to use the B210.
 
-      1. **Install the Ettus UHD Windows binary** — provides the WinUSB driver Windows needs to see the B210, plus the FX3/FPGA firmware images (~100 MB).  Grab `uhd_4.10.0.0-release_Win64_VS2022.exe` from <https://files.ettus.com/binaries/uhd/latest_release/Windows11/VS2022/> (VS2022 is the safest pick — its C++ runtime ships with Windows 11; VS2026 may need a newer VC++ redist).  Default install location is `C:\Program Files\UHD\`.
+## USRP B210 install kit (Windows)
 
-      2. **Plug in the B210** (USB 3.0 port).  In Device Manager, look under "USRPs" (or "Universal Serial Bus devices") for an "Ettus" entry with no yellow ⚠.  Verify with `& "C:\Program Files\UHD\bin\uhd_find_devices.exe"` — should print a B210 entry.
+The kit is a single directory containing everything needed to install B210 support on a clean Windows 11 PC, with no internet access required at install time.  Use this in the field (mountaintop contests, etc.); use the manual recipe at the end of this file only if the kit isn't an option.
 
-      3. **Install Miniconda** from <https://docs.conda.io/projects/miniconda/>.  During install: "Install for Just Me", do not add to PATH, do not register as system Python.  Use "Anaconda Prompt (Miniconda3)" from the Start menu for the next steps.
+### What the kit contains
 
-      4. **Create the conda env and install UHD + map144 deps** (in Anaconda Prompt):
-         ```
-         conda create -n map144 python=3.11 -y
-         conda activate map144
-         conda install -c conda-forge uhd -y
-         cd C:\Users\<you>\Documents\map144
-         pip install -r requirements.txt
-         ```
-         (Pin numpy is `<2` for UHD compatibility; pip/conda respect that.)
+- Ettus UHD Windows installer (~233 MB) — WinUSB driver + FX3/FPGA firmware
+- `map144-env.zip` (~500 MB) — portable Python env with `uhd` + map144 deps pre-installed
+- `map144-src.zip` — MAP144 source at the build's git SHA
+- `install-b210.bat` — double-click installer
 
-      5. **Smoke test** the Python bindings:
-         ```
-         python -c "import uhd; print(uhd.__version__)"
-         ```
-         Should print `4.10.0.0-release` (matching the Ettus install).
+Total kit size: ~1.5 GB.  Fits on any USB stick.
 
-      **Launching map144 with the B210:** double-click `run-b210.bat`, or from the Anaconda Prompt:
-      ```
-      set UHD_IMAGES_DIR=C:\Program Files\UHD\share\uhd\images
-      conda activate map144
-      python map144.py
-      ```
-      The `UHD_IMAGES_DIR` step is required because conda's UHD looks in its own env directory for the FX3 firmware, but the images live in the Ettus install directory.  `run-b210.bat` sets this automatically.
+### Building the kit (home machine, one-time)
 
-      **For Flex-only runs**, the pip `.venv` + `run.bat` path still works — the conda env is only needed when you want the B210.
+On a home machine with Miniconda + git installed, from the map144 repo root:
+
+```powershell
+.\tools\build-b210-kit.ps1
+```
+
+Output: `dist\map144-b210-kit-<gitSha>\` — copy this whole directory to a USB stick (or zip + upload as a GitHub release).
+
+The build script downloads the Ettus installer (caches it in `tools\cache\`), creates a fresh conda env, packs it with `conda-pack`, snapshots the repo via `git archive`, and assembles the kit.  Takes ~15 minutes the first time, faster on re-runs.
+
+### Installing on the contest PC
+
+Prerequisites on the target PC: Windows 11 (or Win10 build 17763+), 3 GB free on `C:`, administrator access, WSJT-X installed separately for the `jt9` decoder.
+
+1. Plug the B210 into a **USB 3.0** port (blue port) on the target PC.
+2. Copy the kit directory to the PC (or leave it on the USB stick).
+3. Double-click `install-b210.bat`.
+4. Approve the UAC prompt.
+5. Wait ~5 minutes.  The last line will read either `READY` or `FAILED: <reason>`.
+6. Launch with `C:\map144\run-b210.bat`.
+
+The installer is idempotent — re-running the same kit version is a no-op; re-running a different kit version prompts to overwrite.  Install log is at `C:\map144\install.log` for diagnosing failures after the fact.
+
+### What the installer does
+
+1. Self-elevates to admin (UAC).
+2. Pre-flight: Windows version, disk space, not under OneDrive.
+3. Silently installs Ettus UHD (skipped if already present).
+4. Extracts the portable Python env to `C:\map144\env\`.
+5. Runs `conda-unpack.exe` to rewrite the env's internal paths (this is the slow step).
+6. Extracts the map144 source to `C:\map144\`.
+7. Smoke tests: `uhd_find_devices` sees the B210; the env's `python.exe` can `import uhd`.
+
+### Manual B210 setup (fallback when the kit isn't an option)
+
+If you can't use the kit (no home machine to build it on, conda-pack not working on a particular Windows version, etc.), here's the by-hand recipe.  Verified end-to-end on Win11 with a B210 attached on 2026-06-02.
+
+1. **Install the Ettus UHD Windows binary** — provides the WinUSB driver and bundled firmware images.  Grab `uhd_4.10.0.0-release_Win64_VS2022.exe` from <https://files.ettus.com/binaries/uhd/latest_release/Windows11/VS2022/>.  Default install location: `C:\Program Files\UHD\`.
+
+2. **Plug in the B210** (USB 3.0 port).  In Device Manager, look under "USRPs" for an "Ettus" entry with no yellow ⚠.  Verify with `& "C:\Program Files\UHD\bin\uhd_find_devices.exe"`.
+
+3. **Install Miniconda** from <https://docs.conda.io/projects/miniconda/>.  During install: "Install for Just Me", do not add to PATH, do not register as system Python.
+
+4. **Create the conda env and install UHD + map144 deps** (in Anaconda Prompt):
+   ```
+   conda create -n map144 python=3.11 -y
+   conda activate map144
+   conda install -c conda-forge uhd -y
+   cd C:\Users\<you>\Documents\map144
+   pip install -r requirements.txt
+   ```
+
+5. **Smoke test** the Python bindings:
+   ```
+   python -c "import uhd; print(uhd.__version__)"
+   ```
+   Should print `4.10.0.0-release`.
+
+6. **Launch with the conda env** (`run-b210.bat` auto-detects it):
+   ```
+   run-b210.bat
+   ```
 
 ## Install
 

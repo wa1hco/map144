@@ -38,6 +38,7 @@ MANIFEST
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+tools/cache/
 
 # OS/editor artifacts
 .DS_Store
