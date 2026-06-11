@@ -117,3 +117,12 @@ scratch/
 
 # Band Map basemap data (drop GridTracker shapes.json here; not redistributed)
 map144_app/data/
+
+# Runtime-generated launch/decode logs (canonical corpora live elsewhere)
+launches.jsonl
+decoded.jsonl
+tools/decoded.txt
+
+# Local Claude settings backups
+.claude/*.bak*
+
