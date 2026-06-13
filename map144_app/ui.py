@@ -137,6 +137,7 @@ def setup_ui(self):
         setup_airspy_window, setup_rtlsdr_window, setup_sdrangel_window,
     )
     from .reporting_window import setup_reporting_window
+    from .map65_window import setup_map65_window
     from .screenshot_window import setup_screenshot_window
     from .band_map_window import setup_band_map_window
 
@@ -215,6 +216,7 @@ def setup_ui(self):
     cand_map_action    = QtWidgets.QAction("Sync Candidate Map",   self)
     iq_nb_action       = QtWidgets.QAction("Noise Blanker",  self)
     reporting_action   = QtWidgets.QAction("Reporting",            self)
+    map65_action       = QtWidgets.QAction("MAP65 Export",         self)
     band_map_action    = QtWidgets.QAction("Band Map",            self)
     flex_action        = QtWidgets.QAction("Flex Radio",           self)
     usrp_action        = QtWidgets.QAction("USRP B210",            self)
@@ -223,7 +225,7 @@ def setup_ui(self):
     sdrangel_action    = QtWidgets.QAction("SDRangel",             self)
     # Toggle-style View entries — checked state mirrors window visibility.
     for act in (fg_action, det_action, sync_det_action, cand_map_action, iq_nb_action,
-                reporting_action, band_map_action,
+                reporting_action, map65_action, band_map_action,
                 flex_action, usrp_action, airspy_action, rtlsdr_action, sdrangel_action):
         act.setCheckable(True)
         act.setChecked(True)
@@ -678,6 +680,7 @@ def setup_ui(self):
     # ── Panel windows: source-specific ───────────────────────────────────────
     setup_iq_nb_window(self,      iq_nb_action)
     setup_reporting_window(self,  reporting_action)
+    setup_map65_window(self,      map65_action)
     setup_band_map_window(self,   band_map_action)
     setup_flex_window(self,       flex_action)
     setup_usrp_window(self,       usrp_action)
@@ -704,6 +707,9 @@ def setup_ui(self):
     )
     reporting_action.triggered.connect(
         lambda checked: self._reporting_win.show() if checked else self._reporting_win.hide()
+    )
+    map65_action.triggered.connect(
+        lambda checked: self._map65_win.show() if checked else self._map65_win.hide()
     )
     band_map_action.triggered.connect(
         lambda checked: self._band_map_win.show() if checked else self._band_map_win.hide()
@@ -739,6 +745,7 @@ def setup_ui(self):
         (self._sync_detect_win,'sync_detect_geometry',QtCore.QRect(480, 1075,850, 350)),
         (self._iq_nb_win,      'iq_nb_geometry',      QtCore.QRect(50,  870, 380, 420)),
         (self._reporting_win,  'reporting_geometry',  QtCore.QRect(820, 870, 380, 500)),
+        (self._map65_win,      'map65_geometry',      QtCore.QRect(820, 470, 380, 380)),
         (self._band_map_win,   'band_map_geometry',   QtCore.QRect(820, 100, 780, 560)),
         (self._flex_win,       'flex_geometry',       QtCore.QRect(450, 870, 360, 500)),
         (self._usrp_win,       'usrp_geometry',       QtCore.QRect(450, 870, 360, 440)),
@@ -763,6 +770,7 @@ def setup_ui(self):
     cand_map_visible = _SETTINGS.value('cand_map_visible',    True, type=bool)
     iq_nb_visible      = _SETTINGS.value('iq_nb_visible',       True,  type=bool)
     reporting_visible  = _SETTINGS.value('reporting_visible',    True,  type=bool)
+    map65_visible      = _SETTINGS.value('map65_visible',        False, type=bool)
     band_map_visible   = _SETTINGS.value('band_map_visible',     False, type=bool)
     fg_action.setChecked(fg_visible)
     det_action.setChecked(det_visible)
@@ -770,6 +778,7 @@ def setup_ui(self):
     cand_map_action.setChecked(cand_map_visible)
     iq_nb_action.setChecked(iq_nb_visible)
     reporting_action.setChecked(reporting_visible)
+    map65_action.setChecked(map65_visible)
     band_map_action.setChecked(band_map_visible)
     if fg_visible:         self._fast_graph_win.show()
     if det_visible:        self._detect_win.show()
@@ -777,6 +786,8 @@ def setup_ui(self):
     if cand_map_visible:   self._cand_map_win.show()
     if iq_nb_visible:      self._iq_nb_win.show()
     if reporting_visible:  self._reporting_win.show()
+    if map65_visible:      self._map65_win.show()
+    else:                  self._map65_win.hide()
     if band_map_visible:   self._band_map_win.show()
     else:                  self._band_map_win.hide()
 

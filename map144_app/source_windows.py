@@ -1549,6 +1549,8 @@ def update_source_windows(self):
     # Reporting (always — stats update even when window hidden)
     from .reporting_window import update_reporting_window
     update_reporting_window(self)
+    from .map65_window import update_map65_window
+    update_map65_window(self)
 
     # Radio windows — only update if visible
     if getattr(self, '_flex_win',   None) is not None and self._flex_win.isVisible():

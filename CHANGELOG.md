@@ -6,6 +6,55 @@ All notable changes to MAP144 are recorded here.  Format roughly follows
 Versions are bumped at noticeable-to-tester intervals, not per commit.
 Each released version has a matching git tag (e.g. ``v0.1.1-alpha``).
 
+## Unreleased — 2026-06-13
+
+### Added
+
+- **MAP65 I/Q export (View → "MAP65 Export").**  Tees a 96 kHz Linrad **timf2**
+  I/Q stream off the USRP B210 to MAP65 over UDP (default `:50002`), so one
+  radio feeds MAP65 (EME) while MSK144 detection keeps running unchanged.
+
+  - **Frequency plan.**  The B210 hardware LO (and its DC artifact) is parked at
+    `pan_center` via a new `USRPSource(pan_center_mhz=…)`; the MSK144 path's NCO
+    then brings its centre to baseband, so the DC artifact is pushed out of both
+    sub-bands.  The export taps the *raw* 192 kHz dual-pol IQ inside
+    `_recv_loop` (the only place the full band exists) and does its own
+    NCO + ÷2 decimate (192→96 kHz, exact — no rational resampling).  Recommended
+    setup: single-pol RF0, B210 DC = MAP65 centre = 144.100 MHz, so MAP65's
+    centre DC-blank coincides with the (off-band) artifact and the 144.110–
+    144.140 EME activity is clear.
+
+  - **Wire format (Linrad timf2).**  24-byte little-endian header
+    (`passband_center`, `time`, `userx_freq`, `ptr`, `block_no`, `userx_no`,
+    `passband_direction`) + interleaved int16 samples.  Two hard-won
+    requirements: payload **must** be exactly `NET_MULTICAST_PAYLOAD` = 1392
+    bytes/packet (else MAP65 mis-aligns its ring buffer → dense spurious lines),
+    and `userx_no` = **+channel-count** (sign = int16/float, magnitude = channels;
+    `0` → MAP65 shows no signal).  Single-pol = +1, dual H+V = +2.
+
+  - **Safety/UX.**  Output is clamped to ±32766 — saturated full-scale int16
+    (±32767) crashes MAP65's `INTEGER*2` `*_sync.f90` ("32767 out of range").
+    Window settings (enable / IP / port / MAP65 centre / B210 DC centre / int16
+    level) and geometry persist across restart; **Enter** applies in any field;
+    export **auto-restores** on restart (re-attaches to the B210 at source
+    creation).  QSettings keys: `map65_*`.
+
+  - New modules `map144_app/map65_export.py`, `map144_app/map65_window.py`;
+    tests in `tests/test_map65_export.py` (13 tests: timf2 header, ÷2 decimator
+    + alias rejection, int16 clamp, NCO tone placement, single/dual interleave,
+    fixed-payload guard).
+
+- **Diagnostic tools.**  `tools/wsjtx_inject.py` (send a synthetic WSJT-X UDP
+  decode to test the GridTracker→N1MM chain without a meteor ping) and
+  `tools/udp_listen.ps1` (UDP arrival probe for the MAP65 export).
+
+### Changed
+
+- `USRPSource` gains `pan_center_mhz` (decouples the hardware LO / DC position
+  from the MSK144 processing centre) and an optional `map65_exporter` tap; the
+  NCO table build is refactored into `_build_nco_table()` so `retune()` keeps
+  the LO fixed on `pan_center` in pan mode.
+
 ## v0.1.3-alpha — 2026-05-19
 
 ### Fixed

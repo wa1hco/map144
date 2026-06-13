@@ -238,7 +238,8 @@ class USRPSource:
                  antenna: str = "RX2",
                  lo_offset_hz: float = 40_000.0,
                  device_args: str = "",
-                 dual_channel: bool = False):
+                 dual_channel: bool = False,
+                 pan_center_mhz: float = None):
         if not _UHD_AVAILABLE:
             if sys.platform == 'win32':
                 hint = (
@@ -281,6 +282,14 @@ class USRPSource:
         self.lo_offset_hz           = lo_offset_hz
         self.device_args            = device_args
         self.dual_channel           = dual_channel   # True → enable RX channel 1 (RX2 port)
+        # pan_center_mhz: when set, the hardware LO (and thus the DC artifact) is
+        # placed here instead of at (center − lo_offset).  The NCO then brings
+        # center_freq_mhz to baseband for the MSK144 path, and the raw 192 kHz IQ
+        # (DC = pan_center) is what the MAP65 exporter taps.  None → legacy.
+        self.pan_center_mhz         = pan_center_mhz
+        # Optional Map65Exporter; when set & enabled, _recv_loop tees raw dual-pol
+        # IQ to it before the MSK144 NCO/decimate (only place 192 kHz exists).
+        self.map65_exporter         = None
         self.sample_queue           = queue.Queue(maxsize=4000)
         self.center_freq_mhz_actual = center_freq_mhz
 
@@ -346,6 +355,12 @@ class USRPSource:
         except OSError:
             pass
         self.startup_phase = 'configuring'   # make() done; now rate/tune/stream setup
+
+        # When panning is requested, derive lo_offset so the hardware LO lands on
+        # pan_center (DC artifact there).  Everything below (LO tune via
+        # center − lo_offset, NCO table) then falls out correctly.
+        if self.pan_center_mhz is not None:
+            self.lo_offset_hz = (self.center_freq_mhz - self.pan_center_mhz) * 1e6
 
         channels = [0, 1] if self.dual_channel else [0]
 
@@ -417,15 +432,7 @@ class USRPSource:
         self._nco_phase  = 0.0
         self._nco_phase1 = 0.0
         # Precompute NCO rotation table for one full recv buffer.
-        if self.lo_offset_hz != 0.0:
-            _nco_step = -2.0 * np.pi * self.lo_offset_hz / _HW_RATE
-            self._nco_table = np.exp(
-                1j * np.arange(_RECV_SIZE, dtype=np.float64) * _nco_step
-            ).astype(np.complex64)
-            self._nco_step = _nco_step
-        else:
-            self._nco_table = None
-            self._nco_step = 0.0
+        self._build_nco_table()
         # Stream command issued; the device may take a while to actually deliver
         # IQ over a marginal USB link.  'waiting_iq' until the first samples land.
         self.startup_phase = 'waiting_iq'
@@ -462,16 +469,40 @@ class USRPSource:
             self._thread = None
         self._usrp = None
 
+    def _build_nco_table(self):
+        """(Re)build the NCO rotation table + step from the current lo_offset.
+
+        Shifts a signal at +lo_offset_hz down to DC (negative step).  Called at
+        start() and on retune() when pan_center mode changes the NCO offset.
+        """
+        if self.lo_offset_hz != 0.0:
+            self._nco_step  = -2.0 * np.pi * self.lo_offset_hz / _HW_RATE
+            self._nco_table = np.exp(
+                1j * np.arange(_RECV_SIZE, dtype=np.float64) * self._nco_step
+            ).astype(np.complex64)
+        else:
+            self._nco_table = None
+            self._nco_step  = 0.0
+
     def retune(self, center_freq_mhz: float):
         """Retune to a new center frequency while streaming.
 
         Updates both channels when dual_channel is active.  Resets the NCO
         phase accumulators so the downconversion stays coherent after the LO
         settles.  Safe to call from the Qt main thread while the recv loop runs.
+
+        In pan_center mode the hardware LO stays fixed at pan_center (so the
+        MAP65 tap's band does not move); retuning instead adjusts the NCO offset
+        (= center − pan_center) and rebuilds the NCO table.
         """
         self.center_freq_mhz = center_freq_mhz
         if self._usrp is None:
             return
+        if self.pan_center_mhz is not None:
+            # Keep LO on pan_center; the center−lo_offset tune below then equals
+            # pan_center, and the NCO offset moves to track the new center.
+            self.lo_offset_hz = (center_freq_mhz - self.pan_center_mhz) * 1e6
+            self._build_nco_table()
         channels = [0, 1] if self.dual_channel else [0]
         tune_result = None
         for ch in channels:
@@ -625,6 +656,15 @@ class USRPSource:
             self.recv_count += 1
             ts_int  = metadata.time_spec.get_full_secs()
             ts_frac = int(metadata.time_spec.get_frac_secs() * 1e12)
+
+            # ── MAP65 export tap ──────────────────────────────────────────────
+            # Tee the RAW dual-pol 192 kHz IQ (DC = pan_center) to MAP65 before
+            # the MSK144 NCO/decimate — this is the only point the full 192 kHz
+            # exists.  process() copies internally and never raises into the loop.
+            exp = self.map65_exporter
+            if exp is not None and exp.enabled and self.dual_channel:
+                exp.process(recv_bufs[0, :n], recv_bufs[1, :n],
+                            ts_int + ts_frac * 1e-12)
 
             if self.dual_channel:
                 # Apply NCO and decimate each channel independently.

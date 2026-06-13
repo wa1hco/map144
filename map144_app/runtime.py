@@ -533,6 +533,18 @@ def _connect_usrp_client(self):
         )
         self.usrp_client._gain_ch1    = _gain1
         self.usrp_client._antenna_ch1 = _ant1
+        # Auto-restore MAP65 export: re-apply the persisted settings (enable / IP /
+        # port / centres / level) and attach the exporter to the freshly-created
+        # source.  The export window's own startup Apply runs before this source
+        # exists, so without this the exporter would never attach on restart.
+        # No-op if the export window isn't built yet (its deferred Apply attaches
+        # then); idempotent if both run.
+        if getattr(self, 'map65_exporter', None) is not None:
+            try:
+                from .map65_window import _on_map65_apply
+                _on_map65_apply(self)
+            except Exception as exc:
+                logger.warning("[map65] auto-restore failed: %s", exc)
         logger.debug("[usrp] USRPSource created")
         _fg_resize_for_plot_count(self)
     except Exception as exc:
@@ -1631,6 +1643,7 @@ def closeEvent(self, event):
         (getattr(self, '_cand_map_win',   None), 'cand_map_geometry',   'cand_map_visible'),
         (getattr(self, '_iq_nb_win',      None), 'iq_nb_geometry',      'iq_nb_visible'),
         (getattr(self, '_reporting_win',  None), 'reporting_geometry',  'reporting_visible'),
+        (getattr(self, '_map65_win',      None), 'map65_geometry',      'map65_visible'),
         (getattr(self, '_band_map_win',   None), 'band_map_geometry',   'band_map_visible'),
         (getattr(self, '_flex_win',       None), 'flex_geometry',       None),
         (getattr(self, '_usrp_win',       None), 'usrp_geometry',       None),
