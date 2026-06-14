@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -51,7 +52,12 @@ NR0V_THRESHOLD_DEFAULT  = 30.0      # trip when mag > threshold × running avg
 
 # ── Shared-library loader ─────────────────────────────────────────────────────
 
-_LIB_PATH = Path(__file__).resolve().parent.parent / "vendor" / "wdsp" / "libnob.so"
+# Native WDSP NOB library.  Platform-specific name so a Windows (.dll) or
+# macOS (.dylib) build is found if present; Linux uses .so.  This backend is
+# only built for Linux today — on other platforms the loader fails cleanly and
+# `make()`/`is_available()` fall the selection back to the Linrad blanker.
+_LIB_NAME = {"win32": "libnob.dll", "darwin": "libnob.dylib"}.get(sys.platform, "libnob.so")
+_LIB_PATH = Path(__file__).resolve().parent.parent / "vendor" / "wdsp" / _LIB_NAME
 _lib: Optional[ctypes.CDLL] = None
 
 
@@ -61,8 +67,9 @@ def _load_library() -> ctypes.CDLL:
         return _lib
     if not _LIB_PATH.exists():
         raise RuntimeError(
-            f"libnob.so not found at {_LIB_PATH}. "
-            f"Build it with: make -C {_LIB_PATH.parent}"
+            f"{_LIB_NAME} not found at {_LIB_PATH}. "
+            f"Build it from the C sources in {_LIB_PATH.parent} "
+            f"(Linux/macOS: `make -C {_LIB_PATH.parent}`)."
         )
     lib = ctypes.CDLL(str(_LIB_PATH))
 
@@ -187,6 +194,19 @@ class NR0VWidebandBlanker(Blanker):
     """
 
     name = "NR0V-Wideband"
+
+    @classmethod
+    def is_available(cls) -> bool:
+        """True only if the WDSP NOB shared library can be loaded.
+
+        Lets ``make()`` fall back to Linrad on platforms without the native
+        lib (e.g. Windows) instead of crashing the radio loop at first chunk.
+        """
+        try:
+            _load_library()
+            return True
+        except Exception:
+            return False
 
     def __init__(self):
         self._rate: Optional[float] = None

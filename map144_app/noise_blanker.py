@@ -41,12 +41,15 @@ only — display and reset paths do not move.
 """
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 from scipy.ndimage import convolve1d as _nd_convolve1d
+
+logger = logging.getLogger(__name__)
 
 
 # ── Constants (mirrored from processing.py) ──────────────────────────────────
@@ -112,6 +115,12 @@ class Blanker(ABC):
     def reset(self, engine) -> None:
         """Clear backend state.  Default is a no-op; subclasses override."""
         return
+
+    @classmethod
+    def is_available(cls) -> bool:
+        """Whether this backend can run here.  Default True; backends that
+        depend on a native library override this to probe for it."""
+        return True
 
 
 # ── Bypass ───────────────────────────────────────────────────────────────────
@@ -386,6 +395,16 @@ def available() -> list[str]:
 
 
 def make(name: str) -> Blanker:
-    """Instantiate a blanker by name.  Unknown names fall back to Linrad."""
+    """Instantiate a blanker by name.  Unknown names fall back to Linrad.
+
+    If the requested backend's native dependency is missing on this platform
+    (e.g. the NR0V WDSP library isn't built for Windows), fall back to Linrad
+    with a warning instead of crashing the radio loop on the first chunk.
+    """
     cls = _REGISTRY.get(name, LinradBlanker)
+    if not cls.is_available():
+        logger.warning(
+            "[nb] noise-blanker backend %r is unavailable on this platform "
+            "(native library missing) — falling back to 'Linrad'.", name)
+        return LinradBlanker()
     return cls()

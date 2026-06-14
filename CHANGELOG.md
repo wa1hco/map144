@@ -6,7 +6,7 @@ All notable changes to MAP144 are recorded here.  Format roughly follows
 Versions are bumped at noticeable-to-tester intervals, not per commit.
 Each released version has a matching git tag (e.g. ``v0.1.1-alpha``).
 
-## Unreleased — 2026-06-13
+## Unreleased — 2026-06-14
 
 ### Added
 
@@ -54,6 +54,18 @@ Each released version has a matching git tag (e.g. ``v0.1.1-alpha``).
   from the MSK144 processing centre) and an optional `map65_exporter` tap; the
   NCO table build is refactored into `_build_nco_table()` so `retune()` keeps
   the LO fixed on `pan_center` in pan mode.
+
+### Fixed
+
+- **Selecting the "NR0V-Wideband" noise blanker crashed the radio loop on
+  platforms without the WDSP `libnob` native library (e.g. Windows).**  The
+  backend loaded `libnob.so` lazily on the first IQ chunk and raised, taking
+  down the source thread (and the choice persisted in `nb_backend`, so it
+  re-crashed every restart).  `noise_blanker.make()` now checks
+  `Blanker.is_available()` and falls back to Linrad with a warning instead of
+  crashing; the loader path is platform-aware (`libnob.dll` / `.dylib` / `.so`)
+  so a native build is used where present.  Regression test in
+  `tests/test_nb_fallback.py`.
 
 ## v0.1.3-alpha — 2026-05-19
 
