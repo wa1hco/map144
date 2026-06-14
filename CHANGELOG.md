@@ -65,7 +65,10 @@ Each released version has a matching git tag (e.g. ``v0.1.1-alpha``).
   `Blanker.is_available()` and falls back to Linrad with a warning instead of
   crashing; the loader path is platform-aware (`libnob.dll` / `.dylib` / `.so`)
   so a native build is used where present.  Regression test in
-  `tests/test_nb_fallback.py`.
+  `tests/test_nb_fallback.py`.  `vendor/wdsp` now cross-builds: `comm.h` has a
+  `_WIN32` branch using native Win32 APIs (`nob.c` is upstream Windows code),
+  and the Makefile/README cover building `libnob.dll` (MinGW or MSVC) so the
+  NR0V backend can be enabled on Windows.
 
 ## v0.1.3-alpha — 2026-05-19
 
