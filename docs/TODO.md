@@ -122,16 +122,29 @@ ML / clustering / classifier items added as #29–#39).
        commit `294169f`; 6 new tests in
        [tests/test_engine_block_shadow.py](../tests/test_engine_block_shadow.py).
        **Live bake-in pending** before option 2 lands.
-    2. ⬜ **Replace detect+decode only** — when flag on, BYPASS the
-       legacy detect/decode portion of `process_iq_data` (channelizer
-       + hop loop + extract_and_decode dispatch).  Block path becomes
-       primary; updates the same `_jt9_markers` / `decode_panel` /
-       `_decode_queue` the GUI reads via a small adapter.  Legacy noise
-       blanker + spectrogram still run inline.  Lands AFTER bake-in.
-    3. ⬜ **Full replacement** — move noise blanker into a
-       `NoiseBlankerBlock` and the spectrogram into its own block;
-       replace `process_iq_data` wholesale.  Cleanest architecturally;
-       lands as part of Phase 5 cleanup (#13–#16).
+    2. ✅ **Replace detect+decode only** — LANDED (`28b6ed0`). With the flag
+       on, the legacy hop loop computes the GUI sq/sync displays but SKIPS
+       detect+decode ([processing.py:1600-1610](../map144_app/processing.py#L1600-L1610));
+       the Block runtime's DetectorBlock + DecoderBlock own those, and
+       `_EngineBridgeSink` ([engine.py:86](../map144_app/engine.py#L86)) forwards
+       block decodes into `engine._decode_queue` in the legacy shape so the GUI /
+       reporter are unchanged. e2e gate: `tests/test_engine_block_primary.py`.
+       **Still default-off + live-bake-in pending** before flipping the default
+       (operator-gated; needs an A/B block-vs-legacy decode-count run). Legacy
+       noise blanker + spectrogram still run inline under the flag.
+    3. 🔄 **Full replacement** — move noise blanker + spectrogram into blocks,
+       then replace `process_iq_data` wholesale (Phase 5 cleanup #13–#16).
+       - ✅ **`NoiseBlankerBlock`** (2026-06-25) — wraps the `noise_blanker`
+         backends (Linrad/Bypass/NR0V) as a Block; mono v1; passes a minimal
+         `_BlankerState` holder instead of the Engine (narrower interface), seeded
+         identically to the Engine's `_nb_*` init so it's bit-equivalent at
+         cut-over; `blanked_fraction` in output metadata for the #41c gate. Not
+         wired into a graph. 6 tests in `tests/test_noise_blanker_block.py`.
+       - ⬜ **SpectrogramBlock** — the block `DisplayBlock` already owns the IQ
+         waterfall (#10b), so this is mostly consolidating the legacy inline
+         spectrogram, not net-new DSP. Check overlap with DisplayBlock first.
+       - ⬜ Delete `process_iq_data` wholesale — **only after bake-in + default-on**
+         (don't delete the still-default path).
 
 ## 🔄 Stream-oriented refactor — de-monolith `process_iq_data` (active, 2026-05-31)
 
