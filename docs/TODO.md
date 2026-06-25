@@ -138,8 +138,16 @@ ML / clustering / classifier items added as #29–#39).
          backends (Linrad/Bypass/NR0V) as a Block; mono v1; passes a minimal
          `_BlankerState` holder instead of the Engine (narrower interface), seeded
          identically to the Engine's `_nb_*` init so it's bit-equivalent at
-         cut-over; `blanked_fraction` in output metadata for the #41c gate. Not
-         wired into a graph. 6 tests in `tests/test_noise_blanker_block.py`.
+         cut-over; `blanked_fraction` in output metadata for the #41c gate. 6
+         tests in `tests/test_noise_blanker_block.py`.
+       - ✅ **Wired ACTIVE into the block-primary graph** (2026-06-25,
+         `_ensure_block_runtime`): `iq_in → NoiseBlankerBlock → iq_tee →
+         {chan→det→dec, dec}`, blanker_name mirroring the engine's selected
+         backend. **Fixed a parity gap:** `_block_pump_iq` feeds RAW IQ, and the
+         block graph had no blanker, so block-primary was detecting/decoding on
+         un-blanked IQ (sensitivity / false-trigger regression vs legacy in
+         impulsive noise). Now cleaned IQ drives both detection and the decode
+         ring, matching legacy. `test_engine_block_primary` still decodes through.
        - ⬜ **SpectrogramBlock** — the block `DisplayBlock` already owns the IQ
          waterfall (#10b), so this is mostly consolidating the legacy inline
          spectrogram, not net-new DSP. Check overlap with DisplayBlock first.

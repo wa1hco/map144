@@ -647,10 +647,12 @@ class Engine:
             DecoderBlock, DecoderBlockConfig,
             DetectorBlock, DetectorBlockConfig,
             JsonlSink, JsonlSinkConfig,
+            NoiseBlankerBlock, NoiseBlankerBlockConfig,
             Runtime, Stream,
             TeeBlock, TeeBlockConfig,
             make_event_stream, make_sample_stream,
         )
+        from .noise_blanker import NB_FACTOR
 
         # Output paths after Option 2 cut-over:
         #   - WAVs / decodes.jsonl / launches.jsonl → production location
@@ -673,9 +675,28 @@ class Engine:
         rt = Runtime()
 
         # No Source block — IQ is pushed externally via _block_pump_iq.
-        # We wire ``iq_in`` into a Tee whose two output ports feed
-        # Channelizer (for detection) and DecoderBlock (for the IQ ring
-        # window read on each detection event).
+        # First stage is the noise blanker (matching the legacy path, which
+        # blanks BEFORE the IQ ring + channelizer): raw IQ in → cleaned IQ out.
+        # Without this the block path would detect/decode on un-blanked IQ — a
+        # sensitivity / false-trigger regression vs legacy in impulsive noise.
+        # blanker_name mirrors the engine's currently-selected backend so the
+        # block path uses the same blanker the operator chose (incl. the
+        # QSettings-restored GUI default — see headless_vs_gui_blanker_divergence).
+        nb = rt.add(
+            NoiseBlankerBlock("nb"),
+            NoiseBlankerBlockConfig(
+                input_port_name="iq_in",
+                output_port_name="iq",
+                blanker_name=self.blanker.name,
+                sample_rate_hz=self.sample_rate,
+                nb_factor=float(getattr(self, 'nb_factor', NB_FACTOR)),
+                get_timeout_s=0.05,
+            ),
+        )
+
+        # The Tee fans the CLEANED IQ to the Channelizer (for detection) and
+        # the DecoderBlock (for the IQ-ring window read on each detection
+        # event) — both downstream of the blanker, as in legacy.
         iq_tee = rt.add(
             TeeBlock("iq_tee"),
             TeeBlockConfig(
@@ -760,10 +781,15 @@ class Engine:
             n_samples_per_record=4096,
             on_full=Stream.POLICY_DROP_OLDEST,
         )
-        # Manual port assignment (no upstream block produced this).
-        iq_tee.inputs["iq_in"] = iq_in
+        # Manual port assignment (no upstream block produced this): the raw IQ
+        # feed enters the noise blanker, whose cleaned output drives the Tee.
+        nb.inputs["iq_in"] = iq_in
 
         # Wire the rest with the standard connect API.
+        rt.connect(nb, "iq", iq_tee, "iq_in",
+                   queue_depth_seconds=2.0,
+                   sample_rate_hz=self.sample_rate,
+                   n_samples_per_record=4096)
         rt.connect(iq_tee, "to_chan", chan, "iq",
                    queue_depth_seconds=2.0,
                    sample_rate_hz=self.sample_rate,
