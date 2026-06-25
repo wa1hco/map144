@@ -91,6 +91,31 @@ class TestTimeBaseWiring(unittest.TestCase):
         # 2026 / 15 s ≈ 1.18e8 — a large, positive, sane period index.
         self.assertGreater(idx, 100_000_000)
 
+    def test_live_display_time_flows_through_timebase(self):
+        # Consumer migration: the waterfall anchor _sbuf_t0 (and hence the
+        # spectrogram / heatmap period grid) must derive from TimeBase.utc_at,
+        # i.e. wall-clock-anchored (2026), not the old _iq_t0_wall and not 0-based.
+        _clear_decode_panel_on_source_start(self.eng)
+        _feed(self.eng, "radio", seconds=1.0)
+        self.assertGreater(self.eng._sbuf_t0, YEAR_2020_UTC,
+                           "live _sbuf_t0 must be wall-anchored via TimeBase.utc_at")
+
+    def test_wav_display_time_stays_0_based(self):
+        # WAV's two time roles: the display/period grid stays 0-based
+        # file-relative even though TimeBase's outward anchor is wall-clock.  So
+        # the migration must NOT route the WAV grid through utc_at.
+        _reset_wav_timeline(self.eng)
+        _feed(self.eng, "wav", seconds=1.0)
+        self.assertLess(self.eng._sbuf_t0, YEAR_2020_UTC,
+                        "WAV _sbuf_t0 must stay 0-based file-relative, not wall-clock")
+
+    def test_iq_t0_wall_attribute_removed(self):
+        # The single-anchor _iq_t0_wall + 30-s drift guard is gone; sample->UTC is
+        # owned solely by TimeBase.  Telemetry still exposes an iq_t0_wall value,
+        # now derived from utc_at(0).
+        self.assertFalse(hasattr(self.eng, "_iq_t0_wall"),
+                         "Engine._iq_t0_wall should be retired (TimeBase owns it)")
+
 
 if __name__ == "__main__":
     unittest.main()

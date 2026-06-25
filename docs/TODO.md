@@ -141,7 +141,7 @@ ships a standalone, testable win. **Policy:** a legacy-path bug triggers the
 matching slice instead of an in-place patch (CLAUDE.md "Refactor / migration
 policy"). Built on the ratified dual-clock contract (block-stream-design §3.5).
 
-- R1. ⬜ **`TimeBase` — dual-clock value object owned by the Source.** Captures
+- R1. 🔄 **`TimeBase` — dual-clock value object owned by the Source.** Captures
   the independent `(sample_counter, wall_clock)` pair per §3.5 (never derives one
   from the other, never slews either). Per-period anchoring: `mark_period_start(
   sample)` reads one synchronized `(period_start_sample, period_start_wall)` pair
@@ -154,6 +154,75 @@ policy"). Built on the ratified dual-clock contract (block-stream-design §3.5).
   `source_mode=='wav'` time branches from the DSP core. **Acceptance test: the
   1970 TFMF-timestamp bug cannot recur** (WAV→radio transition; long-run drift).
   Closes that bug structurally rather than by patch.
+
+  **Status (2026-06-25) — acceptance MET; residual legacy sweep deferred.**
+  - ✅ `TimeBase` class landed pure + tested (`009ca0f`,
+    [timebase.py](../map144_app/timebase.py)); 11 tests incl. the 1970-regression
+    + 11-h no-drift acceptance tests (`tests/test_timebase.py`) — all green.
+  - ✅ Wired into the engine and **re-anchors on every source open** (`caaa7e8`),
+    so a WAV-relative anchor can no longer leak into a live run. The 1970 bug is
+    structurally fixed and verified (headless WAV replay stamps 2026, not 1970).
+  - 🔄 **Residual sweep NOT done:** TimeBase currently feeds only the TFMF
+    candidate stamp. The scattered `_iq_t0_wall` / `_loop_wall` / `_pkt_time*`
+    arithmetic still drives the main detect + display + decode-period path
+    ([processing.py:1017-1028](../map144_app/processing.py#L1017-L1028),
+    [:1113-1122](../map144_app/processing.py#L1113-L1122),
+    [:1243-1249](../map144_app/processing.py#L1243-L1249),
+    [:2082-2103](../map144_app/processing.py#L2082-L2103)). Completing it is a
+    real design slice, not a mechanical variable-swap — two findings from reading
+    the consumers (2026-06-25), both verified in code:
+    1. **Live time is not always `_iq_t0_wall`-derived.** For a GPS-locked source
+       (`timestamp_int >= 1e9`) `_pkt_time_early` is the **hardware VITA timestamp
+       used directly**; the `_iq_t0_wall` derivation is only the fallback for
+       unlocked clocks (Flex TSI=0, RTL/Airspy w/o GPS). The current TimeBase
+       wiring passes unconditional `time.time()`, so routing live display/decode
+       through `utc_at()` blind would **regress GPS-locked timing to OS-clock
+       accuracy**. Correct design: Source hands TimeBase the *hardware* timestamp
+       as the per-period wall when locked, `time.time()` only as fallback (§3.5
+       "Source reads two clocks").
+    2. **WAV replay already runs 3 inconsistent time conventions:** display +
+       decode-period assignment is 0-based file-relative (`_wav_time_cursor` from
+       0, [runtime.py:823](../map144_app/runtime.py#L823),
+       [:971-974](../map144_app/runtime.py#L971-L974)); the TFMF stamp is
+       *wall-clock-at-replay-start* (the `caaa7e8` `reset(wall=time.time())` fires
+       for WAV too, [processing.py:1271-1273](../map144_app/processing.py#L1271-L1273));
+       and **neither recovers the capture's true recording UTC**. The sweep must
+       pick one. WAV source files are arbitrary-length IQ captures (not 15-s
+       period files, not the 2–5 s jt9 snippets), replayed as a continuous stream.
+  - **WAV anchor decision (operator chose 2026-06-25, then refined on reading
+    the spec test):** WAV has **two intentional time roles that must NOT be
+    collapsed** — discovered via
+    [test_timebase_wiring.py:61-63](../tests/test_timebase_wiring.py#L61-L63),
+    which deliberately asserts the WAV TimeBase anchors to replay-now wall-clock
+    (so outward stamps read 2026, not 1970):
+    1. **Internal period grid** (display + decode-period assignment) = 0-based
+       file-relative — correct/needed (WSJT WAVs start on a 15-s boundary, so a
+       0-based grid keeps replay periods aligned to file content; a wall-clock
+       grid would split a ping's 15-s period across two display windows).
+    2. **Outward timestamps** (TFMF candidates, decode reports) = replay-now
+       wall-clock — deliberate, avoids 1970-looking logs.
+    "Make the TFMF WAV stamp 0-based" (an earlier mis-statement of option A)
+    would regress role 2 to ~1970 and break that test — rejected.
+    **Decision: migrate LIVE path only; leave WAV untouched** (0-based grid +
+    wall-clock outward stamp, both as-is). True recording-UTC for WAV (role 3,
+    currently absent) deferred to a future slice if #26/#48 geometry forces it.
+  - ✅ **Live-only sweep landed (2026-06-25).** Live `_pkt_time_early` / `_pkt_time`
+    (→ `_loop_wall`, `_sbuf_t0`, heatmap + spectrogram period grid) now derive from
+    `timebase.utc_at()`; TimeBase is anchored + period-re-paired at the top of
+    `process_iq_data`; the Engine `_iq_t0_wall` single-anchor **and** the 30-s
+    drift-guard heuristic are deleted (`_iq_t0_wall` ≡ `utc_at(0)`). Per-period
+    re-peg (one `time.time()` read/period) replaces the drift guard — PC UTC is
+    only ms-accurate so no finer coupling is pursued; GPS-locked VITA-as-wall
+    deliberately skipped (Flex is TSI=0). **WAV untouched** (0-based grid +
+    wall-clock outward stamp — its two roles). Decode epoch unaffected
+    (`extract_and_decode` is called with `iq_t0_wall=None`; epoch uses `detect_ts`
+    = `datetime.now()`). Tests: 6 in `test_timebase_wiring.py` (live-via-utc_at,
+    WAV-stays-0-based, attribute-retired) + full `tests/` green (283 pass; the
+    lone `test_sources` drift failure is the documented load-flake, passes alone).
+  - **Still open (future R1/R2 slices):** (a) optionally feed `extract_and_decode`
+    `timebase.utc_at(detect_sample)` to activate the sample-accurate PERIOD_SLIP
+    epoch (currently dormant — behavior change, do under its own test); (b) WAV
+    true-recording-UTC if #26/#48 geometry needs it; (c) R2 Source-emits-records.
 - R2. ⬜ **Source emits timestamped sample-records.** Every record carries both
   clocks as metadata (§3.5 "records carry both anchors"); downstream stages read
   time from the record, never re-derive. Deletes per-section time recomputation

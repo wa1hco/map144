@@ -999,33 +999,46 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
     raw   = _raw_in[:, 0] if _raw_in.ndim == 2 else _raw_in.ravel()
     raw_v = _raw_in[:, 1].copy() if dual_pol else None
 
-    # Pre-compute packet time from embedded timestamp so it is available for
-    # the detection section (which runs before the waterfall section where
-    # _pkt_time is normally computed).
+    # Pre-compute this chunk's wall-clock time (its first sample) so it is
+    # available for the detection section, which runs before the waterfall
+    # section where _pkt_time is recomputed for _sbuf_t0.
     #
-    # **Sample-clock anchoring** (see project_sample_clock_anchoring memory):
-    # Scrolling displays (waterfall, detection heatmaps) must index by a
-    # sample-counter-derived time, never by wall-clock-at-processing time.
-    # When the radio provides a valid VITA-49 sample-clock timestamp
-    # (timestamp_int >= 1e9), we use it directly — perfectly monotonic.
-    # When it doesn't (Flex TSI=0, RTL-SDR, Airspy without GPS lock), the
-    # legacy fallback ``time.time()`` injects per-chunk wall-clock jitter
-    # that lands on the heatmap row index → randomly-placed dark vertical
-    # lines.  Instead, anchor once at the first chunk and derive each
-    # subsequent chunk's time from the sample counter.  Result is a
-    # monotonic per-sample timeline regardless of OS scheduling jitter.
-    _pkt_time_early = float(timestamp_int) + float(timestamp_frac) * 1e-12
-    _is_wav_early   = getattr(self, 'source_mode', '') == 'wav'
-    if not _is_wav_early and timestamp_int < 1_000_000_000:
-        _t0 = getattr(self, '_iq_t0_wall', None)
-        if _t0 is not None:
-            # Subsequent chunk: derive from sample counter.  _iq_abs_sample
-            # is the count *before* this chunk has been added, so this is
-            # the wall-clock for the first sample of this chunk.
-            _pkt_time_early = _t0 + self._iq_abs_sample / self.sample_rate
-        else:
-            # Very first chunk after start/reset: anchor to wall clock once.
-            _pkt_time_early = time.time()
+    # **Dual-clock TimeBase** (block-stream-design §3.5; project_sample_clock_anchoring):
+    # the PC/UTC clock decides *which* 15-s period a sample belongs to (period
+    # boundaries), while the sample counter keeps placement *within* a period
+    # coherent and jitter-free.  ``self.timebase`` holds one simultaneous
+    # (sample, wall) pair, re-paired at each period boundary for live, and
+    # ``utc_at(sample)`` maps between them.  This replaces the old single-anchor
+    # ``_iq_t0_wall`` + 30-s drift-guard heuristic (which §3.5 flags as the wrong
+    # shape of fix) with the principled per-period re-peg: PC time sets the
+    # period, sample count keeps within-period processing coherent, and the
+    # offset between them is refreshed once per period (PC UTC is only ms-accurate
+    # and NTP-drifting, so a single time.time() read per period is plenty).
+    #
+    # WAV replay keeps its own 0-based file-relative cursor (the embedded
+    # timestamp): replay periods stay aligned to file start, independent of the
+    # wall-clock TimeBase anchor used for outward candidate stamps (TODO R1 —
+    # "WAV has two time roles").  A GPS-locked source could feed its VITA UTC as
+    # the period wall instead of time.time(); deliberately not done (Flex is
+    # TSI=0, rarely locked — not worth the branch).
+    _is_wav_early = getattr(self, 'source_mode', '') == 'wav'
+    _chunk_start_sample = self._iq_abs_sample   # first sample of this chunk (pre-increment)
+    if getattr(self, '_timebase_anchor_pending', False):
+        # Every source open re-anchors → a WAV-relative anchor cannot leak into a
+        # live run (the 2026-05-31 "1970 TFMF timestamp" bug).
+        self.timebase.reset(sample=_chunk_start_sample, wall=time.time())
+        self._timebase_anchor_pending = False
+    elif not _is_wav_early:
+        # Live: re-pair (sample, wall) at each 15-s UTC boundary so long-run
+        # TCXO drift cannot accumulate.
+        _tb_now = time.time()
+        if self.timebase.should_mark_period(_tb_now):
+            self.timebase.mark_period_start(sample=_chunk_start_sample, wall=_tb_now)
+
+    if _is_wav_early:
+        _pkt_time_early = float(timestamp_int) + float(timestamp_frac) * 1e-12
+    else:
+        _pkt_time_early = self.timebase.utc_at(_chunk_start_sample)
 
 
     # ── 0. Noise blanker (Linrad / Bypass / NR0V-Wideband) ────────────────────
@@ -1090,35 +1103,12 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         self._iq_ring[pos:]                 = _ring_chunk[:first_n]
         self._iq_ring[:chunk_len - first_n] = _ring_chunk[first_n:]
     self._iq_ring_pos    = (pos + chunk_len) % ring_size
-    # Anchor wall-clock for IQ ring sample 0 — see project_sample_clock_anchoring.
-    # Set ONCE per session (or after a reset that nulls it).  Re-anchoring per
-    # chunk would re-introduce wall-clock jitter into _iq_t0_wall and undo the
-    # whole point of sample-clock anchoring.
-    #
-    # The drift threshold for re-anchoring needs to be high enough that normal
-    # source-side timestamp jitter never trips it.  Flex's per-packet timestamp
-    # (computed in the source thread as ``_t_start + _abs_samps/_hw_rate``) can
-    # oscillate ±1–2 s under CPU contention because ``_t_start`` is anchored
-    # once at acquisition start with a `time.time()` reading that itself has
-    # OS-scheduling jitter and NTP-correction events.  A 1-s threshold caused
-    # constant re-anchoring during noise bursts; each re-anchor jumped
-    # ``_iq_t0_wall`` enough to spuriously cross a 15-s boundary in the
-    # heatmap-display logic and triggered a wipe.
-    #
-    # 30 s is well above any normal jitter (Flex packets stay within ±2 s) but
-    # well below the "stream is broken" regime — a real source-restart or DAX
-    # stream reset would manifest as tens of seconds of discontinuity.  The
-    # PERIOD_SLIP fix can absorb a few seconds of drift without misassigning
-    # decodes (15 s period, plenty of slack).
-    _projected = (self._iq_t0_wall + self._iq_abs_sample / self.sample_rate
-                  if self._iq_t0_wall is not None else None)
-    if self._iq_t0_wall is None:
-        self._iq_t0_wall = _pkt_time_early - self._iq_abs_sample / self.sample_rate
-    elif abs(_pkt_time_early - _projected) > 30.0:
-        # Major discontinuity — re-anchor and log so the cause is visible.
-        self._iq_t0_wall = _pkt_time_early - self._iq_abs_sample / self.sample_rate
-        logger.warning("Re-anchored _iq_t0_wall: drift %.2f s from projected",
-                       _pkt_time_early - _projected)
+    # ``_iq_abs_sample`` is the running IQ-ring sample counter; the sample→UTC
+    # mapping is owned by ``self.timebase`` (anchored + re-paired at the top of
+    # this method), not by a separate wall-clock anchor.  The old ``_iq_t0_wall``
+    # single-anchor + 30-s drift-guard heuristic is gone — the per-period re-peg
+    # bounds long-run TCXO drift correctly and structurally (block-stream-design
+    # §3.5), so a discontinuity re-anchor is no longer needed.
     self._iq_abs_sample += chunk_len
 
     # ── 1a. Update time-domain magnitude display buffers (post- and pre-blanker) ──
@@ -1264,20 +1254,8 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
     # mid-period): the surface's first sample is the OLDEST available IQ,
     # which may be later than period_start — the offset shifts the image
     # rect right so it lands at the correct period-relative time.
-    # ── Dual-clock TimeBase: anchor on source open, mark periods (live) ──────
-    # The TFMF candidate timestamp is stamped from this (TimeBase.utc_at),
-    # never from period_idx*15 — the relative-anchor path that produced 1970
-    # stamps when a WAV-relative anchor leaked into a live run.  Re-anchored to
-    # time.time() on every source open (_timebase_anchor_pending).
-    if getattr(self, '_timebase_anchor_pending', False):
-        self.timebase.reset(sample=self._iq_abs_sample, wall=time.time())
-        self._timebase_anchor_pending = False
-    elif self.source_mode != "wav":
-        # Live: re-pair (sample, wall) at each 15-s UTC boundary so long-run
-        # TCXO drift cannot accumulate (block-stream-design §3.5).
-        _tb_now = time.time()
-        if self.timebase.should_mark_period(_tb_now):
-            self.timebase.mark_period_start(sample=self._iq_abs_sample, wall=_tb_now)
+    # (TimeBase anchoring / period re-pairing now happens at the top of
+    # process_iq_data, before the detection section — see there.)
 
     # The TFMF surface + peak-pick is display-only and is the CPU fallback of a
     # GPU path (~10 ms GPU vs ~4-7 s CPU), so skip it when no consumer is on
@@ -1288,15 +1266,17 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
     _tfmf_wins = [w for w in (getattr(self, '_sync_detect_win', None),
                               getattr(self, '_cand_map_win', None)) if w is not None]
     _tfmf_wanted = (not _tfmf_wins) or any(w.isVisible() for w in _tfmf_wins)
-    if (self._iq_t0_wall is not None
+    if (self.timebase.is_anchored()
             and _tfmf_wanted
             and not self._tfmf_worker_busy
             and (_loop_wall - self._tfmf_last_dispatch_time
                  >= _TFMF_REDISPLAY_INTERVAL_S)):
         _period_idx = int(_loop_wall / self.history_secs)
         _period_start_wall = _period_idx * float(self.history_secs)
+        # utc_at(0) is the TimeBase equivalent of the old _iq_t0_wall ("wall at
+        # ring sample 0"), now per-period re-pegged instead of a fixed anchor.
         _period_start_abs = int(
-            (_period_start_wall - self._iq_t0_wall) * self.sample_rate
+            (_period_start_wall - self.timebase.utc_at(0)) * self.sample_rate
         )
         _period_start_utc = (self.timebase.utc_at(_period_start_abs)
                              if self.timebase.is_anchored() else None)
@@ -2078,27 +2058,19 @@ def process_iq_data(self, iq_samples, timestamp_int, timestamp_frac):
         self._sbuf_v[self._sbuf_v_end:self._sbuf_v_end + new_n] = cleaned_v
         self._sbuf_v_end += new_n
 
-    # All sources must deliver timestamp_frac as picoseconds (adapter responsibility).
-    _pkt_time = float(timestamp_int) + float(timestamp_frac) * 1e-12
-    # WAV files use a 0-based cursor (seconds from file start) — their timestamps are
-    # intentionally small and must NOT be replaced by wall-clock time.
-    # For live radio sources, a small timestamp_int (< year 2001 Unix epoch) means the
-    # hardware clock is not yet locked to UTC (Flex TSI=0, RTL-SDR, Airspy without GPS).
-    # Fall back to the sample-clock-anchored time (_iq_t0_wall + abs_sample/sr), NOT
-    # to time.time() — the latter introduces wall-clock jitter that makes _sbuf_t0
-    # jump between chunks during CPU bursts, which makes row_idx jump, which fires
-    # the spec_staging gap-fill and produces visible 200 ms bands of repeated
-    # spectrum content.  See project_sample_clock_anchoring memory.
+    # Wall-clock for _sbuf[0].  WAV keeps its 0-based file cursor (the embedded
+    # timestamp); live uses the TimeBase sample→UTC map (anchored at the top of
+    # process_iq_data).  Never time.time() here — per-chunk jitter would make
+    # _sbuf_t0 jump between chunks during CPU bursts → row_idx jump → spec_staging
+    # gap-fill bands of repeated spectrum (project_sample_clock_anchoring).
+    # ``_iq_abs_sample`` already includes this chunk's samples (incremented
+    # earlier), so utc_at(_iq_abs_sample - new_n) is the wall-clock of the first
+    # of this chunk's just-appended _sbuf samples.
     _is_wav = getattr(self, 'source_mode', '') == 'wav'
-    if not _is_wav and timestamp_int < 1_000_000_000:
-        _t0 = getattr(self, '_iq_t0_wall', None)
-        if _t0 is not None:
-            # _iq_abs_sample at this point already includes this chunk's samples
-            # (incremented earlier in process_iq_data), so _sbuf_end_before pointing
-            # at the same absolute sample count yields a consistent _sbuf_t0.
-            _pkt_time = _t0 + (self._iq_abs_sample - new_n) / self.sample_rate
-        else:
-            _pkt_time = time.time()
+    if _is_wav:
+        _pkt_time = float(timestamp_int) + float(timestamp_frac) * 1e-12
+    else:
+        _pkt_time = self.timebase.utc_at(self._iq_abs_sample - new_n)
     # Time of _sbuf[0] = packet's first-sample time minus already-buffered samples
     self._sbuf_t0 = _pkt_time - _sbuf_end_before / self.sample_rate
 

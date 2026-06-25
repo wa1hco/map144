@@ -864,8 +864,8 @@ def _reset_wav_timeline(self):
     self._iq_ring[:] = 0
     self._iq_ring_pos = 0
     self._iq_abs_sample = 0
-    self._iq_t0_wall = None
     # Re-anchor the dual-clock TimeBase on WAV (re)load with this run's policy.
+    # (The old _iq_t0_wall anchor is gone — TimeBase owns sample→UTC now.)
     self._timebase_anchor_pending = True
     if hasattr(self, '_sync_buf'):
         self._sync_buf[:]   = 0

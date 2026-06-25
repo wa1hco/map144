@@ -429,10 +429,6 @@ class Engine:
         self._iq_ring = np.zeros((_ring_n, 2), dtype=np.complex64)
         self._iq_ring_pos = 0
         self._iq_abs_sample = 0
-        # Wall-clock for ring sample 0; refreshed each chunk in process_iq_data.
-        # Used by extract_and_decode to derive the exact ping epoch from the IQ
-        # sample index, immune to pipeline / queue latency.
-        self._iq_t0_wall: float | None = None
         # Dual-clock owner (block-stream-design §3.5).  Anchored to time.time()
         # and re-anchored on every source open (_timebase_anchor_pending) so a
         # WAV-relative anchor cannot leak into a live run (the 2026-05-31 "1970
@@ -903,7 +899,8 @@ class Engine:
             "wall_clock":              _time.time(),
             "sample_rate":             self.sample_rate,
             "iq_abs_sample":           int(self._iq_abs_sample),
-            "iq_t0_wall":              float(self._iq_t0_wall or 0.0),
+            "iq_t0_wall":              float(self.timebase.utc_at(0)
+                                             if self.timebase.is_anchored() else 0.0),
             "ch_snr_history_h":        self._ch_snr_history_h.copy(),
             "ch_snr_history_v":        self._ch_snr_history_v.copy(),
             "ch_snr_write_idx":        int(self._ch_snr_write_idx),
