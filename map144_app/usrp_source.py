@@ -290,6 +290,13 @@ class USRPSource:
         # Optional Map65Exporter; when set & enabled, _recv_loop tees raw dual-pol
         # IQ to it before the MSK144 NCO/decimate (only place 192 kHz exists).
         self.map65_exporter         = None
+        # Generic raw-IQ consumer for the multi-mode router (and similar tees).
+        # Signature: callback(raw_h, raw_v_or_None, ts_epoch) — must not raise
+        # into the recv loop (exceptions are logged and swallowed).
+        self.raw_iq_callback        = None
+        # When True, skip NCO/decimate/sample_queue and only serve raw callbacks
+        # / map65_exporter.  Used by the standalone B210 audio/IQ router.
+        self.raw_only               = False
         self.sample_queue           = queue.Queue(maxsize=4000)
         self.center_freq_mhz_actual = center_freq_mhz
 
@@ -657,14 +664,27 @@ class USRPSource:
             ts_int  = metadata.time_spec.get_full_secs()
             ts_frac = int(metadata.time_spec.get_frac_secs() * 1e12)
 
-            # ── MAP65 export tap ──────────────────────────────────────────────
-            # Tee the RAW dual-pol 192 kHz IQ (DC = pan_center) to MAP65 before
-            # the MSK144 NCO/decimate — this is the only point the full 192 kHz
-            # exists.  process() copies internally and never raises into the loop.
+            # ── Raw IQ taps (MAP65 + generic router callback) ─────────────────
+            # Tee the RAW 192 kHz IQ (DC = pan_center) before the MSK144
+            # NCO/decimate — this is the only point the full 192 kHz exists.
+            ts_epoch = ts_int + ts_frac * 1e-12
             exp = self.map65_exporter
             if exp is not None and exp.enabled and self.dual_channel:
-                exp.process(recv_bufs[0, :n], recv_bufs[1, :n],
-                            ts_int + ts_frac * 1e-12)
+                exp.process(recv_bufs[0, :n], recv_bufs[1, :n], ts_epoch)
+
+            cb = self.raw_iq_callback
+            if cb is not None:
+                try:
+                    if self.dual_channel:
+                        cb(recv_bufs[0, :n].copy(),
+                           recv_bufs[1, :n].copy(), ts_epoch)
+                    else:
+                        cb(recv_bufs[0, :n].copy(), None, ts_epoch)
+                except Exception as exc:
+                    logger.warning("[usrp] raw_iq_callback error: %s", exc)
+
+            if self.raw_only:
+                continue
 
             if self.dual_channel:
                 # Apply NCO and decimate each channel independently.

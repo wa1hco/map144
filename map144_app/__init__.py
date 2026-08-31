@@ -47,10 +47,13 @@ ui.py           Widget construction: panel layout, pyqtgraph plots, colour
 
 channelizer.py  Polyphase channelizer filter design and state management.
 
+router/         B210 multi-mode audio / IQ router (standalone derivative).
+
 Public API
 ----------
-Only ``MAP144Visualizer`` is exported; everything else is an implementation
-detail internal to the package.
+``MAP144Visualizer`` is the main GUI entry; ``__version__`` is always
+available.  Submodules (including ``router``) must be importable without
+pulling the full GUI/DSP stack — hence the lazy ``MAP144Visualizer`` load.
 """
 
 #: Package version.  Single source of truth — referenced by:
@@ -61,6 +64,13 @@ detail internal to the package.
 #: Bumped together with a git tag at each release.  See CHANGELOG.md.
 __version__ = "0.1.3-alpha"
 
-from .visualizer import MAP144Visualizer
-
 __all__ = ["MAP144Visualizer", "__version__"]
+
+
+def __getattr__(name):
+    # Lazy: importing map144_app.router (or __version__) must not require
+    # numba / the full Engine+Visualizer stack.
+    if name == "MAP144Visualizer":
+        from .visualizer import MAP144Visualizer
+        return MAP144Visualizer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

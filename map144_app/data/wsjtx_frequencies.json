@@ -1,0 +1,42 @@
+{
+  "source": "WSJT-X default working frequencies (curated subset for B210-tunable bands)",
+  "version_note": "2026-08-31; dial frequencies in MHz (USB). HF omitted — B210 covers ~70 MHz–6 GHz.",
+  "b210_min_mhz": 50.0,
+  "b210_max_mhz": 6000.0,
+  "entries": [
+    {"band": "4m",   "mode": "FT8",    "dial_mhz": 70.100,  "label": "FT8"},
+    {"band": "4m",   "mode": "MSK144", "dial_mhz": 70.150,  "label": "MSK144"},
+    {"band": "4m",   "mode": "JT65",   "dial_mhz": 70.091,  "label": "JT65"},
+
+    {"band": "6m",   "mode": "MSK144", "dial_mhz": 50.260,  "label": "MSK144"},
+    {"band": "6m",   "mode": "MSK144", "dial_mhz": 50.280,  "label": "MSK144 alt"},
+    {"band": "6m",   "mode": "FT8",    "dial_mhz": 50.313,  "label": "FT8"},
+    {"band": "6m",   "mode": "FT8",    "dial_mhz": 50.323,  "label": "FT8 DX"},
+    {"band": "6m",   "mode": "FT4",    "dial_mhz": 50.318,  "label": "FT4"},
+    {"band": "6m",   "mode": "JT65",   "dial_mhz": 50.276,  "label": "JT65"},
+    {"band": "6m",   "mode": "Q65",    "dial_mhz": 50.275,  "label": "Q65"},
+    {"band": "6m",   "mode": "WSPR",   "dial_mhz": 50.293,  "label": "WSPR"},
+
+    {"band": "2m",   "mode": "MSK144", "dial_mhz": 144.110, "label": "MSK144 low"},
+    {"band": "2m",   "mode": "MSK144", "dial_mhz": 144.150, "label": "MSK144"},
+    {"band": "2m",   "mode": "FT4",    "dial_mhz": 144.170, "label": "FT4"},
+    {"band": "2m",   "mode": "FT8",    "dial_mhz": 144.174, "label": "FT8"},
+    {"band": "2m",   "mode": "JT65",   "dial_mhz": 144.120, "label": "JT65"},
+    {"band": "2m",   "mode": "Q65",    "dial_mhz": 144.120, "label": "Q65"},
+    {"band": "2m",   "mode": "WSPR",   "dial_mhz": 144.489, "label": "WSPR"},
+
+    {"band": "1.25m","mode": "FT8",    "dial_mhz": 222.065, "label": "FT8"},
+    {"band": "1.25m","mode": "MSK144", "dial_mhz": 222.100, "label": "MSK144"},
+
+    {"band": "70cm", "mode": "FT8",    "dial_mhz": 432.065, "label": "FT8"},
+    {"band": "70cm", "mode": "FT4",    "dial_mhz": 432.060, "label": "FT4"},
+    {"band": "70cm", "mode": "MSK144", "dial_mhz": 432.300, "label": "MSK144"},
+    {"band": "70cm", "mode": "JT65",   "dial_mhz": 432.065, "label": "JT65"},
+    {"band": "70cm", "mode": "Q65",    "dial_mhz": 432.065, "label": "Q65"},
+    {"band": "70cm", "mode": "WSPR",   "dial_mhz": 432.300, "label": "WSPR"},
+
+    {"band": "23cm", "mode": "Q65",    "dial_mhz": 1296.060,"label": "Q65"},
+    {"band": "23cm", "mode": "JT65",   "dial_mhz": 1296.060,"label": "JT65"},
+    {"band": "23cm", "mode": "FT8",    "dial_mhz": 1296.174,"label": "FT8"}
+  ]
+}

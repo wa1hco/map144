@@ -732,6 +732,16 @@ See `project_ml_qso_classifier_plan` memory for the full plan; see
     mute. See `project_wsjtx_audio_bridge` memory; 9 tests in
     `tests/test_wsjtx_audio_export_setup.py`.
 
+50. 🔄 **B210 multi-mode audio / IQ router** (derivative; 2026-08-31).
+    Standalone `router_app.py`: band → WSJT-X dial checklist (FT8/FT4/MSK144/…)
+    → named PipeWire sinks per selected dial + optional MAP65/QMAP TIMF2.
+    Core under `map144_app/router/`; docs in [router.md](router.md).
+    Reuses `WsjtxAudioExporter` + `Map65Exporter`; new wideband multi-NCO path
+    off raw 192 kHz IQ (not channelizer row 0). LO planner auto-covers the
+    selection inside 192 kHz IF. v1: Linux, standalone owns B210, no TX.
+    Unit tests: `tests/test_router_*.py`. Remaining: live Bake on B210,
+    optional MAP144 View-menu panel, 384 kHz IF unlock.
+
 45. ⬜ **Cross-platform WSJT-X audio bridge (Windows/macOS via PortAudio).**
     The #44 bridge is Linux-only: only two steps are OS-specific — creating
     the virtual sink (`pactl`) and playing into it (`paplay`). Everything
