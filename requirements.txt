@@ -1,8 +1,10 @@
-# NumPy must stay < 2.x: UHD 4.6.0 (python3-uhd) was compiled against
+# NumPy must stay on 1.26.4: UHD 4.6.0 (python3-uhd) was compiled against
 # NumPy 1.26.4 (system package).  NumPy 2.x changes PyArrayObject layout
 # and causes a seg fault in usrp_source._recv_loop.  All other deps
 # (matplotlib, pyqtgraph, scipy, bottleneck) work fine with 1.26.x.
-numpy>=1.26.4,<2
+# Pin exact: Windows install.ps1 prefers Python 3.14 but falls back when
+# 1.26.4 has no cp314 wheel (official PyPI builds do not).
+numpy==1.26.4
 bottleneck>=1.3.7
 matplotlib==3.10.6
 PyQt5==5.15.11

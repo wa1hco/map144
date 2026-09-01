@@ -7,9 +7,16 @@
 #     cd C:\WSJT\map144
 #     .\install.ps1
 #
-# Re-runnable: existing venv is reused, requirements re-resolved.
-# Uses the venv's python.exe directly so there are no PowerShell
-# execution-policy concerns — no activate step required.
+# Re-runnable: existing venv is reused when compatible, requirements
+# re-resolved.  Uses the venv's python.exe directly so there are no
+# PowerShell execution-policy concerns — no activate step required.
+#
+# Python / NumPy policy
+# ---------------------
+# Prefer Python 3.14, then 3.13 → 3.12 → 3.11 → 3.10.
+# requirements.txt pins numpy==1.26.4 (UHD ABI).  Official PyPI builds of
+# 1.26.4 have no cp314 wheels, so a 3.14 venv often fails at pip install.
+# In that case we tear down .venv and retry with the next older Python.
 
 $ErrorActionPreference = 'Stop'
 
@@ -18,11 +25,7 @@ $ErrorActionPreference = 'Stop'
 $RepoDir = (Resolve-Path $PSScriptRoot).Path
 Set-Location $RepoDir
 
-# ── 1. Find a usable Python ─────────────────────────────────────────────
-# Prefer 3.12 / 3.13.  requirements.txt pins numpy<2 (UHD ABI on Linux);
-# NumPy 1.26 has no cp314 wheels, so Python 3.14 makes pip try to compile
-# numpy from source and fails without a full MSVC build stack.
-#
+# ── 1. Discover usable Python interpreters ──────────────────────────────
 # Refuse the Microsoft Store stub.  On a fresh Win11 install ``python``
 # resolves to ``...\WindowsApps\python.exe`` which launches the Store
 # instead of running anything.
@@ -40,7 +43,8 @@ function Test-PythonCandidate([string] $Exe) {
         $ver = $parts[0]
         $maj, $min, $pat = $ver.Split('.')
         if ([int]$maj -ne 3) { return $null }
-        if ([int]$min -lt 10 -or [int]$min -ge 14) { return $null }
+        # Accept 3.10 .. 3.14 inclusive.
+        if ([int]$min -lt 10 -or [int]$min -gt 14) { return $null }
         $resolved = $Exe
         if ($parts.Count -ge 2 -and (Test-Path -LiteralPath $parts[1])) { $resolved = $parts[1] }
         if ($resolved -like '*WindowsApps*') { return $null }
@@ -52,93 +56,133 @@ function Test-PythonCandidate([string] $Exe) {
     }
 }
 
-$pythonInfo = $null
-# Prefer the py launcher pins (3.12, then 3.13, then 3.11, then 3.10).
-$pyLauncher = Get-Command py -ErrorAction SilentlyContinue
-if ($pyLauncher) {
-    foreach ($tag in @('-3.12', '-3.13', '-3.11', '-3.10')) {
+function Get-PythonCandidates {
+    $found = @()
+    $seen = @{}
+    $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+    # Prefer newest first: 3.14 → 3.10
+    foreach ($tag in @('-3.14', '-3.13', '-3.12', '-3.11', '-3.10')) {
+        if (-not $pyLauncher) { break }
         try {
             $out = & py $tag -c "import sys; print(sys.executable)" 2>$null
             if ($LASTEXITCODE -eq 0 -and $out) {
-                $pythonInfo = Test-PythonCandidate $out.Trim()
-                if ($pythonInfo) { break }
+                $info = Test-PythonCandidate $out.Trim()
+                if ($info -and -not $seen.ContainsKey($info.Exe)) {
+                    $seen[$info.Exe] = $true
+                    $found += $info
+                }
             }
         } catch { }
     }
-}
-if (-not $pythonInfo) {
-    $cmd = Get-Command python -ErrorAction SilentlyContinue
-    if ($cmd) { $pythonInfo = Test-PythonCandidate $cmd.Source }
-}
-if (-not $pythonInfo) {
-    $cmd3 = Get-Command python3 -ErrorAction SilentlyContinue
-    if ($cmd3) { $pythonInfo = Test-PythonCandidate $cmd3.Source }
-}
-
-if (-not $pythonInfo) {
-    # Explain the common 3.14 failure explicitly.
-    $anyPy = Get-Command python -ErrorAction SilentlyContinue
-    if ($anyPy -and $anyPy.Source -notlike '*WindowsApps*') {
-        $anyVer = & python -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
-        if ($anyVer -match '^3\.14') {
-            Write-Host "ERROR: Python $anyVer found, but MAP144 needs Python 3.10-3.13 on Windows." -ForegroundColor Red
-            Write-Host "  requirements pin numpy<2 (no binary wheels for 3.14), so pip tries to" -ForegroundColor Red
-            Write-Host "  compile numpy from source and fails." -ForegroundColor Red
-            Write-Host "" -ForegroundColor Red
-            Write-Host "  Fix: install Python 3.12 from https://www.python.org/downloads/" -ForegroundColor Yellow
-            Write-Host "       (check 'Add python.exe to PATH'), then:" -ForegroundColor Yellow
-            Write-Host "         rmdir /s /q .venv" -ForegroundColor Yellow
-            Write-Host "         .\install.ps1" -ForegroundColor Yellow
-            exit 1
+    foreach ($name in @('python', 'python3')) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if (-not $cmd) { continue }
+        $info = Test-PythonCandidate $cmd.Source
+        if ($info -and -not $seen.ContainsKey($info.Exe)) {
+            $seen[$info.Exe] = $true
+            $found += $info
         }
     }
-    Write-Host "ERROR: no suitable Python 3.10-3.13 found on PATH." -ForegroundColor Red
-    Write-Host "  Install Python 3.12 from https://www.python.org/downloads/" -ForegroundColor Red
+    # Stable preference: higher minor first, then keep discovery order.
+    return @($found | Sort-Object -Property Minor -Descending)
+}
+
+$candidates = Get-PythonCandidates
+if (-not $candidates -or $candidates.Count -eq 0) {
+    Write-Host "ERROR: no suitable Python 3.10-3.14 found on PATH." -ForegroundColor Red
+    Write-Host "  Install Python 3.14 or 3.12 from https://www.python.org/downloads/" -ForegroundColor Red
     Write-Host "  (the python.org installer, NOT the Microsoft Store one)." -ForegroundColor Red
+    Write-Host "  Note: numpy==1.26.4 has no official 3.14 wheels — if 3.14 fails," -ForegroundColor Yellow
+    Write-Host "  install.ps1 will automatically retry with 3.13/3.12." -ForegroundColor Yellow
     exit 1
 }
 
-$PythonExe = $pythonInfo.Exe
-Write-Host "Python $($pythonInfo.Version) at $PythonExe" -ForegroundColor Green
+Write-Host "Python candidates (preferred first):" -ForegroundColor Cyan
+foreach ($c in $candidates) {
+    Write-Host ("  {0}  {1}" -f $c.Version, $c.Exe)
+}
 
-# ── 2. Create venv if missing (idempotent) ──────────────────────────────
+# ── 2–4. Create venv + install requirements (with Python fallback) ──────
 $VenvDir = Join-Path $RepoDir ".venv"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
-if (Test-Path $VenvPython) {
-    # If an existing venv was built with 3.14+, recreate (no numpy<2 wheels).
-    $venvVer = & $VenvPython -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
-    if ($venvVer) {
-        $vm, $vn = $venvVer.Split('.')
-        if ([int]$vm -eq 3 -and [int]$vn -ge 14) {
-            Write-Host "Existing .venv is Python $venvVer (unsupported for numpy<2). Recreating ..." -ForegroundColor Yellow
+$ReqFile = Join-Path $RepoDir "requirements.txt"
+$installed = $false
+$lastError = ""
+
+foreach ($pythonInfo in $candidates) {
+    $PythonExe = $pythonInfo.Exe
+    Write-Host ""
+    Write-Host "Trying Python $($pythonInfo.Version) at $PythonExe ..." -ForegroundColor Cyan
+
+    # Drop an incompatible existing venv (different major.minor).
+    if (Test-Path $VenvPython) {
+        $venvVer = & $VenvPython -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
+        $wantVer = '{0}.{1}' -f 3, $pythonInfo.Minor
+        if ($venvVer -and $venvVer -ne $wantVer) {
+            Write-Host "Existing .venv is Python $venvVer; recreating for $wantVer ..." -ForegroundColor Yellow
             Remove-Item -LiteralPath $VenvDir -Recurse -Force
         }
     }
-}
-if (-not (Test-Path $VenvPython)) {
-    Write-Host "Creating venv at $VenvDir ..." -ForegroundColor Cyan
-    & $PythonExe -m venv $VenvDir
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "ERROR: venv creation failed." -ForegroundColor Red
-        exit 1
+
+    if (-not (Test-Path $VenvPython)) {
+        Write-Host "Creating venv at $VenvDir ..." -ForegroundColor Cyan
+        & $PythonExe -m venv $VenvDir
+        if ($LASTEXITCODE -ne 0) {
+            $lastError = "venv creation failed with Python $($pythonInfo.Version)"
+            Write-Host "ERROR: $lastError" -ForegroundColor Red
+            if (Test-Path $VenvDir) {
+                Remove-Item -LiteralPath $VenvDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            continue
+        }
     }
+
+    Write-Host "Upgrading pip ..." -ForegroundColor Cyan
+    & $VenvPython -m pip install --upgrade pip
+    if ($LASTEXITCODE -ne 0) {
+        $lastError = "pip upgrade failed with Python $($pythonInfo.Version)"
+        Write-Host "ERROR: $lastError" -ForegroundColor Red
+        Remove-Item -LiteralPath $VenvDir -Recurse -Force -ErrorAction SilentlyContinue
+        continue
+    }
+
+    Write-Host "Installing requirements (numpy==1.26.4) ..." -ForegroundColor Cyan
+    & $VenvPython -m pip install -r $ReqFile
+    if ($LASTEXITCODE -ne 0) {
+        $lastError = "pip install failed with Python $($pythonInfo.Version)"
+        Write-Host "ERROR: $lastError" -ForegroundColor Red
+        if ($pythonInfo.Minor -ge 14) {
+            Write-Host "  numpy==1.26.4 typically has no cp314 wheels; falling back to an older Python ..." -ForegroundColor Yellow
+        }
+        Remove-Item -LiteralPath $VenvDir -Recurse -Force -ErrorAction SilentlyContinue
+        continue
+    }
+
+    # Confirm numpy pin landed.
+    $npVer = & $VenvPython -c "import numpy; print(numpy.__version__)" 2>$null
+    if (-not $npVer) {
+        $lastError = "numpy import failed after install (Python $($pythonInfo.Version))"
+        Write-Host "ERROR: $lastError" -ForegroundColor Red
+        Remove-Item -LiteralPath $VenvDir -Recurse -Force -ErrorAction SilentlyContinue
+        continue
+    }
+    if ($npVer -ne '1.26.4') {
+        Write-Host "WARNING: expected numpy 1.26.4, got $npVer" -ForegroundColor Yellow
+    } else {
+        Write-Host "numpy $npVer OK" -ForegroundColor Green
+    }
+
+    $installed = $true
+    Write-Host "Using Python $($pythonInfo.Version) + numpy $npVer" -ForegroundColor Green
+    break
 }
 
-# ── 3. Upgrade pip ──────────────────────────────────────────────────────
-# Mandatory: older pip on a stale Python install can miss the ABI tag
-# for newer Python builds and fall back to source compilation.
-Write-Host "Upgrading pip ..." -ForegroundColor Cyan
-& $VenvPython -m pip install --upgrade pip
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: pip upgrade failed." -ForegroundColor Red
-    exit 1
-}
-
-# ── 4. Install requirements ─────────────────────────────────────────────
-Write-Host "Installing requirements ..." -ForegroundColor Cyan
-& $VenvPython -m pip install -r requirements.txt
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: pip install -r requirements.txt failed." -ForegroundColor Red
+if (-not $installed) {
+    Write-Host ""
+    Write-Host "ERROR: could not create a working venv." -ForegroundColor Red
+    if ($lastError) { Write-Host "  Last failure: $lastError" -ForegroundColor Red }
+    Write-Host "  Install Python 3.12 from https://www.python.org/downloads/ and re-run." -ForegroundColor Yellow
+    Write-Host "  (3.14 is tried first, but numpy==1.26.4 usually needs 3.10-3.13.)" -ForegroundColor Yellow
     exit 1
 }
 
@@ -163,5 +207,7 @@ Write-Host "MAP144 v$Map144Version ready." -ForegroundColor Green
 Write-Host "To run:"
 Write-Host "    cd $RepoDir"
 Write-Host "    .\run.bat"
+Write-Host "Router:"
+Write-Host "    .\run-router.bat"
 Write-Host ""
 Write-Host "The first launch may take ~10 s while numba JIT-compiles its hot paths."
