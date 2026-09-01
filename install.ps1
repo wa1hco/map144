@@ -1,6 +1,6 @@
-# install.ps1 — MAP144 install / update for Windows.
+﻿# install.ps1 - MAP144 install / update for Windows.
 #
-# Run from inside the cloned repo (no auto-clone — gives you full
+# Run from inside the cloned repo (no auto-clone - gives you full
 # control of where the working tree lives):
 #
 #     git clone https://github.com/wa1hco/map144.git C:\WSJT\map144
@@ -9,11 +9,11 @@
 #
 # Re-runnable: existing venv is reused when compatible, requirements
 # re-resolved.  Uses the venv's python.exe directly so there are no
-# PowerShell execution-policy concerns — no activate step required.
+# PowerShell execution-policy concerns - no activate step required.
 #
 # Python / NumPy policy
-# ---------------------
-# Prefer Python 3.14, then 3.13 → 3.12 → 3.11 → 3.10.
+# --------------------
+# Prefer Python 3.14, then 3.13 -> 3.12 -> 3.11 -> 3.10.
 # requirements.txt pins numpy==1.26.4 (UHD ABI).  Official PyPI builds of
 # 1.26.4 have no cp314 wheels, so a 3.14 venv often fails at pip install.
 # In that case we tear down .venv and retry with the next older Python.
@@ -25,7 +25,7 @@ $ErrorActionPreference = 'Stop'
 $RepoDir = (Resolve-Path $PSScriptRoot).Path
 Set-Location $RepoDir
 
-# ── 1. Discover usable Python interpreters ──────────────────────────────
+# -- 1. Discover usable Python interpreters --------------------
 # Refuse the Microsoft Store stub.  On a fresh Win11 install ``python``
 # resolves to ``...\WindowsApps\python.exe`` which launches the Store
 # instead of running anything.
@@ -60,7 +60,7 @@ function Get-PythonCandidates {
     $found = @()
     $seen = @{}
     $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
-    # Prefer newest first: 3.14 → 3.10
+    # Prefer newest first: 3.14 -> 3.10
     foreach ($tag in @('-3.14', '-3.13', '-3.12', '-3.11', '-3.10')) {
         if (-not $pyLauncher) { break }
         try {
@@ -87,13 +87,13 @@ function Get-PythonCandidates {
     return @($found | Sort-Object -Property Minor -Descending)
 }
 
-$candidates = Get-PythonCandidates
-if (-not $candidates -or $candidates.Count -eq 0) {
-    Write-Host "ERROR: no suitable Python 3.10-3.14 found on PATH." -ForegroundColor Red
-    Write-Host "  Install Python 3.14 or 3.12 from https://www.python.org/downloads/" -ForegroundColor Red
-    Write-Host "  (the python.org installer, NOT the Microsoft Store one)." -ForegroundColor Red
-    Write-Host "  Note: numpy==1.26.4 has no official 3.14 wheels — if 3.14 fails," -ForegroundColor Yellow
-    Write-Host "  install.ps1 will automatically retry with 3.13/3.12." -ForegroundColor Yellow
+$candidates = @(Get-PythonCandidates)
+if ($candidates.Count -eq 0) {
+    Write-Host 'ERROR: no suitable Python 3.10-3.14 found on PATH.' -ForegroundColor Red
+    Write-Host '  Install Python 3.14 or 3.12 from https://www.python.org/downloads/' -ForegroundColor Red
+    Write-Host '  (the python.org installer, NOT the Microsoft Store one).' -ForegroundColor Red
+    Write-Host '  Note: numpy==1.26.4 has no official 3.14 wheels - if 3.14 fails,' -ForegroundColor Yellow
+    Write-Host '  install.ps1 will automatically retry with 3.13/3.12.' -ForegroundColor Yellow
     exit 1
 }
 
@@ -102,7 +102,7 @@ foreach ($c in $candidates) {
     Write-Host ("  {0}  {1}" -f $c.Version, $c.Exe)
 }
 
-# ── 2–4. Create venv + install requirements (with Python fallback) ──────
+# -- 2-4. Create venv + install requirements (with Python fallback) ------
 $VenvDir = Join-Path $RepoDir ".venv"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 $ReqFile = Join-Path $RepoDir "requirements.txt"
@@ -186,7 +186,7 @@ if (-not $installed) {
     exit 1
 }
 
-# ── 5. Verify jt9 discovery ─────────────────────────────────────────────
+# -- 5. Verify jt9 discovery --------------------
 Write-Host "Verifying jt9 discovery ..." -ForegroundColor Cyan
 $jt9Path = & $VenvPython -c "from map144_app.detection import find_jt9; p = find_jt9(); print(p if p else '')"
 if (-not $jt9Path) {
@@ -197,11 +197,11 @@ if (-not $jt9Path) {
     Write-Host "jt9: $jt9Path" -ForegroundColor Green
 }
 
-# ── 6. Resolve installed version (single source of truth) ──────────────
+# -- 6. Resolve installed version (single source of truth) --------------
 $Map144Version = & $VenvPython -c "from map144_app import __version__; print(__version__)" 2>$null
 if (-not $Map144Version) { $Map144Version = "???" }
 
-# ── 7. Done ─────────────────────────────────────────────────────────────
+# -- 7. Done --------------------
 Write-Host ""
 Write-Host "MAP144 v$Map144Version ready." -ForegroundColor Green
 Write-Host "To run:"
