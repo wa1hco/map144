@@ -30,7 +30,9 @@ if exist "%USERPROFILE%\miniconda3\envs\map144\python.exe" (
 )
 echo ERROR: no B210-capable Python env found. 1>&2
 echo   Looked for env\, .venv\, and conda env map144. 1>&2
-echo   Install via tools\install-b210.ps1 or follow docs\ALPHA_NOTES.md. 1>&2
+echo   1^) .\install.ps1          - venv + Ettus UHD/B210 firmware 1>&2
+echo   2^) need Python import uhd: tools\install-b210.bat  OR  1>&2
+echo      conda install -c conda-forge uhd   (see docs\router-windows.md) 1>&2
 exit /b 1
 
 :env_found

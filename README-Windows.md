@@ -44,8 +44,19 @@ or change execution policy permanently.
 What `install.ps1` does (re-runnable = update):
 
 - Creates/reuses `.venv`
-- Upgrades pip and installs `requirements.txt`
+- Upgrades pip and installs `requirements.txt` (`numpy==1.26.4`)
+- Installs / verifies **Ettus UHD** (WinUSB driver + B210 FPGA/FX3 firmware
+  images under `C:\Program Files\UHD\share\uhd\images\`). First time needs
+  admin + internet (~233 MB). Pass `-SkipUhd` to skip.
 - Verifies `jt9` discovery (warning only if missing)
+
+B210 **Python** bindings (`import uhd`) are not installed into `.venv` (no
+Windows pip wheels). For `run-router.bat` / USRP, also use either:
+
+- the offline B210 kit `env\` (`tools\install-b210.bat`), or
+- `conda install -c conda-forge uhd` in a `map144` conda env
+
+Firmware/driver alone (from `install.ps1`) is still required either way.
 
 ## Update
 

@@ -17,6 +17,15 @@
 # requirements.txt pins numpy==1.26.4 (UHD ABI).  Official PyPI builds of
 # 1.26.4 have no cp314 wheels, so a 3.14 venv often fails at pip install.
 # In that case we tear down .venv and retry with the next older Python.
+#
+# Also installs Ettus UHD (WinUSB + B210 FPGA/FX3 firmware images) via
+# tools\Install-UhdWindows.ps1 unless -SkipUhd is passed.  That step needs
+# admin + internet the first time (~233 MB).  Python `import uhd` still
+# requires the B210 kit env\ or conda-forge uhd (no Windows pip wheels).
+
+param(
+    [switch]$SkipUhd
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -186,7 +195,29 @@ if (-not $installed) {
     exit 1
 }
 
-# -- 5. Verify jt9 discovery --------------------
+# -- 5. Ettus UHD + B210 firmware (for router / USRP) -------------------
+if (-not $SkipUhd) {
+    Write-Host ""
+    Write-Host "Installing / verifying Ettus UHD + B210 firmware ..." -ForegroundColor Cyan
+    $uhdHelper = Join-Path $RepoDir 'tools\Install-UhdWindows.ps1'
+    if (-not (Test-Path -LiteralPath $uhdHelper)) {
+        Write-Host "WARNING: $uhdHelper missing; skipping UHD install." -ForegroundColor Yellow
+    } else {
+        $uhdProc = Start-Process -FilePath 'powershell.exe' `
+            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$uhdHelper`"") `
+            -Wait -PassThru
+        if ($uhdProc.ExitCode -ne 0) {
+            Write-Host "WARNING: UHD / B210 firmware install failed (exit $($uhdProc.ExitCode))." -ForegroundColor Yellow
+            Write-Host "  Router/B210 will not work until UHD is installed." -ForegroundColor Yellow
+            Write-Host "  Retry: powershell -ExecutionPolicy Bypass -File tools\Install-UhdWindows.ps1" -ForegroundColor Yellow
+            Write-Host "  Or use the offline kit: tools\install-b210.bat" -ForegroundColor Yellow
+        }
+    }
+} else {
+    Write-Host "Skipping Ettus UHD install (-SkipUhd)." -ForegroundColor Yellow
+}
+
+# -- 6. Verify jt9 discovery --------------------------------------------
 Write-Host "Verifying jt9 discovery ..." -ForegroundColor Cyan
 $jt9Path = & $VenvPython -c "from map144_app.detection import find_jt9; p = find_jt9(); print(p if p else '')"
 if (-not $jt9Path) {
@@ -197,17 +228,19 @@ if (-not $jt9Path) {
     Write-Host "jt9: $jt9Path" -ForegroundColor Green
 }
 
-# -- 6. Resolve installed version (single source of truth) --------------
+# -- 7. Resolve installed version (single source of truth) --------------
 $Map144Version = & $VenvPython -c "from map144_app import __version__; print(__version__)" 2>$null
 if (-not $Map144Version) { $Map144Version = "???" }
 
-# -- 7. Done --------------------
+# -- 8. Done ------------------------------------------------------------
 Write-Host ""
 Write-Host "MAP144 v$Map144Version ready." -ForegroundColor Green
 Write-Host "To run:"
 Write-Host "    cd $RepoDir"
 Write-Host "    .\run.bat"
-Write-Host "Router:"
+Write-Host "Router (needs UHD firmware above + a Python with 'import uhd'):"
 Write-Host "    .\run-router.bat"
+Write-Host "  B210 Python bindings: use kit env\ or conda install -c conda-forge uhd"
+Write-Host "  (pip .venv alone cannot import uhd on Windows)."
 Write-Host ""
 Write-Host "The first launch may take ~10 s while numba JIT-compiles its hot paths."

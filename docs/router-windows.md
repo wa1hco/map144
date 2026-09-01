@@ -25,28 +25,53 @@ against the same radio at the same time.
 
 ## 1. Install MAP144 + B210 support
 
-### Option A — B210 install kit (recommended)
+### Option A — `install.ps1` (recommended for router on a networked PC)
 
-Same kit used for MAP144 on contest PCs. Details: `docs/ALPHA_NOTES.md`
-and `tools/kit-README.txt`.
+From a git checkout of `main`:
+
+```powershell
+cd C:\map144
+.\install.ps1
+```
+
+This will:
+
+1. Create `.venv` and install Python deps (`numpy==1.26.4`, …)
+2. Download/install **Ettus UHD** (admin UAC) including **B210 firmware**
+   images under `C:\Program Files\UHD\share\uhd\images\`  
+   (skip with `.\install.ps1 -SkipUhd` if you only want Flex/audio work)
+
+**Python `import uhd`:** Windows has no pip wheel. After `install.ps1`, also do
+**one** of:
+
+- Offline kit `env\` (Option B), or  
+- Miniconda: `conda create -n map144 python=3.11` then  
+  `conda install -c conda-forge uhd` and `pip install -r requirements.txt`
+
+`run-router.bat` auto-detects `env\`, `.venv\`, or the conda `map144` env.
+
+Standalone UHD/firmware only:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\Install-UhdWindows.ps1
+```
+
+### Option B — B210 install kit (offline / contest PC)
+
+Same kit used for MAP144. Details: `docs/ALPHA_NOTES.md` and
+`tools/kit-README.txt`.
 
 1. Plug the B210 into a USB 3.0 port.
 2. Copy the kit folder to the PC (or leave it on a USB stick).
 3. Double-click `install-b210.bat` → approve UAC → wait until it prints `READY`.
 4. Default layout after install:
    - `C:\map144\` — source + launchers  
-   - `C:\map144\env\` — Python env with UHD  
+   - `C:\map144\env\` — Python env with UHD bindings  
    - `C:\Program Files\UHD\` — Ettus driver / firmware  
 
-### Option B — already have MAP144 on this PC
+### Option C — already have MAP144 + B210 working
 
-If `run-b210.bat` already works, skip to §2. You only need the router files
-from a current tree (`router_app.py`, `run-router.bat`, `map144_app\router\`, …).
-
-### Option C — manual (no kit)
-
-Follow **Manual B210 setup** in `docs/ALPHA_NOTES.md` (Ettus UHD installer →
-Miniconda env `map144` with `uhd` → clone/copy map144 → `pip install -r requirements.txt`).
+If `run-b210.bat` already works, skip to §2.
 
 ---
 
