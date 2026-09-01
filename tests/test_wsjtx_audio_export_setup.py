@@ -89,12 +89,14 @@ def test_env_zero_disables(fake_exporter, monkeypatch):
     assert self._wsjtx_exports == {}
 
 
-def test_non_linux_skipped(fake_exporter, monkeypatch):
+def test_windows_enabled_by_default(fake_exporter, monkeypatch):
+    """#45: bridge is no longer Linux-only — PortAudio path on win/mac."""
     monkeypatch.delenv("MAP144_WSJTX_AUDIO", raising=False)
-    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "platform", "win32")
     self = _obj()
     runtime._setup_wsjtx_audio_export(self, dual=True)
-    assert self._wsjtx_exports == {}
+    assert set(self._wsjtx_exports) == {0, 1}
+    assert self._wsjtx_exports[0].sink == "map144.RF0.rx"
 
 
 def test_idempotent_when_already_built(fake_exporter, monkeypatch):

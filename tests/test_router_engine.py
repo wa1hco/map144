@@ -59,16 +59,38 @@ class _FakeMap65:
 class _FakeUSRP:
     def __init__(self, **kw):
         self.kw = kw
+        self.gain_db = float(kw.get("gain_db", 50.0))
+        self.antenna = kw.get("antenna", "RX2")
+        self.dual_channel = bool(kw.get("dual_channel", False))
+        self._gain_ch1 = self.gain_db
+        self._antenna_ch1 = "RX2"
         self.raw_only = False
         self.raw_iq_callback = None
         self.started = False
         self.stopped = False
+        self.recv_count = 0
+        self.startup_phase = "idle"
+        self._usrp = None
 
     def start(self):
         self.started = True
+        self.startup_phase = "streaming"
 
     def stop(self):
         self.stopped = True
+        self.startup_phase = "idle"
+
+    def set_rx_gain(self, gain_db, channel=0):
+        if int(channel) == 0:
+            self.gain_db = float(gain_db)
+        else:
+            self._gain_ch1 = float(gain_db)
+
+    def set_rx_antenna(self, antenna, channel=0):
+        if int(channel) == 0:
+            self.antenna = str(antenna)
+        else:
+            self._antenna_ch1 = str(antenna)
 
 
 def test_start_stop_creates_sinks_and_tears_down():
@@ -139,3 +161,46 @@ def test_plan_only_preview():
     plan = eng.plan_only(RouterConfig(dials=dials))
     assert plan.hw_rate_hz == 192_000
     assert not eng.running
+
+
+def test_live_gain_and_blanker_while_running():
+    eng = RouterEngine()
+    dials = [DialChannel("2m", "FT8", 144.174, "FT8")]
+    eng.start(
+        RouterConfig(dials=dials, gain_db=40.0, blanker_name="Bypass", nb_factor=5.0),
+        usrp_factory=_FakeUSRP,
+        audio_exporter_factory=_FakeExporter,
+    )
+    assert eng._src.gain_db == 40.0
+    eng.set_gain_db(55.0, 0)
+    assert eng._src.gain_db == 55.0
+    eng.set_blanker("Linrad")
+    assert eng.blanker_name == "Linrad"
+    eng.set_nb_factor(7.5, "h")
+    assert eng.nb_factor == 7.5
+    assert eng._nb_state.nb_factor == 7.5
+
+    # Raw callback blanks then feeds exporter
+    n = 3840
+    raw = (0.01 * (np.random.randn(n) + 1j * np.random.randn(n))).astype(np.complex64)
+    eng._src.raw_iq_callback(raw, None, 0.0)
+    st = eng.status()
+    assert st.running
+    assert st.blanker_name == "Linrad"
+    eng.stop()
+
+
+def test_config_passes_gain_into_usrp():
+    eng = RouterEngine()
+    eng.start(
+        RouterConfig(
+            dials=[DialChannel("2m", "MSK144", 144.150, "MSK144")],
+            gain_db=33.0,
+            antenna="TX/RX",
+        ),
+        usrp_factory=_FakeUSRP,
+        audio_exporter_factory=_FakeExporter,
+    )
+    assert eng._src.kw["gain_db"] == 33.0
+    assert eng._src.kw["antenna"] == "TX/RX"
+    eng.stop()

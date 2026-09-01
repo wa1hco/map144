@@ -476,6 +476,28 @@ class USRPSource:
             self._thread = None
         self._usrp = None
 
+    def set_rx_gain(self, gain_db: float, channel: int = 0) -> None:
+        """Set RX gain (dB) for one RF channel; live if the radio is open."""
+        gain_db = float(gain_db)
+        if int(channel) == 0:
+            self.gain_db = gain_db
+        else:
+            self._gain_ch1 = gain_db
+        usrp = self._usrp
+        if usrp is not None:
+            usrp.set_rx_gain(gain_db, int(channel))
+
+    def set_rx_antenna(self, antenna: str, channel: int = 0) -> None:
+        """Set RX antenna port for one RF channel; live if the radio is open."""
+        antenna = str(antenna)
+        if int(channel) == 0:
+            self.antenna = antenna
+        else:
+            self._antenna_ch1 = antenna
+        usrp = self._usrp
+        if usrp is not None:
+            usrp.set_rx_antenna(antenna, int(channel))
+
     def _build_nco_table(self):
         """(Re)build the NCO rotation table + step from the current lo_offset.
 

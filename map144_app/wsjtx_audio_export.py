@@ -1,37 +1,40 @@
-"""Phase 1 of the MAP144 -> WSJT-X audio bridge: live calling-channel export.
+"""MAP144 -> WSJT-X audio bridge: live baseband → virtual soundcard.
 
-Taps the calling channel's complex baseband (``ch_out[0]``, DC-centred, 12 kHz),
-upconverts it to real audio at 1500 Hz (phase-continuous across chunks), and
-streams 12 kHz signed-16 PCM into a PipeWire/Pulse null sink.  PipeWire resamples
-12 -> 48 kHz and adaptively syncs to the graph clock, absorbing the B210-vs-system
-clock drift for free.  WSJT-X records the sink's monitor and decodes as if from a
-normal soundcard.
+Taps complex baseband (DC-centred, typically 12 kHz), upconverts to real audio
+at 1500 Hz (phase-continuous across chunks), and streams signed-16 PCM into a
+platform transport:
 
-Why this is a *sink*, not a DSP stage:
-  * It only reads ``ch_out[0]``; it never modifies the pipeline (read-only tap,
-    a proto- ``WsjtxAudioExportBlock`` for the block/stream migration).
-  * The PCM is handed to a background writer thread through a bounded
-    drop-oldest queue, so a stalled audio pipe drops audio rather than blocking
-    the DSP ingest loop (which would corrupt MAP144's own decode and the A/B).
+  * Linux: PipeWire/Pulse null sink + paplay (auto-created; WSJT-X records the
+    sink monitor).  PipeWire resamples 12→48 kHz and absorbs clock drift.
+  * Windows / macOS: PortAudio via ``sounddevice`` into a user-installed virtual
+    cable (VB-CABLE / VoiceMeeter / BlackHole).  Device chosen by config env
+    override, else auto-matched by common cable names.
 
-Deployment: for the B210 on Linux this runs by default -- runtime
+DSP (``feed``) is platform-identical.  Only the Transport differs.
+
+Deployment: for the B210 this runs by default -- runtime
 ``_setup_wsjtx_audio_export`` creates one exporter per RF port at source start,
-with sink names ``map144_RF0`` / ``map144_RF1`` (RF0 <- RX0, RF1 <- RX1).  The
-sinks are named by hardware port (RF0/RF1), NOT polarization, since the antenna
-on each port is operator-dependent.  Disable the whole bridge with
-``MAP144_WSJTX_AUDIO=0``.
+with sink names ``map144.RF0.rx`` / ``map144.RF1.rx`` (RF0 <- RX0, RF1 <- RX1).
+Disable with ``MAP144_WSJTX_AUDIO=0``.
 
-Optional env tuning (apply to every port):
-  MAP144_WSJTX_TARGET_RMS  int16 RMS level  (default 26 -> ~30 dB on the WSJT-X
-                                             meter, calibrated on a B210 feed)
+Env tuning:
+  MAP144_WSJTX_TARGET_RMS   int16 RMS (default 26 → ~30 dB on WSJT-X meter)
+  MAP144_WSJTX_DEVICE       output device name (substring OK); comma-list for
+                            RF0,RF1,… / dial index 0,1,…
+  MAP144_WSJTX_DEVICE_RF0   per-port override (also _RF1)
 """
+from __future__ import annotations
+
+import atexit
+import logging
 import os
 import queue
 import shutil
-import atexit
-import logging
-import threading
 import subprocess
+import sys
+import threading
+from typing import Sequence
+
 import numpy as np
 
 log = logging.getLogger(__name__)
@@ -41,67 +44,64 @@ _FC = 1500.0         # audio carrier WSJT-X expects (Hz)
 _TAU_S = 8.0         # auto-level time constant (>> ping duration, so pings survive)
 _QUEUE_MAX = 128     # ~chunks buffered before drop-oldest (bounds latency + memory)
 
+# Auto-match candidates for PortAudio output devices (case-insensitive substring).
+# Ordered: prefer first match for index 0; later entries / Cable B for index ≥1.
+_WIN_DEVICE_CANDIDATES = (
+    "cable a input",         # VB-CABLE A+B → index 0
+    "cable input",           # single VB-CABLE → index 0 when A absent
+    "cable b input",         # VB-CABLE A+B → index 1
+    "voicemeeter input",
+    "voicemeeter aux input",
+    "voicemeeter vaio",
+)
+_MAC_DEVICE_CANDIDATES = (
+    "blackhole 2ch",
+    "blackhole 16ch",
+    "blackhole",
+)
 
-class WsjtxAudioExporter:
-    """Streams one channel's baseband to a PipeWire null sink as 12 kHz audio."""
 
-    def __init__(self, sink_name=None, target_rms=None, fs=_FS, fc=_FC, label=None,
-                 description=None, stream_name=None):
-        self.sink = sink_name or os.environ.get("MAP144_WSJTX_SINK", "map144_out")
-        self.label = label or self.sink     # short tag for logs (e.g. 'RF0')
-        # Human-readable strings.  device.description is the ONLY label WSJT-X /
-        # pavucontrol show the operator (the programmatic `sink` name with its
-        # dots/underscores never reaches a GUI).  The monitor source WSJT-X
-        # records is auto-named "Monitor of <description>".  stream_name labels
-        # the paplay playback stream itself (visible in pavucontrol's Playback
-        # tab) so the input->process->output chain is self-documenting there.
-        self.description = description or self.sink
-        self.stream_name = stream_name or f"{self.sink} feed"
+# ── Transports ──────────────────────────────────────────────────────────────
+
+class AudioTransport:
+    """Byte sink for 12 kHz mono s16le PCM.  ``write`` may block briefly."""
+
+    wsjtx_input_hint: str = ""   # what the operator should pick in WSJT-X
+
+    def write(self, pcm: bytes) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+
+class PipeWireTransport(AudioTransport):
+    """Linux: create a null sink and paplay raw PCM into it."""
+
+    def __init__(self, sink_name: str, description: str, stream_name: str, fs: int):
+        self.sink = sink_name
+        self.description = description
+        self.stream_name = stream_name
         self.fs = int(fs)
-        self.fc = float(fc)
-        # 26 int16-RMS lands the WSJT-X meter at ~30 dB (the recommended noise
-        # level) -- calibrated live on a B210 H feed.  Auto-level pins output RMS
-        # to this regardless of input, so the meter reading is deterministic.
-        self.target_rms = float(target_rms
-                                or os.environ.get("MAP144_WSJTX_TARGET_RMS", "26"))
-        self._n = 0                  # running sample index -> phase continuity
-        self._rms = None             # EMA of pre-gain audio RMS (auto-level)
-        self._dropped = 0
-        self._q = queue.Queue(maxsize=_QUEUE_MAX)
-        self._stop = threading.Event()
+        self._module_id = None
         self._proc = None
-        self._module_id = None        # pactl module index → unload on close
-
+        self.wsjtx_input_hint = f"Monitor of {description}"
         self._ensure_sink()
         self._open_player()
-        self._thread = threading.Thread(target=self._writer, name="wsjtx-audio",
-                                        daemon=True)
-        self._thread.start()
-        atexit.register(self.close)
-        log.info("WsjtxAudioExporter[%s]: streaming -> sink '%s'  "
-                 "(WSJT-X Input = 'Monitor of %s')",
-                 self.label, self.sink, self.description)
 
-    # -- setup ------------------------------------------------------------
     def _sh(self, cmd):
         return subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
+    def _unload_existing(self):
+        out = self._sh("pactl list short modules").stdout
+        for ln in out.splitlines():
+            if "module-null-sink" in ln and f"sink_name={self.sink}" in ln:
+                self._sh(f"pactl unload-module {ln.split()[0]}")
+
     def _ensure_sink(self):
-        # Remove any stale sink with our name first (e.g. left by a prior crash
-        # where atexit didn't run) so we own a fresh module we can cleanly
-        # unload on close.  The sink's lifetime now matches the bridge's: no
-        # object.linger, so unload-module removes it and a dead bridge
-        # *disappears* from WSJT-X instead of going silently mute.
         self._unload_existing()
-        # List-form (shell=False) so the description may contain spaces and the
-        # "->" arrow without the shell splitting args or treating ">" as a
-        # redirect.  pactl joins these argv into one module-arg string and
-        # re-tokenises on spaces, so a spaced value needs *nested* quoting:
-        # outer double-quotes make the whole proplist the value of
-        # sink_properties; inner single-quotes keep the spaced description as one
-        # property.  (Verified: the single-level form truncates at the first
-        # space.)  Assumes the description carries no single-quote, which holds
-        # for our "MAP144 RFn RX -> WSJT-X" labels.
+        # Nested quoting: outer dq for sink_properties value, inner sq for the
+        # spaced description (pactl re-tokenises on spaces after joining argv).
         cmd = ["pactl", "load-module", "module-null-sink",
                f"sink_name={self.sink}", "media.class=Audio/Sink",
                f"sink_properties=\"device.description='{self.description}'\""]
@@ -111,19 +111,8 @@ class WsjtxAudioExporter:
                                f"{r.stderr.strip()}")
         self._module_id = r.stdout.strip() or None
 
-    def _unload_existing(self):
-        """Unload any module-null-sink already owning our sink name."""
-        out = self._sh("pactl list short modules").stdout
-        for ln in out.splitlines():
-            if "module-null-sink" in ln and f"sink_name={self.sink}" in ln:
-                mod = ln.split()[0]
-                self._sh(f"pactl unload-module {mod}")
-
     def _open_player(self):
         if shutil.which("paplay"):
-            # --client-name/--stream-name label this playback stream in
-            # pavucontrol's Playback tab (and `pactl list sink-inputs`), so the
-            # producer side of the chain is named, not just the sink.
             cmd = ["paplay", f"--device={self.sink}", "--raw",
                    "--format=s16le", f"--rate={self.fs}", "--channels=1",
                    "--client-name=MAP144", f"--stream-name={self.stream_name}"]
@@ -135,13 +124,261 @@ class WsjtxAudioExporter:
                                "(install pulseaudio-utils or pipewire-bin)")
         self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
+    def write(self, pcm: bytes) -> None:
+        proc = self._proc
+        if proc is None:
+            raise BrokenPipeError("paplay closed")
+        proc.stdin.write(pcm)
+
+    def close(self) -> None:
+        p, self._proc = self._proc, None
+        if p is not None:
+            try:
+                p.stdin.close()
+            except Exception:
+                pass
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        mod, self._module_id = self._module_id, None
+        if mod:
+            try:
+                self._sh(f"pactl unload-module {mod}")
+            except Exception:
+                pass
+
+
+class PortAudioTransport(AudioTransport):
+    """Windows/macOS: write PCM to a PortAudio output device (virtual cable)."""
+
+    def __init__(self, device_name: str, fs: int, device_index: int | None = None):
+        try:
+            import sounddevice as sd
+        except ImportError as exc:
+            raise RuntimeError(
+                "WSJT-X audio on Windows/macOS needs the 'sounddevice' package "
+                "(pip install sounddevice). Also install VB-CABLE (Windows) or "
+                "BlackHole (macOS)."
+            ) from exc
+        self._sd = sd
+        self.fs = int(fs)
+        self.device_name = device_name
+        if device_index is None:
+            device_index = _find_output_device_index(sd, device_name)
+        if device_index is None:
+            raise RuntimeError(
+                f"PortAudio output device matching {device_name!r} not found. "
+                f"Install VB-CABLE / BlackHole, or set MAP144_WSJTX_DEVICE. "
+                f"Available outputs: {_list_output_names(sd)}"
+            )
+        self.device_index = int(device_index)
+        info = sd.query_devices(self.device_index)
+        self.wsjtx_input_hint = (
+            f"matching playback of '{info['name']}' "
+            f"(e.g. CABLE Output / Cable A Output / BlackHole)"
+        )
+        # RawOutputStream: we push int16 mono frames from the writer thread.
+        self._stream = sd.RawOutputStream(
+            samplerate=self.fs,
+            channels=1,
+            dtype="int16",
+            device=self.device_index,
+            blocksize=0,
+        )
+        self._stream.start()
+        log.info("PortAudioTransport: writing %d Hz s16 -> [%d] %s",
+                 self.fs, self.device_index, info["name"])
+
+    def write(self, pcm: bytes) -> None:
+        # sounddevice expects a C-contiguous buffer; bytes is fine for Raw*.
+        self._stream.write(pcm)
+
+    def close(self) -> None:
+        stream, self._stream = getattr(self, "_stream", None), None
+        if stream is not None:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
+# ── Device resolution (PortAudio) ───────────────────────────────────────────
+
+def _list_output_names(sd) -> list[str]:
+    names = []
+    for i, d in enumerate(sd.query_devices()):
+        if d.get("max_output_channels", 0) > 0:
+            names.append(f"[{i}] {d['name']}")
+    return names
+
+
+def _find_output_device_index(sd, name_substr: str) -> int | None:
+    """First output device whose name contains name_substr (case-insensitive)."""
+    needle = name_substr.lower().strip()
+    if not needle:
+        return None
+    # Exact-ish: prefer devices where needle is in the name
+    for i, d in enumerate(sd.query_devices()):
+        if d.get("max_output_channels", 0) <= 0:
+            continue
+        if needle in d["name"].lower():
+            return i
+    return None
+
+
+def _platform_candidates() -> tuple[str, ...]:
+    if sys.platform == "darwin":
+        return _MAC_DEVICE_CANDIDATES
+    return _WIN_DEVICE_CANDIDATES
+
+
+def list_matched_output_devices(sd=None) -> list[tuple[int, str]]:
+    """Return [(index, name), ...] for outputs matching platform cable patterns."""
+    if sd is None:
+        import sounddevice as sd
+    found: list[tuple[int, str]] = []
+    seen = set()
+    for cand in _platform_candidates():
+        for i, d in enumerate(sd.query_devices()):
+            if d.get("max_output_channels", 0) <= 0:
+                continue
+            if i in seen:
+                continue
+            if cand in d["name"].lower():
+                found.append((i, d["name"]))
+                seen.add(i)
+    return found
+
+
+def resolve_output_device(
+    *,
+    device_name: str | None = None,
+    index: int = 0,
+    rf: int | None = None,
+) -> str:
+    """Resolve a PortAudio output device name for this exporter slot.
+
+    Priority:
+      1. Explicit ``device_name`` argument
+      2. ``MAP144_WSJTX_DEVICE_RF{n}`` when ``rf`` is set
+      3. ``MAP144_WSJTX_DEVICE`` (comma-separated list indexed by ``index``)
+      4. Auto-match VB-CABLE / BlackHole / VoiceMeeter names (by ``index``)
+    """
+    if device_name:
+        return device_name.strip()
+
+    if rf is not None:
+        env_rf = os.environ.get(f"MAP144_WSJTX_DEVICE_RF{int(rf)}")
+        if env_rf:
+            return env_rf.strip()
+
+    env = os.environ.get("MAP144_WSJTX_DEVICE", "").strip()
+    if env:
+        parts = [p.strip() for p in env.split(",") if p.strip()]
+        if not parts:
+            pass
+        elif len(parts) == 1:
+            return parts[0]
+        else:
+            return parts[min(int(index), len(parts) - 1)]
+
+    # Auto-match
+    try:
+        import sounddevice as sd
+    except ImportError as exc:
+        raise RuntimeError(
+            "sounddevice not installed; pip install sounddevice, or set "
+            "MAP144_WSJTX_DEVICE to a PortAudio output name"
+        ) from exc
+
+    matched = list_matched_output_devices(sd)
+    if not matched:
+        raise RuntimeError(
+            "No VB-CABLE / BlackHole / VoiceMeeter output device found. "
+            "Install a virtual cable, or set MAP144_WSJTX_DEVICE. "
+            f"Available outputs: {_list_output_names(sd)}"
+        )
+    idx = min(int(index), len(matched) - 1)
+    return matched[idx][1]
+
+
+def make_transport(
+    *,
+    sink_name: str,
+    description: str,
+    stream_name: str,
+    fs: int,
+    device_name: str | None = None,
+    index: int = 0,
+    rf: int | None = None,
+    transport: AudioTransport | None = None,
+) -> AudioTransport:
+    """Build the platform transport (or return an injected one for tests)."""
+    if transport is not None:
+        return transport
+    if sys.platform.startswith("linux"):
+        return PipeWireTransport(sink_name, description, stream_name, fs)
+    # Windows / macOS / other: PortAudio into a virtual cable
+    name = resolve_output_device(device_name=device_name, index=index, rf=rf)
+    return PortAudioTransport(device_name=name, fs=fs)
+
+
+# ── Exporter ────────────────────────────────────────────────────────────────
+
+class WsjtxAudioExporter:
+    """Streams one channel's baseband as 12 kHz audio via a platform Transport."""
+
+    def __init__(self, sink_name=None, target_rms=None, fs=_FS, fc=_FC, label=None,
+                 description=None, stream_name=None, device_name=None,
+                 index: int = 0, rf: int | None = None, transport=None):
+        self.sink = sink_name or os.environ.get("MAP144_WSJTX_SINK", "map144_out")
+        self.label = label or self.sink
+        self.description = description or self.sink
+        self.stream_name = stream_name or f"{self.sink} feed"
+        self.fs = int(fs)
+        self.fc = float(fc)
+        self.target_rms = float(target_rms
+                                or os.environ.get("MAP144_WSJTX_TARGET_RMS", "26"))
+        self.device_name = device_name
+        self.index = int(index)
+        self.rf = rf
+        self._n = 0
+        self._rms = None
+        self._dropped = 0
+        self._q: queue.Queue = queue.Queue(maxsize=_QUEUE_MAX)
+        self._stop = threading.Event()
+        self._transport: AudioTransport | None = None
+
+        self._transport = make_transport(
+            sink_name=self.sink,
+            description=self.description,
+            stream_name=self.stream_name,
+            fs=self.fs,
+            device_name=device_name,
+            index=self.index,
+            rf=rf,
+            transport=transport,
+        )
+        self._thread = threading.Thread(target=self._writer, name="wsjtx-audio",
+                                        daemon=True)
+        self._thread.start()
+        atexit.register(self.close)
+        log.info("WsjtxAudioExporter[%s]: streaming -> %s  "
+                 "(WSJT-X Input ≈ %s)",
+                 self.label, self.sink, self._transport.wsjtx_input_hint)
+
     # -- hot path (called from the DSP thread; must never block) ----------
     def feed(self, ch_iq):
         """Convert one calling-channel baseband chunk to PCM and enqueue it.
 
         ch_iq : complex array (n,) at self.fs, signal at DC.
         """
-        if self._proc is None:
+        if self._transport is None:
             return
         n = len(ch_iq)
         if n == 0:
@@ -161,7 +398,7 @@ class WsjtxAudioExporter:
         try:
             self._q.put_nowait(pcm)
         except queue.Full:
-            try:                       # drop oldest, keep latency bounded
+            try:
                 self._q.get_nowait()
                 self._q.put_nowait(pcm)
             except (queue.Empty, queue.Full):
@@ -171,7 +408,6 @@ class WsjtxAudioExporter:
                 log.warning("WsjtxAudioExporter: audio pipe backed up, "
                             "dropped %d chunks (WSJT-X may glitch)", self._dropped)
 
-    # -- background writer (may block on the pipe; off the DSP thread) ----
     def _writer(self):
         while not self._stop.is_set():
             try:
@@ -180,18 +416,15 @@ class WsjtxAudioExporter:
                 continue
             if pcm is None:
                 break
-            # Snapshot: close() runs on the main thread at shutdown and sets
-            # self._proc = None; without the local ref a non-None pcm pulled
-            # just before that nulling would hit None.stdin (AttributeError,
-            # uncaught) and crash this daemon thread during teardown.
-            proc = self._proc
-            if proc is None:
+            transport = self._transport
+            if transport is None:
                 break
             try:
-                proc.stdin.write(pcm)
-            except (BrokenPipeError, ValueError, OSError, AttributeError):
-                log.warning("WsjtxAudioExporter: audio player closed; stopping export")
-                self._proc = None
+                transport.write(pcm)
+            except (BrokenPipeError, ValueError, OSError, AttributeError) as exc:
+                log.warning("WsjtxAudioExporter: transport closed (%s); stopping",
+                            exc)
+                self._transport = None
                 break
 
     def close(self):
@@ -202,19 +435,9 @@ class WsjtxAudioExporter:
             self._q.put_nowait(None)
         except queue.Full:
             pass
-        p, self._proc = self._proc, None
-        if p is not None:
+        t, self._transport = self._transport, None
+        if t is not None:
             try:
-                p.stdin.close()
-            except Exception:
-                pass
-            p.terminate()
-        # Unload the null sink so the bridge's device disappears from WSJT-X
-        # (rather than lingering as a silent monitor) the moment the B210 is no
-        # longer the active source.
-        mod, self._module_id = self._module_id, None
-        if mod:
-            try:
-                self._sh(f"pactl unload-module {mod}")
+                t.close()
             except Exception:
                 pass

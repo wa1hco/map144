@@ -103,19 +103,23 @@ class DialAudioBank:
 
         pan_hz = self.pan_center_mhz * 1e6
         self.branches: list[DialBranch] = []
-        for ch in channels:
+        for i, ch in enumerate(channels):
             # Bring usb_center down to DC: mix by -(usb_center - pan).
             mix_hz = -(ch.usb_center_hz - pan_hz)
             step = 2.0 * np.pi * mix_hz / self.hw_rate_hz
             sink = ch.sink_name(rf)
             desc = ch.description(rf)
             stream = f"{ch.band} {ch.mode} {ch.dial_mhz:.3f} 12k feed -> {sink}"
+            # index selects MAP144_WSJTX_DEVICE list entry / auto-matched cable
+            # on Windows/macOS (Linux ignores it and creates a PipeWire sink).
             exp = factory(
                 sink_name=sink,
                 label=f"{ch.band}-{ch.mode}-{ch.dial_khz_token}",
                 description=desc,
                 stream_name=stream,
                 fs=self.audio_fs,
+                index=i,
+                rf=rf,
             )
             br = DialBranch(
                 channel=ch, rf=rf, exporter=exp, mix_hz=mix_hz,

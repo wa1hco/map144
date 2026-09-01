@@ -739,27 +739,19 @@ See `project_ml_qso_classifier_plan` memory for the full plan; see
     Reuses `WsjtxAudioExporter` + `Map65Exporter`; new wideband multi-NCO path
     off raw 192 kHz IQ (not channelizer row 0). LO planner auto-covers the
     selection inside 192 kHz IF. v1: Linux, standalone owns B210, no TX.
-    Unit tests: `tests/test_router_*.py`. Remaining: live Bake on B210,
-    optional MAP144 View-menu panel, 384 kHz IF unlock.
+    Unit tests: `tests/test_router_*.py`. Windows launcher: `run-router.bat`
+    (audio via #45). Remaining: live bake on B210, optional MAP144
+    View-menu panel, 384 kHz IF unlock.
 
-45. ⬜ **Cross-platform WSJT-X audio bridge (Windows/macOS via PortAudio).**
-    The #44 bridge is Linux-only: only two steps are OS-specific — creating
-    the virtual sink (`pactl`) and playing into it (`paplay`). Everything
-    else (PCM gen, DC→1500 Hz upconvert, auto-level, drop-queue, per-port
-    routing in `WsjtxAudioExporter`) is portable numpy. Plan: abstract a
-    `Transport` in `wsjtx_audio_export.py` —
-    - Linux: keep the auto-created null-sink + paplay (zero user setup).
-    - Windows/macOS: `PortAudioTransport(device_name=...)` via `sounddevice`,
-      writing PCM to a user-installed virtual cable. `feed()` and the DSP stay
-      byte-for-byte identical.
-    User-side prerequisites (can't create audio devices without a kernel
-    driver): **Windows = VB-CABLE** (VB-Audio; free single cable, or VB-CABLE
-    A+B / VoiceMeeter for two ports → RF0=Cable A, RF1=Cable B); **macOS =
-    BlackHole**. Add a device-name config setting (no auto-discovery off
-    Linux). Bounded effort: transport plug-in + config; the hard part (the
-    audio) is done. Deferred — surfaced 2026-06-02 while shifting MAP144
-    testing to Windows (the program runs there already, just without this
-    feature). See `project_wsjtx_audio_bridge` memory.
+45. ✅ **Cross-platform WSJT-X audio bridge (Windows/macOS via PortAudio)**
+    (2026-08-31). `AudioTransport` in `wsjtx_audio_export.py`: Linux keeps
+    PipeWire null-sink + paplay; Windows/macOS uses `PortAudioTransport` via
+    `sounddevice` into VB-CABLE / VoiceMeeter / BlackHole. Device resolve:
+    explicit arg → `MAP144_WSJTX_DEVICE_RFn` → `MAP144_WSJTX_DEVICE` (comma
+    list) → auto-match common cable names. `feed()` DSP unchanged. Runtime
+    setup no longer Linux-gated. `sounddevice` in `requirements.txt` (lazy
+    import). Tests: `tests/test_wsjtx_audio_transport.py` + updated setup
+    tests. Live bake on Windows still pending. See `docs/router.md`.
 
 ## 🔄 External spot correlation & propagation geometry (added 2026-06-03)
 

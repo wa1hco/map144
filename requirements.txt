@@ -20,3 +20,8 @@ numba>=0.59,<0.66
 # source module.  Installed on demand; not strictly required when running
 # map144 against other source types (USRP, Airspy, RTL-SDR, WAV replay).
 flexclient>=0.1
+
+# sounddevice (PortAudio) — Windows/macOS WSJT-X audio bridge (#45).  Optional
+# on Linux (PipeWire/paplay path).  Lazy-imported only when the PortAudio
+# transport is selected.
+sounddevice>=0.4.6

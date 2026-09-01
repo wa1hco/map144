@@ -553,24 +553,22 @@ def _connect_usrp_client(self):
 
 
 def _setup_wsjtx_audio_export(self, dual: bool):
-    """Create the MAP144 -> WSJT-X PipeWire audio sinks for the B210 RF ports.
+    """Create the MAP144 -> WSJT-X audio exports for the B210 RF ports.
 
-    Default-on for the B210 on Linux: one null sink per RF port, named so
-    WSJT-X can record its monitor source:
-        map144_RF0   <- RX0 calling channel
-        map144_RF1   <- RX1 calling channel   (dual-channel only)
+    Default-on for the B210: one export per RF port
+        map144.RF0.rx   <- RX0 calling channel
+        map144.RF1.rx   <- RX1 calling channel   (dual-channel only)
     Labels are RF0/RF1 (hardware ports), NOT H/V -- the antenna/polarization on
     each port is operator-dependent and may change.
 
-    Opt out entirely with env MAP144_WSJTX_AUDIO=0.  Non-Linux platforms are
-    skipped (the exporter shells out to pactl/paplay).  Never raises: a failed
-    sink disables that port's audio but must not block source start.
+    Transport is platform-specific (PipeWire null-sink on Linux; PortAudio into
+    VB-CABLE / BlackHole on Windows/macOS — see wsjtx_audio_export.py).  Opt out
+    with MAP144_WSJTX_AUDIO=0.  Never raises: a failed port disables that export
+    but must not block source start.
     """
-    import os, sys
+    import os
     if getattr(self, '_wsjtx_exports', None):
         return                                      # already built this session
-    if sys.platform != "linux":
-        return
     if os.environ.get("MAP144_WSJTX_AUDIO", "1") == "0":
         return                                      # explicit opt-out
     from .wsjtx_audio_export import WsjtxAudioExporter
@@ -579,23 +577,32 @@ def _setup_wsjtx_audio_export(self, dual: bool):
     for rf in range(n_ports):
         # Programmatic name: dotted machine token (never shown in a GUI; matches
         # the `flex.sliceA.tx` convention).  Description: the spaced human label
-        # WSJT-X/pavucontrol actually show -> the operator records
-        # "Monitor of <description>".  stream_name labels the paplay producer in
-        # pavucontrol's Playback tab.  RF0/RF1 = hardware ports, not H/V.
+        # WSJT-X/pavucontrol actually show on Linux -> the operator records
+        # "Monitor of <description>".  On Windows/macOS the PortAudio device
+        # name is what WSJT-X lists (CABLE Output / BlackHole).  RF0/RF1 =
+        # hardware ports, not H/V.
         sink   = f"map144.RF{rf}.rx"
         desc   = f"MAP144 RF{rf} RX -> WSJT-X"
         stream = f"RF{rf} RX 12k->48k feed -> {sink}"
         try:
             exports[rf] = WsjtxAudioExporter(
                 sink_name=sink, label=f"RF{rf}",
-                description=desc, stream_name=stream)
+                description=desc, stream_name=stream,
+                index=rf, rf=rf)
         except Exception as exc:                    # never break source start
             logger.warning("[wsjtx-audio] RF%d sink '%s' disabled: %s",
                            rf, sink, exc)
     self._wsjtx_exports = exports
     for rf in sorted(exports):
-        logger.info("[wsjtx-audio] RF%d ready -> in WSJT-X set "
-                    "Audio Input = 'Monitor of MAP144 RF%d RX -> WSJT-X'", rf, rf)
+        exp = exports[rf]
+        hint = getattr(getattr(exp, "_transport", None), "wsjtx_input_hint", None)
+        if hint:
+            logger.info("[wsjtx-audio] RF%d ready -> in WSJT-X set Audio Input = %s",
+                        rf, hint)
+        else:
+            logger.info("[wsjtx-audio] RF%d ready -> in WSJT-X set "
+                        "Audio Input = 'Monitor of MAP144 RF%d RX -> WSJT-X'",
+                        rf, rf)
 
 
 def _teardown_wsjtx_audio_export(self):

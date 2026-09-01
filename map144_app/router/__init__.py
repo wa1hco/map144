@@ -11,7 +11,7 @@ MAP65/QMAP TIMF2).  Standalone from the MAP144 detect/decode path.
 """
 
 from .band_plan import DialChannel, bands, channels_for_band, load_frequency_table
-from .engine import RouterConfig, RouterEngine
+from .engine import RouterConfig, RouterEngine, RouterStatus
 from .lo_planner import LoPlan, LoPlanError, plan_lo
 from .wideband_iq import WidebandDest
 
@@ -21,6 +21,7 @@ __all__ = [
     "LoPlanError",
     "RouterConfig",
     "RouterEngine",
+    "RouterStatus",
     "WidebandDest",
     "bands",
     "channels_for_band",
