@@ -7,9 +7,13 @@ Product overview and radio sources: see the top-level [README.md](README.md).
 
 ## Requirements
 
-- Python **3.10+** from [python.org](https://www.python.org/downloads/)  
+- Python **3.10–3.13** from [python.org](https://www.python.org/downloads/)  
+  - **Recommended: 3.12**  
   - Tick **Add python.exe to PATH**  
-  - Avoid the Microsoft Store `WindowsApps\python.exe` stub
+  - Avoid the Microsoft Store `WindowsApps\python.exe` stub  
+  - **Do not use Python 3.14** for this project: `requirements.txt` pins
+    `numpy<2` (UHD ABI), and NumPy 1.26 has no Windows wheels for 3.14, so
+    `install.ps1` would try to compile numpy from source and fail
 - [WSJT-X](https://wsjt.sourceforge.io/) (provides `jt9.exe`)
 - Git for Windows (for `git clone` / `git pull`)
 - PowerShell 5.1+ (built into Windows 10/11)
@@ -114,6 +118,7 @@ $env:MAP144_JT9 = "C:\Path\To\jt9.exe"
 | Symptom | Fix |
 |---------|-----|
 | `python` opens the Microsoft Store | Install python.org build; fix PATH so it wins over `WindowsApps` |
+| pip “Building wheel for numpy” / needs to recompile on 3.14 | Install **Python 3.12**, then `rmdir /s /q .venv` and re-run `.\install.ps1` |
 | `install.ps1` “cannot be loaded” | `powershell -ExecutionPolicy Bypass -File .\install.ps1` |
 | Missing `jt9` | Install WSJT-X or set `MAP144_JT9` |
 | First start feels hung | Wait for numba JIT (~10 s) |

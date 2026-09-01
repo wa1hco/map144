@@ -19,44 +19,105 @@ $RepoDir = (Resolve-Path $PSScriptRoot).Path
 Set-Location $RepoDir
 
 # ── 1. Find a usable Python ─────────────────────────────────────────────
+# Prefer 3.12 / 3.13.  requirements.txt pins numpy<2 (UHD ABI on Linux);
+# NumPy 1.26 has no cp314 wheels, so Python 3.14 makes pip try to compile
+# numpy from source and fails without a full MSVC build stack.
+#
 # Refuse the Microsoft Store stub.  On a fresh Win11 install ``python``
 # resolves to ``...\WindowsApps\python.exe`` which launches the Store
 # instead of running anything.
-$pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-if (-not $pythonCmd) {
-    Write-Host "ERROR: 'python' not found on PATH." -ForegroundColor Red
-    Write-Host "  Install Python 3.10+ from https://www.python.org/downloads/" -ForegroundColor Red
+
+function Test-PythonCandidate([string] $Exe) {
+    if (-not $Exe -or -not (Test-Path -LiteralPath $Exe)) { return $null }
+    if ($Exe -like '*WindowsApps*') { return $null }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $line = & $Exe -c "import sys; v=sys.version_info; print('%d.%d.%d' % (v[0], v[1], v[2])); print(sys.executable)" 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $line) { return $null }
+        $parts = @($line | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+        if ($parts.Count -lt 1) { return $null }
+        $ver = $parts[0]
+        $maj, $min, $pat = $ver.Split('.')
+        if ([int]$maj -ne 3) { return $null }
+        if ([int]$min -lt 10 -or [int]$min -ge 14) { return $null }
+        $resolved = $Exe
+        if ($parts.Count -ge 2 -and (Test-Path -LiteralPath $parts[1])) { $resolved = $parts[1] }
+        if ($resolved -like '*WindowsApps*') { return $null }
+        return @{ Exe = $resolved; Version = $ver; Minor = [int]$min }
+    } catch {
+        return $null
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
+$pythonInfo = $null
+# Prefer the py launcher pins (3.12, then 3.13, then 3.11, then 3.10).
+$pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+if ($pyLauncher) {
+    foreach ($tag in @('-3.12', '-3.13', '-3.11', '-3.10')) {
+        try {
+            $out = & py $tag -c "import sys; print(sys.executable)" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $out) {
+                $pythonInfo = Test-PythonCandidate $out.Trim()
+                if ($pythonInfo) { break }
+            }
+        } catch { }
+    }
+}
+if (-not $pythonInfo) {
+    $cmd = Get-Command python -ErrorAction SilentlyContinue
+    if ($cmd) { $pythonInfo = Test-PythonCandidate $cmd.Source }
+}
+if (-not $pythonInfo) {
+    $cmd3 = Get-Command python3 -ErrorAction SilentlyContinue
+    if ($cmd3) { $pythonInfo = Test-PythonCandidate $cmd3.Source }
+}
+
+if (-not $pythonInfo) {
+    # Explain the common 3.14 failure explicitly.
+    $anyPy = Get-Command python -ErrorAction SilentlyContinue
+    if ($anyPy -and $anyPy.Source -notlike '*WindowsApps*') {
+        $anyVer = & python -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
+        if ($anyVer -match '^3\.14') {
+            Write-Host "ERROR: Python $anyVer found, but MAP144 needs Python 3.10-3.13 on Windows." -ForegroundColor Red
+            Write-Host "  requirements pin numpy<2 (no binary wheels for 3.14), so pip tries to" -ForegroundColor Red
+            Write-Host "  compile numpy from source and fails." -ForegroundColor Red
+            Write-Host "" -ForegroundColor Red
+            Write-Host "  Fix: install Python 3.12 from https://www.python.org/downloads/" -ForegroundColor Yellow
+            Write-Host "       (check 'Add python.exe to PATH'), then:" -ForegroundColor Yellow
+            Write-Host "         rmdir /s /q .venv" -ForegroundColor Yellow
+            Write-Host "         .\install.ps1" -ForegroundColor Yellow
+            exit 1
+        }
+    }
+    Write-Host "ERROR: no suitable Python 3.10-3.13 found on PATH." -ForegroundColor Red
+    Write-Host "  Install Python 3.12 from https://www.python.org/downloads/" -ForegroundColor Red
     Write-Host "  (the python.org installer, NOT the Microsoft Store one)." -ForegroundColor Red
     exit 1
 }
-if ($pythonCmd.Source -like '*WindowsApps*') {
-    Write-Host "ERROR: 'python' resolves to the Microsoft Store stub:" -ForegroundColor Red
-    Write-Host "  $($pythonCmd.Source)" -ForegroundColor Red
-    Write-Host "" -ForegroundColor Red
-    Write-Host "Install Python 3.10+ from https://www.python.org/downloads/" -ForegroundColor Red
-    Write-Host "and make sure that install comes BEFORE WindowsApps on PATH." -ForegroundColor Red
-    exit 1
-}
 
-# Version check — bail early so we don't surface a confusing pip error.
-$pyVersionLine = & python -c "import sys; v=sys.version_info; print(f'{v[0]}.{v[1]}.{v[2]}')"
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: Failed to query Python version." -ForegroundColor Red
-    exit 1
-}
-$pyMajor, $pyMinor, $pyPatch = $pyVersionLine.Split('.')
-if ([int]$pyMajor -lt 3 -or ([int]$pyMajor -eq 3 -and [int]$pyMinor -lt 10)) {
-    Write-Host "ERROR: Python >= 3.10 required (found $pyVersionLine)." -ForegroundColor Red
-    exit 1
-}
-Write-Host "Python $pyVersionLine at $($pythonCmd.Source)" -ForegroundColor Green
+$PythonExe = $pythonInfo.Exe
+Write-Host "Python $($pythonInfo.Version) at $PythonExe" -ForegroundColor Green
 
 # ── 2. Create venv if missing (idempotent) ──────────────────────────────
 $VenvDir = Join-Path $RepoDir ".venv"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
+if (Test-Path $VenvPython) {
+    # If an existing venv was built with 3.14+, recreate (no numpy<2 wheels).
+    $venvVer = & $VenvPython -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
+    if ($venvVer) {
+        $vm, $vn = $venvVer.Split('.')
+        if ([int]$vm -eq 3 -and [int]$vn -ge 14) {
+            Write-Host "Existing .venv is Python $venvVer (unsupported for numpy<2). Recreating ..." -ForegroundColor Yellow
+            Remove-Item -LiteralPath $VenvDir -Recurse -Force
+        }
+    }
+}
 if (-not (Test-Path $VenvPython)) {
     Write-Host "Creating venv at $VenvDir ..." -ForegroundColor Cyan
-    & python -m venv $VenvDir
+    & $PythonExe -m venv $VenvDir
     if ($LASTEXITCODE -ne 0) {
         Write-Host "ERROR: venv creation failed." -ForegroundColor Red
         exit 1
